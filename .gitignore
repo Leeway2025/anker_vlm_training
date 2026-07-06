@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+outputs/
+DATA/
+*.safetensors
+*.pt
+*.onnx
+.venv/
+*.log
+.cache/

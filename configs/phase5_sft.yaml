@@ -1,0 +1,12 @@
+# Phase 5: 基础 SFT(training_plan.md 第 6 节)
+phase: "5_sft"
+init_from: null                # 从 base 开始
+epochs_stage_a: 1              # 6-a: 只训 projector warmup
+epochs_stage_b: 5   # 上限预算;早停可能提前结束,不够可 --epochs 追加              # 6-b: 全 LoRA + projector 联合
+use_whitelist_only: false      # 基础训练用全量数据
+enable_ks_parent_head: true
+enable_aux_heads: false
+cot_mode: false
+hard_mining:
+  enabled: true                # stage_b 训 3 epoch 后跑 hard_mining.py 再续训
+  weight: 3.0

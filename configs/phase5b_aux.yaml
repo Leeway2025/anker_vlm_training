@@ -1,0 +1,10 @@
+# Phase 5b: 辅助任务头(training_plan.md 第 7 节)
+phase: "5b_aux"
+init_from: "outputs/phase5_sft_b/final"   # hard mining 续训过则改 outputs/phase5_sft_hm/final
+epochs: 2   # 上限预算;早停可能提前结束,不够可 --epochs 追加
+learning_rate_scale: 0.5       # 全体 LR × 0.5(相当于 5e-5 主 LR)
+use_whitelist_only: true       # 只用资产 D 白名单
+enable_ks_parent_head: true
+enable_aux_heads: true         # 7 个头: clothing/item/posture/action/view/subrole/dwell
+aux_conf_threshold: 0.5        # Gemini 低置信度属性 → 该样本 aux loss 权重 0
+cot_mode: false

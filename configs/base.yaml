@@ -1,0 +1,109 @@
+# ============================================================
+# Anker VLM 训练基础配置(所有 phase 共享,phase 文件覆盖)
+# 依据: training_plan.md(定稿版)
+# ============================================================
+
+platform: "tpu"        # TPU-only(torch_xla);不维护 GPU 路径
+
+model:
+  # !! 客户侧需按实际 HF 权重路径修改
+  name_or_path: "google/gemma-4-e2b-it"
+  torch_dtype: "bfloat16"          # TPU 原生 bf16
+  attn_implementation: "sdpa"      # TPU/XLA 用 sdpa
+
+# ---------- 采样与预处理(与生产逐字对齐,已确认) ----------
+sampling:
+  num_frames: 16            # 全片均匀采样 16 帧(生产实际,非固定 FPS)
+  image_size: 384           # 直接 resize 384x384(拉伸,不保纵横比)
+  visual_tokens: 70         # Gemma 4 官方档位,勿改
+
+# ---------- 输出格式(须与客户 3 条真实 GT 字符串字节核对) ----------
+format:
+  separator: " | "          # TODO(交付前): 客户核对空格约定
+  prompt_file: "configs/prompt.txt"
+  rt_letters: "ABCDE"
+  sk_letters: "abcdefghijklmnopqrstu"
+  think_open: "<think>"
+  think_close: "</think>"
+  reason_marker: "[REASON]"  # Phase 5d 训练专用,生产 prompt 不含
+
+# ---------- 损失(分类优先原则) ----------
+loss:
+  label_smoothing: 0.1
+  cls_token_weight: 4.0     # RT/SubKS 字母位置的 loss 权重(desc=1.0)
+  ks_parent_coef: 0.2       # KS 6 大类父类头
+  aux_coef: 0.3             # Phase 5b 7 个属性辅助头
+
+# ---------- LoRA(差异化 rank + LoRA+/rsLoRA/PISSA) ----------
+lora:
+  llm_targets: ["q_proj", "k_proj", "v_proj", "o_proj",
+                "gate_proj", "up_proj", "down_proj"]
+  vision_targets: ["q_proj", "k_proj", "v_proj", "o_proj",
+                   "up_proj", "down_proj"]
+  r_sliding: 256            # sliding 层 rank(默认 r)
+  r_global: 512             # full/global attention 层 rank(rank_pattern)
+  alpha_ratio: 2.0          # alpha = ratio * r
+  dropout: 0.0
+  use_rslora: true
+  init_weights: "pissa"     # 需 peft>=0.10;失败自动回退 "gaussian"
+  loraplus_lr_ratio: 16.0   # B 矩阵 LR = A 矩阵 LR × 16
+
+# ---------- 学习率(按模块) ----------
+lr:
+  llm_lora: 1.0e-4
+  vision_lora: 2.0e-5
+  projector: 5.0e-4         # Vision Projector 全参
+  aux_heads: 1.0e-4
+
+# ---------- 冻结(多 LoRA 部署红线: base/PLE/Embedding 不动) ----------
+freeze:
+  keywords: ["ple", "per_layer_embedding", "embed_tokens", "lm_head"]
+  projector_keywords: ["multi_modal_projector", "mm_projector", "projector"]
+  vision_keywords: ["vision_tower", "vision_model"]
+
+# ---------- 训练 ----------
+train:
+  per_device_batch_size: 8
+  gradient_accumulation: 4
+  warmup_steps: 300
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  bf16: true
+  gradient_checkpointing: true
+  logging_steps: 20
+  save_steps: 1000
+  eval_steps: 500           # 在分层监控集上
+  # --- 早停: epochs 只是上限预算,实际训练长度由验证集决定 ---
+  # eval_loss 因分类 token ×4 加权,天然是"分类偏重"的信号
+  early_stopping_patience: 3   # 连续 3 次 eval 无改善即停
+  load_best_at_end: true       # final 取验证集最优 checkpoint,非最后一个
+  # --- XLA 关键: 动态 shape 会触发反复编译,必须固定 padding ---
+  pad_to_fixed_length: true
+  max_seq_len: 2048         # 视觉 1120(70×16 固定) + prompt ~200 + 目标 ~200 + 余量
+
+# ---------- 数据 ----------
+data:
+  labels_file: "DATA/labels.jsonl"           # 客户侧改为自己的路径
+  video_root: "DATA/videos"
+  attributes_file: "DATA/asset_A_attributes.jsonl"   # Phase 5b 用
+  reasoning_file: "DATA/asset_C_reasoning.jsonl"     # Phase 5d 用
+  whitelist_file: "DATA/asset_D_whitelist.txt"       # 5b/5d/KTO 用
+  val_holdout_key: "camera_id"   # 按摄像头/住户切分验证集,防泄漏
+  val_size: 30000
+  num_workers: 8
+
+# ---------- 增强(6.5 节;时序翻转/mixup 为红线禁止,代码内亦有断言) ----------
+augment:
+  temporal_crop_prob: 0.7
+  temporal_crop_ratio: [0.5, 0.9]
+  frame_dropout_prob: 0.10
+  spatial_crop_scale: [0.85, 1.0]   # RandomCrop 在原图上做,resize 之前
+  color_jitter: 0.15
+  hflip_prob: 0.5                   # 水平翻转安全(方向语义是前后)
+  brightness_night_boost: true
+
+# ---------- view_type 规则(客户数据免费打标;代理集用 Gemini) ----------
+view_type_rule:
+  enabled: true
+  doorbell_resolutions: [[1600, 2200]]
+  # 16:9 → non_doorbell,其余按 Gemini 标注兜底

@@ -1,0 +1,47 @@
+# ============================================================
+# 训练阶段配置: 客户逐阶段手动执行,每阶段跑完看验收标准再决定下一步
+# 用法:
+#   python -m training.pipeline status       # 看各阶段状态(done/pending/skipped)
+#   python -m training.pipeline next         # 下一个待跑阶段的命令 + 验收标准
+#   python -m training.pipeline cmd <stage>  # 任意阶段的命令(只打印不执行)
+#   python -m training.pipeline run <stage>  # 执行单个阶段,跑完即停
+# 跳过某阶段: 将其 enabled 设 false,后续阶段自动接最近的已完成产物
+# ============================================================
+
+# 整链起点(可选): 从已有 checkpoint 起步(比如已训过的 v0)
+# 为 null 时从 base 模型开始
+start_from_checkpoint: null
+
+# TPU 核数(1=单卡验证, 8=正式)
+num_cores: 1
+
+stages:
+  sft_warmup:            # Phase 5 stage a: 仅 projector warmup
+    enabled: true
+    # 跳过后果: sft_joint 从未对齐的 projector 起步,前期 loss 略高
+
+  sft_joint:             # Phase 5 stage b: 全 LoRA + projector 联合
+    enabled: true
+    # 基础阶段;若跳过且无 start_from_checkpoint,后续阶段无起点
+
+  hard_mining:           # 错例挖掘 + 续训(含推理、挖掘、续训 3 步)
+    enabled: true
+    # 跳过后果: 少 +0.5~1.5 SubKS(training_plan 6.4)
+
+  aux_heads:             # Phase 5b: 7 属性辅助头
+    enabled: true
+    # 依赖: data.attributes_file(Gemini 资产 A)存在,否则必须跳
+    # 跳过后果: 少 +1~2 RT
+
+  implicit_cot:          # Phase 5d: 隐式 CoT 蒸馏
+    enabled: true
+    # 依赖: data.reasoning_file(Gemini 资产 C)存在,否则必须跳
+    # 跳过后果: 少 +0.5~1 各项;跳过则无 think 泄漏风险,验收项自动省略
+
+  kto:                   # Phase 6: 偏好优化(自动展开: 推理→构造偏好→KTO)
+    enabled: true
+    # 跳过后果: 少 +1 左右各项(Stage 2 主力)
+
+  swa:                   # Phase 9: checkpoint 平均
+    enabled: true
+    # 依赖: 上一训练阶段至少 2 个 checkpoint;跳过后果: 少 +0.2

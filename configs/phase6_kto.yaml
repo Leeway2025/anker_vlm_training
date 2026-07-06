@@ -1,0 +1,10 @@
+# Phase 6: KTO(training_plan.md 第 10 节;纯分类偏好,不跑 judge)
+phase: "6_kto"
+init_from: "outputs/phase5d_cot/final"
+kto_data: "outputs/kto_data.jsonl"   # 先跑 training/build_kto_data.py
+learning_rate: 1.0e-5
+beta: 0.1
+epochs: 1
+desirable_weight: 1.0
+undesirable_weight: 1.5
+# 监控: 每 100 step 测监控集,任一分类指标降 >0.5 → 停,LR 减半

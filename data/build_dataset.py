@@ -152,8 +152,19 @@ class AnkerVideoDataset:
 
 
 class AnkerCollator:
-    """processor 编码 + labels/token_weights 构造。SMOKE: 需真机验证
-    gemma-4 processor 的 chat template 细节。"""
+    """processor 编码 + labels/token_weights 构造。
+
+    Gemma4 processor 真实签名(2026-07-07 v6e-1 真机烟测确认):
+      - 视频经 chat template `{"type": "video", "video": frames}` 传入,
+        必须 `do_sample_frames=False`(内置采样器默认重采 32 帧,
+        与"均匀 16 帧照抄生产"冲突)
+      - 输出 pixel_values_videos (T,630,768) / video_position_ids /
+        mm_token_type_ids;70 token/帧 = 630 patch 经 3×3 pooling
+      - 帧时间戳写进 prompt,未传 video_metadata 时按 fps=24 兜底
+        (TODO 客户对齐: 生产端时间戳/metadata 约定,训练须照抄)
+    """
+
+    MM_KEYS = ("pixel_values_videos", "video_position_ids")
 
     def __init__(self, processor, cfg):
         self.p = processor
@@ -161,42 +172,42 @@ class AnkerCollator:
         self.prompt_text = open(cfg["format"]["prompt_file"],
                                 encoding="utf-8").read().strip()
 
-    def _prompt_ids(self, suffix, num_frames):
-        """生产 prompt(+可选 [REASON])→ prompt 段 token ids。
-        优先 chat template;失败回退纯文本拼接(SMOKE 时确认走哪条)。"""
+    def _encode_prompt(self, frames, suffix):
+        """<video>+生产 prompt(+可选 [REASON])→ processor 编码结果
+        (prompt 段 ids 含视觉 token 与时间戳,及视频张量)。"""
         text = self.prompt_text + suffix
-        try:
-            messages = [{"role": "user", "content": (
-                [{"type": "video"}] + [{"type": "text", "text": text}])}]
-            return self.p.apply_chat_template(
-                messages, add_generation_prompt=True, tokenize=True)
-        except Exception:
-            return self.p.tokenizer(text, add_special_tokens=True)["input_ids"]
+        messages = [{"role": "user", "content": [
+            {"type": "video", "video": frames},
+            {"type": "text", "text": text}]}]
+        return self.p.apply_chat_template(
+            messages, add_generation_prompt=True, tokenize=True,
+            return_dict=True, return_tensors="pt", do_sample_frames=False)
 
     def __call__(self, batch):
         import torch
-        input_ids_l, labels_l, weights_l, pixel_l = [], [], [], []
-        aux_l, ks_l = [], []
+        input_ids_l, labels_l, weights_l, mmtt_l = [], [], [], []
+        pixel_l, vpos_l, aux_l, ks_l = [], [], [], []
         tok = self.p.tokenizer
+        model_dtype = getattr(torch, self.cfg["model"]["torch_dtype"])
 
         for ex in batch:
+            enc = self._encode_prompt(ex["frames"], ex["prompt_suffix"])
+            p_ids = enc["input_ids"][0].tolist()
+            mm_tt = enc["mm_token_type_ids"][0].tolist()
+
             spec = ex["target_spec"]
-            enc = tok(spec.text, add_special_tokens=False,
-                      return_offsets_mapping=True)
-            t_ids = enc["input_ids"] + [tok.eos_token_id]
-            t_w = char_spans_to_token_weights(spec, enc["offset_mapping"])
+            t_enc = tok(spec.text, add_special_tokens=False,
+                        return_offsets_mapping=True)
+            t_ids = t_enc["input_ids"] + [tok.eos_token_id]
+            t_w = char_spans_to_token_weights(spec, t_enc["offset_mapping"])
             t_w = t_w + [1.0]                                 # eos 权重 1
 
-            p_ids = self._prompt_ids(ex["prompt_suffix"],
-                                     len(ex["frames"]))
-            ids = list(p_ids) + t_ids
-            labels = [-100] * len(p_ids) + t_ids
-            weights = [0.0] * len(p_ids) + t_w
-
-            input_ids_l.append(torch.tensor(ids))
-            labels_l.append(torch.tensor(labels))
-            weights_l.append(torch.tensor(weights))
-            pixel_l.append(torch.from_numpy(ex["frames"]))
+            input_ids_l.append(torch.tensor(p_ids + t_ids))
+            labels_l.append(torch.tensor([-100] * len(p_ids) + t_ids))
+            weights_l.append(torch.tensor([0.0] * len(p_ids) + t_w))
+            mmtt_l.append(torch.tensor(mm_tt + [0] * len(t_ids)))
+            pixel_l.append(enc["pixel_values_videos"][0].to(model_dtype))
+            vpos_l.append(enc["video_position_ids"][0])
             ks_l.append(ex["ks_label"])
             aux_l.append([ex["aux_labels"].get(h, -100)
                           for h in AUX_HEAD_ORDER])
@@ -220,12 +231,11 @@ class AnkerCollator:
             "input_ids": _pad(input_ids_l, pad),
             "labels": _pad(labels_l, -100),
             "token_weights": _pad(weights_l, 0.0),
+            "mm_token_type_ids": _pad(mmtt_l, 0),
+            "pixel_values_videos": torch.stack(pixel_l),
+            "video_position_ids": torch.stack(vpos_l),
             "ks_labels": torch.tensor(ks_l),
             "aux_labels": torch.tensor(aux_l),
         }
         out["attention_mask"] = (out["input_ids"] != pad).long()
-        # SMOKE: gemma-4 processor 的视频入参键名需真机确认
-        # (常见: pixel_values / pixel_values_videos + video_grid_thw)
-        frames = torch.stack(pixel_l)                # (B,T,H,W,C) uint8
-        out["pixel_values"] = frames
         return out

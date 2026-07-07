@@ -44,7 +44,9 @@ def main():
     llm_keys, vis_keys = split_adapter_keys(list(sd), vis_kw)
     llm_sd = {k: sd[k] for k in llm_keys}
     if a.issue480:
-        sys.path.insert(0, "docs")
+        # 仓库相对路径,不依赖 cwd(E2E 实测: 在别的目录运行时 "docs" 失效)
+        sys.path.insert(0, os.path.join(os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__))), "docs"))
         from issue480_workaround import rename_keys
         ren = rename_keys(list(llm_sd))
         llm_sd = {ren.get(k, k): v for k, v in llm_sd.items()}

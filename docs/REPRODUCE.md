@@ -6,7 +6,7 @@
 TPU VM(v6e-8 或同级)/ Python ≥3.10
 pip install torch~=2.5 torch_xla[tpu] transformers>=4.53 peft>=0.13 \
     safetensors pyyaml opencv-python-headless decord google-genai tensorboard
-python3 tests/test_core.py     # 必须 13/13 passed
+python3 tests/test_core.py     # 必须全部 passed(个别用例需 torch)
 ```
 
 ## 1. 数据准备
@@ -19,8 +19,12 @@ labels.jsonl 每行(与 annotation_spec 2.2 一致):
  "meta": {"camera_id": "cam_001", ...}}
 
 ① 改 configs/base.yaml → data.* 路径
-② 字节核对: 抽 3 条真实 GT 输出串,确认与 configs/prompt.txt 的
-   " | " 分隔符逐字节一致(不一致改 format.separator)
+② 格式字节核对(整串,不止分隔符):
+   从数据文件原样复制 3+ 条真实 GT 输出串存 gt_samples.txt(每行一条)
+   python -m eval.check_format_alignment --gt-samples gt_samples.txt \
+       --tokenizer <gemma-4 权重路径>
+   全部 OK 才开训;FAIL 时按提示改 format.separator,并核对
+   configs/prompt.txt 与生产 prompt 的空格/换行是否一致
 ③ 构造监控集: python -m eval.monitor_set --labels labels.jsonl --out monitor.jsonl
 ```
 

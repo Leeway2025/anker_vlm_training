@@ -46,21 +46,49 @@ tests/         纯逻辑单测(python3 tests/test_core.py,无 torch 依赖)
 8. 评测:        eval/metrics.py(--pred/--gt),对齐客户口径
 ```
 
-## ⚠️ TPU 烟测清单(首次运行必查,本仓库在无 TPU/权重环境编写)
+## ✅ TPU 烟测清单(2026-07-07 已在 v6e-1 真机全部验证,9/9 PASS)
 
-1. gemma-4 模型类名: `AutoModelForImageTextToText` 是否命中(common._load 有回退)
-2. processor 的 video 入参签名(collator/inference_utils 标 SMOKE 处)
-3. PLE 参数命名: freeze_base 打印 frozen_keyword_hits,`ple` 计数须 >0
-4. `config.text_config.layer_types` 存在性(差异化 rank 的 global 层检测)
-5. 固定 padding 生效: 训练 10 步观察 XLA 编译次数(应只编译 1~2 次)
-6. PISSA 初始化(peft≥0.10),失败自动回退有 [WARN] 日志
-7. kto.py 的 DataLoader 拼装(骨架就绪,依赖 2 的确认)
+> `PJRT_DEVICE=TPU python tests/smoke_tpu.py` 可随时回归。真机确认结果:
+
+1. ✅ 模型类名 `Gemma4ForConditionalGeneration`(AutoModelForImageTextToText 命中)
+2. ✅ processor 签名: chat template `{"type":"video"}` + **`do_sample_frames=False`**
+   (内置采样器默认重采 32 帧!)→ `pixel_values_videos`/`video_position_ids`/
+   `mm_token_type_ids`;70 token/帧 ×16=1120;帧时间戳写进 prompt
+   (无 video_metadata 时 fps=24 兜底,**须与客户生产端约定对齐**)
+3. ✅ PLE 实名 `per_layer_*`(108 个);Projector 实名 `embed_vision.embedding_projection`
+4. ✅ `layer_types` 存在: 35 层,global = [4,9,14,19,24,29,34](7 层,方案假设成立)
+5. ✅ 固定 padding + 视频前向反向端到端(加权 CE loss 正常,无重编译)
+6. ✅ PISSA 成功(target 正则指向 vision 的 `.linear` 后);rank_pattern
+   512/256 生效;LoRA llm=410 / vision=192 张量,audio 塔已排除
+7. ✅ kto.py 全链路(双 adapter / 4 forward / 反向 / 优化器更新)真机跑通
+
+**真机烟测修掉的坑**(详见 WORK_STATUS 第 4 轮):processor 二次采样 /
+ClippableLinear 注入 / XLA checkpoint 三连坑(补丁位置、model.train()、
+vision 梯度静默丢失)/ get_peft_model 重冻 projector / KTO logprob 窗口 /
+bf16 图间噪声下的监控信号设计。
 
 ## 红线(代码级强制)
 
 - base/PLE/Embedding 冻结断言(common.freeze_base 关键字未命中即 raise)
 - 时序翻转禁止(augmentation.assert_monotonic,违者抛异常)
 - 输出解析按位置取字段 + 大小写矫正 + RT×SubKS 合法组合校验
+  (非法组合表含 D|q,涉安全类升级为 C 告警,training_plan 14.2)
+
+## 与 training_plan 的已知偏离(交付评审需知)
+
+1. **KTO 实现**: 方案 10.2 写 TRL KTOTrainer,实际为自实现
+   (training/kto.py)。2026-07 调研结论(支撑该决策):
+   - TRL KTOTrainer 无 TPU/torch_xla 支持(CI 仅 GPU/CPU,XLA 路径失修),
+     且不支持视频输入(v1.6.0 起仅图像);KTO 刚经历 experimental
+     降级-重构-回稳定的动荡期,接口不稳
+   - EasyDeL 是唯一 TPU 原生 KTO(JAX),但纯文本管线且偏离路线 A
+   - 本实现的双 adapter ref 设计与 TRL v1.x 官方机制一致
+     (TRL 对 PeftModel 自动复制 default → 冻结 "ref" adapter)
+   - 损失数学与 TRL 逐项对齐(错配对 KL + 跨核 all_reduce + clamp),
+     tests/test_kto_math.py 与 TRL 公式数值对拍,上 TPU 前必须全绿
+   - **Plan B(如客户可用 GPU)**: TRL v1.6+ 的 KTO 多图支持理论上可把
+     16 帧当图像序列喂入(Gemma 视频本就是图像序列),单 GPU 训 1 epoch
+     白名单子集可行;受 TRL 重构期接口稳定性制约,仅作兜底
 
 ## Phase ↔ 代码映射(training_plan.md 对照)
 

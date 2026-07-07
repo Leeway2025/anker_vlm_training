@@ -25,9 +25,15 @@ def generate_predictions(model, processor, records, cfg, out_path,
         if not batch:
             return
         with torch.no_grad():
-            inputs = processor(text=[prompt] * len(batch),
-                               videos=batch, return_tensors="pt",
-                               padding=True).to(model.device)
+            # do_sample_frames=False: 帧已按生产规则均匀采好,
+            # 禁止 processor 内置采样器二次重采(默认 32 帧,烟测确认)
+            messages = [[{"role": "user", "content": [
+                {"type": "video", "video": v},
+                {"type": "text", "text": prompt}]}] for v in batch]
+            inputs = processor.apply_chat_template(
+                messages, add_generation_prompt=True, tokenize=True,
+                return_dict=True, return_tensors="pt", padding=True,
+                do_sample_frames=False).to(model.device)
             out = model.generate(**inputs, max_new_tokens=max_new_tokens,
                                  do_sample=False)
             texts = processor.batch_decode(
@@ -49,7 +55,7 @@ def generate_predictions(model, processor, records, cfg, out_path,
         frames, _ = decode_video(path,
                                  num_frames=cfg["sampling"]["num_frames"])
         frames = resize_production(frames, cfg["sampling"]["image_size"])
-        batch.append(list(frames))
+        batch.append(frames)                       # (T,H,W,3) np.uint8
         metas.append(vid)
         if len(batch) >= batch_size:
             flush()

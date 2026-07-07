@@ -7,4 +7,9 @@ beta: 0.1
 epochs: 1
 desirable_weight: 1.0
 undesirable_weight: 1.5
+# ---- TPU 工程参数(kto.py 风险修复,2026-07-07) ----
+logprob_chunk: 256           # 分块 logsumexp;防 (B,L,262k) fp32 物化 OOM
+undesirable_per_batch: 2     # 分层 batch: 每 batch 固定混入错例数
+ref_divergence_warn_after: 100  # 该步数后 |logratio| 仍≈0 → set_adapter 失效,raise
 # 监控: 每 100 step 测监控集,任一分类指标降 >0.5 → 停,LR 减半
+# (classification_brake 实现;基线 = v1.5 在监控集上的指标)

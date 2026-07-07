@@ -56,27 +56,29 @@ def s2_load(ctx):
     ctx.update(cfg=cfg, model=model, processor=processor)
 
 
-@check("3. processor 视频入参签名探测(SMOKE 关键)")
+@check("3. processor 视频入参签名(2026-07-07 已确认,此处回归验证)")
 def s3_processor_sig(ctx):
     import numpy as np
     p = ctx["processor"]
-    frames = [np.zeros((384, 384, 3), dtype=np.uint8)] * 4  # 4 帧试探
-    prompt = "describe"
-    tried = []
-    for kw in ("videos", "video", "images"):
-        try:
-            out = p(text=prompt, **{kw: [frames]}, return_tensors="pt")
-            keys = list(out.keys())
-            print(f"     ✓ 入参 `{kw}` 可用 → 输出键: {keys}")
-            ctx["video_kw"] = kw
-            ctx["pixel_key"] = next(
-                k for k in keys if "pixel" in k or "video" in k)
-            return
-        except Exception as e:
-            tried.append(f"{kw}: {type(e).__name__}")
-    raise RuntimeError(
-        f"所有视频入参均失败 {tried} — 查 gemma-4 processor 文档,"
-        f"更新 data/build_dataset.AnkerCollator 与 training/inference_utils")
+    frames = np.zeros((16, 384, 384, 3), dtype=np.uint8)   # 均匀 16 帧
+    messages = [{"role": "user", "content": [
+        {"type": "video", "video": frames},
+        {"type": "text", "text": "describe"}]}]
+    out = p.apply_chat_template(
+        messages, add_generation_prompt=True, tokenize=True,
+        return_dict=True, return_tensors="pt", do_sample_frames=False)
+    keys = list(out.keys())
+    print(f"     输出键: {keys}")
+    assert "pixel_values_videos" in keys, f"视频张量键缺失: {keys}"
+    pv = out["pixel_values_videos"]
+    assert pv.shape[1] == 16, \
+        f"帧数被改写: {pv.shape}(do_sample_frames=False 未生效?)"
+    # 70 token/帧 × 16 帧 = 1120 视觉 token(方案预算),序列应 > 1120
+    assert out["input_ids"].shape[1] > 1120, \
+        f"prompt 序列过短 {out['input_ids'].shape},视觉 token 未展开?"
+    print(f"     pixel_values_videos {tuple(pv.shape)}, "
+          f"prompt len {out['input_ids'].shape[1]} ✓")
+    ctx["pixel_key"] = "pixel_values_videos"
 
 
 @check("4. freeze_base(PLE/embed 命名验证 — 多 LoRA 红线)")
@@ -87,7 +89,8 @@ def s4_freeze(ctx):
     print(f"     projector trainable: "
           f"{stats['projector_trainable_params']/1e6:.1f}M params")
     hits = stats["frozen_keyword_hits"]
-    if hits.get("ple", 0) == 0 and hits.get("per_layer_embedding", 0) == 0:
+    if not any(hits.get(k, 0) for k in
+               ("per_layer", "ple", "per_layer_embedding")):
         # 打印疑似 PLE 参数名帮助定位
         cand = [n for n, _ in ctx["model"].named_parameters()
                 if "layer" in n.lower() and "embed" in n.lower()][:5]
@@ -115,13 +118,22 @@ def s6_lora(ctx):
           f"({100*trainable/total:.2f}%)")
     # 验证 global 层确实拿到 r=512
     r_glb = ctx["cfg"]["lora"]["r_global"]
+    # 限定 language_model —— vision_tower 也有 layers.{i},其 r=256 是正确的
     hit = [n for n, p in model.named_parameters()
-           if f"layers.{ctx['global_layers'][0]}." in n
+           if "language_model" in n
+           and f"layers.{ctx['global_layers'][0]}." in n
            and "lora_a" in n.lower()]
     if hit:
         shape = dict(model.named_parameters())[hit[0]].shape
         print(f"     global 层 lora_A 形状: {shape}(应含 {r_glb})")
         assert r_glb in shape, f"rank_pattern 未生效: {shape}"
+    # get_peft_model 会重新冻结非 adapter 参数,build_lora 须恢复 projector
+    proj_kw = ctx["cfg"]["freeze"]["projector_keywords"]
+    n_proj = sum(p.numel() for n, p in model.named_parameters()
+                 if p.requires_grad and "lora" not in n.lower()
+                 and any(k in n.lower() for k in proj_kw))
+    assert n_proj > 0, "projector 在 LoRA 注入后被冻结(应恢复全参训练)"
+    print(f"     projector 仍可训: {n_proj/1e6:.1f}M ✓")
     ctx["model"] = model
 
 
@@ -167,8 +179,45 @@ def s8_collator(ctx):
         f"固定 padding 未生效: {batch['input_ids'].shape} != {L}"
     w = batch["token_weights"]
     assert (w == 4.0).any() and (w == 1.0).any(), "分类加权丢失"
+    assert batch["pixel_values_videos"].shape[:2] == (2, 16), \
+        f"视频张量形状异常: {batch['pixel_values_videos'].shape}"
     print(f"     input_ids {tuple(batch['input_ids'].shape)}, "
+          f"pixel_values_videos {tuple(batch['pixel_values_videos'].shape)}, "
           f"weights 含 4.0/1.0 ✓")
+    ctx["batch"] = batch
+
+
+@check("9. 视频前向+反向端到端(collator batch → TPU,加权 CE)")
+def s9_video_forward(ctx):
+    import torch
+    import torch_xla.core.xla_model as xm
+    model, d = ctx["model"], ctx["device"]
+    # 与真实训练配置一致: XLA 专用 gradient checkpointing 必开
+    # (原生 checkpoint 被 CSE 优化掉,v6e-1 实测无效 → 35.4G OOM)
+    from training.common import enable_xla_gradient_checkpointing
+    enable_xla_gradient_checkpointing(model)
+    model.train()   # checkpoint 分支仅在 training 模式生效(v6e-1 踩坑:
+                    # eval 模式下 enable 了也不进图,显存字节不差)
+    batch = {k: v.to(d) for k, v in ctx["batch"].items()}
+    weights = batch.pop("token_weights")
+    batch.pop("ks_labels"), batch.pop("aux_labels")
+    labels = batch.pop("labels")
+    t0 = time.time()
+    out = model(**batch)
+    s_logits = out.logits[:, :-1]
+    s_labels, s_w = labels[:, 1:], weights[:, 1:]
+    import torch.nn.functional as F
+    ce = F.cross_entropy(
+        s_logits.float().reshape(-1, s_logits.size(-1)),
+        s_labels.reshape(-1), reduction="none",
+        ignore_index=-100).view(s_labels.shape)
+    valid = (s_labels != -100).float()
+    loss = (ce * s_w * valid).sum() / (s_w * valid).sum().clamp_min(1.0)
+    loss.backward()
+    xm.mark_step()
+    lv = float(loss)
+    print(f"     加权 CE loss={lv:.3f}, 首步(含编译)={time.time()-t0:.0f}s")
+    assert lv == lv and lv < 100, f"loss 异常: {lv}"
 
 
 def main():
@@ -178,7 +227,8 @@ def main():
     ctx = {"model_name": a.model}
     print(f"=== TPU 烟测: {a.model} ===")
     for fn in [s1_devices, s2_load, s3_processor_sig, s4_freeze,
-               s5_layers, s6_lora, s7_forward, s8_collator]:
+               s5_layers, s6_lora, s7_forward, s8_collator,
+               s9_video_forward]:
         ctx = fn(ctx)
         if RESULTS[-1][1] == "FAIL" and RESULTS[-1][0][0] in "1234":
             print("\n⛔ 前置步骤失败,后续跳过")

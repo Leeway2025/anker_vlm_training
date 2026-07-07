@@ -95,24 +95,41 @@ def save_final(model, out_dir, cfg, aux, inject_lora):
     final = os.path.join(out_dir, "final")
     os.makedirs(final, exist_ok=True)
     if inject_lora:
-        model.save_pretrained(final)        # 仅 adapter(peft 行为)
+        # 不能直接 model.save_pretrained: XLA 张量过 safetensors 会报
+        # "invalid python storage"(E2E 实测)→ 显式搬 CPU 再存
+        from peft import get_peft_model_state_dict
+        from safetensors.torch import save_file
+        sd = {k: v.detach().cpu().contiguous()
+              for k, v in get_peft_model_state_dict(model).items()}
+        save_file(sd, os.path.join(final, "adapter_model.safetensors"))
+        model.peft_config["default"].save_pretrained(final)
     # projector 始终单独保存(全参训练,不在 adapter 内)
-    proj_sd = {k: v.cpu() for k, v in model.state_dict().items()
+    proj_sd = {k: v.detach().cpu() for k, v in model.state_dict().items()
                if any(kw in k.lower()
                       for kw in cfg["freeze"]["projector_keywords"])
                and "lora" not in k.lower()}
     torch.save(proj_sd, os.path.join(final, "projector.pt"))
     if aux is not None and aux.heads is not None:
-        torch.save({"pool": aux.pool_score.state_dict(),
-                    "heads": aux.heads.state_dict()},
+        torch.save({"pool": {k: v.cpu() for k, v in
+                             aux.pool_score.state_dict().items()},
+                    "heads": {k: v.cpu() for k, v in
+                              aux.heads.state_dict().items()}},
                    os.path.join(final, "aux_heads.pt"))
     print(f"[save] {final} (adapter={inject_lora}, "
           f"projector tensors={len(proj_sd)})")
     return final
 
 
-class AnnealCallback:
-    """Phase 5d: 最后 anneal_epochs 切纯生产模式(防 think 泄漏)。"""
+try:
+    from transformers import TrainerCallback as _TrainerCallback
+except ImportError:          # 纯逻辑单测环境无 transformers 时兜底
+    _TrainerCallback = object
+
+
+class AnnealCallback(_TrainerCallback):
+    """Phase 5d: 最后 anneal_epochs 切纯生产模式(防 think 泄漏)。
+    必须继承 TrainerCallback —— Trainer 会分发 on_train_begin 等全部事件
+    (E2E 实测: 裸类在 on_train_begin 直接 AttributeError)。"""
 
     def __init__(self, dataset, total_steps, anneal_epochs, epochs):
         self.ds = dataset
@@ -145,7 +162,10 @@ def main():
     is_phase5 = phase["phase"].startswith("5_sft")
     inject_lora = not (is_phase5 and a.stage == "a")   # stage a 仅 projector
     suffix = f"_{a.stage}" if is_phase5 else ""
-    out_dir = a.output or f"outputs/{phase['phase']}{suffix}"
+    # 目录名 = "phase" + yaml phase 字段(5_sft → outputs/phase5_sft_b),
+    # 与各 phase yaml 的 init_from / pipeline.py 约定一致(E2E 实测踩坑:
+    # 之前直接用 phase 字段,产出 outputs/5_sft_b,链条断裂)
+    out_dir = a.output or f"outputs/phase{phase['phase']}{suffix}"
     os.makedirs(out_dir, exist_ok=True)
     init_dir = a.init_from or phase.get("init_from")
 
@@ -173,12 +193,26 @@ def main():
     if inject_lora:
         model = build_lora(model, cfg)
     restore_from(model, init_dir, inject_lora)
+    # bf16 参数吞小更新(v6e-1 实测),可训张量必须 fp32 master weights
+    from training.common import cast_trainable_to_fp32
+    cast_trainable_to_fp32(model)
+
+    if cfg["train"]["gradient_checkpointing"]:
+        from training.common import enable_xla_gradient_checkpointing
+        enable_xla_gradient_checkpointing(model)
 
     aux = None
     if phase.get("enable_aux_heads"):
         aux = AuxHeads(cfg).attach(model, cfg["freeze"]["projector_keywords"])
     ks = KSParentHead() if phase.get("enable_ks_parent_head") else None
 
+    # XLA: 模型必须先上卡再建优化器(Trainer 校验两者同设备;真机烟测确认)
+    if cfg.get("platform") == "tpu":
+        try:
+            import torch_xla.core.xla_model as xm
+            model.to(xm.xla_device())
+        except ImportError:
+            pass
     optimizer = build_optimizer(model, cfg, aux_module=aux,
                                 lr_scale=phase.get("learning_rate_scale", 1.0))
 
@@ -194,7 +228,10 @@ def main():
         warmup_steps=cfg["train"]["warmup_steps"],
         max_grad_norm=cfg["train"]["max_grad_norm"],
         bf16=cfg["train"]["bf16"],
-        gradient_checkpointing=cfg["train"]["gradient_checkpointing"],
+        # gradient checkpointing 由 enable_xla_gradient_checkpointing 接管
+        # (XLA 下原生 checkpoint 被 CSE 优化掉,无省显存效果,烟测确认),
+        # 此处必须 False 防 Trainer 二次 enable 覆盖补丁
+        gradient_checkpointing=False,
         logging_steps=cfg["train"]["logging_steps"],
         save_steps=cfg["train"]["save_steps"],
         eval_steps=cfg["train"]["eval_steps"],

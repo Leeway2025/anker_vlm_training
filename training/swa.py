@@ -29,7 +29,13 @@ def main():
     fname = "adapter_model.safetensors"
     sds = [load_file(os.path.join(d, fname)) for d in dirs]
     avg = average_tensors(sds)
-    shutil.copytree(dirs[-1], a.out, dirs_exist_ok=True)  # 配置沿用最后一个
+    # 只拷 adapter 配置,不 copytree —— checkpoint 内 optimizer.pt 每个
+    # 3~4G,E2E 实测把盘写满(ENOSPC);SWA 产物只需 adapter 两件套
+    os.makedirs(a.out, exist_ok=True)
+    for f in ("adapter_config.json", "README.md"):
+        src = os.path.join(dirs[-1], f)
+        if os.path.exists(src):
+            shutil.copy(src, a.out)
     save_file(avg, os.path.join(a.out, fname))
     print(f"saved -> {a.out}")
 

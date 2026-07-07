@@ -84,6 +84,27 @@ def test_parse_output_illegal_combo():
     assert deployment_guard(r2)["action"] == "escalate_to_C_alert"
 
 
+def test_parse_output_dq_illegal():
+    """D|q 在 training_plan 14.2 非法组合表内;q 涉安全 → 升级为 C 告警。"""
+    r = parse_output("D | q | an unidentified person holds a knife")
+    assert r.ok and not r.legal_combo
+    assert deployment_guard(r)["action"] == "escalate_to_C_alert"
+    # 其他含 q 的组合不在表内,不受影响
+    r2 = parse_output("C | q | a suspicious person holds a knife")
+    assert r2.legal_combo
+    assert deployment_guard(r2)["action"] == "accept"
+
+
+def test_format_alignment_verify():
+    """交付前 GT 整串字节核对(eval/check_format_alignment)。"""
+    from eval.check_format_alignment import verify_gt_line
+    assert verify_gt_line(
+        "B | i | A delivery person places a package.") is None
+    assert verify_gt_line("B|i|no spaces") is not None      # 分隔符约定不同
+    assert verify_gt_line("b | i | lowercase rt") is not None  # GT 不该需矫正
+    assert verify_gt_line("garbage") is not None            # 解析失败
+
+
 def test_parse_output_think_leak():
     r = parse_output("<think>reasoning</think>\nC | s | person lingers")
     assert r.think_leak and r.ok and r.rt == "C" and r.sk == "s"
@@ -180,6 +201,43 @@ def test_pipeline_chain():
     b = _y.safe_load(open(os.path.join(root, "configs/base.yaml")))
     assert b["train"]["early_stopping_patience"] >= 1
     assert b["train"]["load_best_at_end"] is True
+
+
+def test_kto_stratified_batches():
+    """KTO 分层 batch: 每 batch 固定混入 undesirable(纯逻辑)。"""
+    import random
+    from training.kto import plan_stratified_batches
+    # 100 条,12 条 undesirable(≈错例占比),batch 8,每 batch 2 条错例
+    is_d = [True] * 100
+    for i in range(0, 96, 8):
+        is_d[i] = False
+    rng = random.Random(0)
+    batches = plan_stratified_batches(is_d, batch_size=8,
+                                      n_undesirable=2, rng=rng)
+    assert all(len(b) == 8 for b in batches)
+    for b in batches:
+        n_u = sum(1 for i in b if not is_d[i])
+        assert n_u == 2, f"batch 应含 2 条 undesirable,实际 {n_u}"
+    # desirable 池决定 epoch 长度: 88 desirable / 6 per batch = 14 batches
+    assert len(batches) == 14
+    # 无 undesirable 时退化为普通分批
+    plain = plan_stratified_batches([True] * 20, 8, 2, random.Random(0))
+    assert all(len(b) == 8 for b in plain) and len(plain) == 2
+
+
+def test_kto_ref_divergence_and_brake():
+    from training.kto import ref_divergence_alert, classification_brake
+    # 同起点前期 ref_gap≈0 正常;超过 warn_after 仍为 0 → 告警
+    assert not ref_divergence_alert(0.0, step=50, warn_after=100)
+    assert ref_divergence_alert(0.0, step=150, warn_after=100)
+    assert not ref_divergence_alert(0.3, step=150, warn_after=100)
+    # 刹车: 任一分类指标降 >0.5 → 返回劣化项
+    base = {"RoleType_acc": 89.5, "SubKeyScene_acc": 81.0}
+    assert classification_brake(base, {"RoleType_acc": 89.2,
+                                       "SubKeyScene_acc": 80.8}) == []
+    assert classification_brake(base, {"RoleType_acc": 88.9,
+                                       "SubKeyScene_acc": 81.2}) == \
+        ["RoleType_acc"]
 
 
 def test_hard_mining_replication():

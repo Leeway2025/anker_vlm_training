@@ -22,9 +22,13 @@ SAFETY_CRITICAL_SK = set("nqru")
 
 
 def is_legal(rt: str, sk: str) -> bool:
+    """training_plan 14.2 非法组合表(D+q 亦在表内,标 ⚠️ 建议升级为 C——
+    q ∈ SAFETY_CRITICAL_SK,由 deployment_guard 的安全类规则 ② 升级)。"""
     if rt == "E" and sk in _HUMAN_ONLY_SK:
         return False
     if rt == "A" and sk in _FAMILY_ILLEGAL_SK:
+        return False
+    if rt == "D" and sk == "q":
         return False
     return True
 

@@ -19,7 +19,10 @@ sampling:
 
 # ---------- 输出格式(须与客户 3 条真实 GT 字符串字节核对) ----------
 format:
-  separator: " | "          # TODO(交付前): 客户核对空格约定
+  # TODO(开训前): python -m eval.check_format_alignment --gt-samples …
+  # 整串字节核对(separator 与 prompt.txt 的空格/换行均须与生产一致,
+  # PDF 的 prompt 代码块含排版产物,prompt.txt 为清理版,不可默认可信)
+  separator: " | "
   prompt_file: "configs/prompt.txt"
   rt_letters: "ABCDE"
   sk_letters: "abcdefghijklmnopqrstu"
@@ -47,6 +50,8 @@ lora:
   use_rslora: true
   init_weights: "pissa"     # 需 peft>=0.10;失败自动回退 "gaussian"
   loraplus_lr_ratio: 16.0   # B 矩阵 LR = A 矩阵 LR × 16
+  # gemma-4 带 audio_tower(也有 *_proj 模块),LoRA 禁止注入(烟测确认)
+  exclude_keywords: ["audio"]
 
 # ---------- 学习率(按模块) ----------
 lr:
@@ -56,9 +61,12 @@ lr:
   aux_heads: 1.0e-4
 
 # ---------- 冻结(多 LoRA 部署红线: base/PLE/Embedding 不动) ----------
+# 关键字为 2026-07-07 v6e-1 真机烟测确认的 gemma-4-e2b-it 实名:
+#   PLE       → model.language_model.layers.*.per_layer_{input_gate,projection,...}
+#   Projector → model.embed_vision.embedding_projection
 freeze:
-  keywords: ["ple", "per_layer_embedding", "embed_tokens", "lm_head"]
-  projector_keywords: ["multi_modal_projector", "mm_projector", "projector"]
+  keywords: ["per_layer", "embed_tokens", "lm_head"]
+  projector_keywords: ["embed_vision"]
   vision_keywords: ["vision_tower", "vision_model"]
 
 # ---------- 训练 ----------

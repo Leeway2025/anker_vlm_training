@@ -63,15 +63,96 @@ def freeze_base(model, cfg):
         raise RuntimeError(
             f"freeze keywords not found in model params: {missed} — "
             f"检查 gemma-4 参数命名,更新 configs/base.yaml freeze.keywords")
-    if frozen_hits.get("ple", 0) == 0 and \
-       frozen_hits.get("per_layer_embedding", 0) == 0:
+    ple_keys = ("per_layer", "ple", "per_layer_embedding")
+    if not any(frozen_hits.get(k, 0) for k in ple_keys):
         print("[WARN] no PLE-named params found — 确认 gemma-4 PLE 命名"
-              "(可能叫 per_layer_*),否则多 LoRA 红线可能失守")
+              "(实测为 per_layer_input_gate/per_layer_projection),"
+              "否则多 LoRA 红线可能失守")
     if proj_params == 0:
         raise RuntimeError("projector keywords matched nothing — "
                            "检查 projector_keywords 配置")
     return {"frozen_keyword_hits": frozen_hits,
             "projector_trainable_params": proj_params}
+
+
+def enable_xla_gradient_checkpointing(model):
+    """XLA 专用 gradient checkpointing。
+
+    坑(v6e-1 真机实测): torch.utils.checkpoint 的重算子图会被 XLA 的
+    CSE 优化合并回去 —— 显存毫无节省(B2/L2048 视频反向 35.4G OOM,
+    开关前后字节不差)。必须用 torch_xla.utils.checkpoint,它插入
+    optimization_barrier 阻止 CSE。
+    做法: 把 torch.utils.checkpoint.checkpoint 打补丁为 XLA 版
+    (transformers 的 _gradient_checkpointing_func 在 enable 时解析该符号),
+    并 enable_input_require_grads(冻结 embedding + LoRA 下 reentrant
+    checkpoint 需要输入侧有梯度流)。
+    """
+    try:
+        import torch_xla.utils.checkpoint as xla_ckpt
+        _xla_checkpoint = xla_ckpt.checkpoint
+
+        def _ckpt(fn, *args, use_reentrant=None, **kw):
+            return _xla_checkpoint(fn, *args)
+
+        # transformers.modeling_utils 在模块加载时 `from torch.utils.checkpoint
+        # import checkpoint` 早绑定,补丁必须打在它自己的符号上
+        # (只改 torch.utils.checkpoint.checkpoint 无效 —— v6e-1 实测
+        #  显存字节不差)
+        import transformers.modeling_utils as _mu
+        _mu.checkpoint = _ckpt
+        import torch.utils.checkpoint as _tuc
+        _tuc.checkpoint = _ckpt          # 兜底: 其他调用点
+        print("[ckpt] XLA checkpoint patched into transformers.modeling_utils")
+    except ImportError:
+        print("[WARN] torch_xla 不可用,gradient checkpointing 走原生实现")
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
+    model.gradient_checkpointing_enable()
+
+    # ⚠️ v6e-1 实测坑: reentrant checkpoint 在"分段输入不带梯度"时静默
+    # 丢梯度。enable_input_require_grads 只覆盖文本 embedding;vision
+    # tower 的输入来自冻结 patch_embedder → vision LoRA 的 grad 全为
+    # None(llm 侧正常)。补救: 给 vision 侧 embedding 模块输出挂
+    # require-grad 钩子,让视觉塔的 checkpoint 段有梯度入口。
+    import torch
+
+    def _require_grad_hook(mod, args, output):
+        if torch.is_tensor(output) and torch.is_floating_point(output) \
+                and not output.requires_grad:
+            output.requires_grad_(True)
+        return output
+
+    hooked = []
+    for name, mod in model.named_modules():
+        leaf = name.split(".")[-1].lower()
+        if "vision" in name.lower() and "embed" in leaf:
+            mod.register_forward_hook(_require_grad_hook)
+            hooked.append(name)
+    if hooked:
+        print(f"[ckpt] vision input-require-grad hooks: {len(hooked)}")
+
+
+def cast_trainable_to_fp32(model, keyword="lora"):
+    """LoRA 参数升 fp32 做 master weights(安全网;peft 新版默认已 fp32)。
+
+    v6e-1 真机实测的两个约束:
+    ① bf16 参数 + AdamW(lr≤1e-4)的更新量低于 bf16 舍入分辨率 →
+      权重逐字节不变,训练静默空转 —— LoRA(lr 1e-4/2e-5)必须 fp32。
+    ② Projector(embed_vision)不能升 fp32: 其 fp32 输出与 bf16
+      inputs_embeds 在视频特征 masked_scatter 处相遇,XLA 直接报
+      "mixed precision is disallowed";其 lr=5e-4 远超 bf16 分辨率,
+      保持 bf16 更新不丢失。
+    必须在 restore/注入完成后、建 optimizer 前调用。
+    """
+    import torch
+    n = 0
+    for name, p in model.named_parameters():
+        if p.requires_grad and p.dtype == torch.bfloat16 \
+                and keyword in name.lower():
+            p.data = p.data.float()
+            n += 1
+    print(f"[fp32] {n} LoRA tensors upcast to float32 (master weights)")
+    return model
 
 
 def detect_global_layers(model):
@@ -89,15 +170,27 @@ def detect_global_layers(model):
 
 
 def build_lora(model, cfg):
-    """差异化 rank + rsLoRA + PISSA(失败回退)。"""
+    """差异化 rank + rsLoRA + PISSA(失败回退)。
+
+    target 用正则(v6e-1 烟测确认的 gemma-4 结构):
+      - LLM 侧 *_proj 是纯 nn.Linear,直接注入
+      - vision 侧 *_proj 是 Gemma4ClippableLinear 包装(PEFT 不支持),
+        注入点必须是其内部 `.linear` 子模块
+      - audio_tower / embed_audio 不在正则内,天然排除
+    """
     from peft import LoraConfig, get_peft_model
     lcfg = cfg["lora"]
-    targets = sorted(set(lcfg["llm_targets"]) | set(lcfg["vision_targets"]))
     glb = detect_global_layers(model)
+
+    llm_alt = "|".join(lcfg["llm_targets"])
+    vis_alt = "|".join(lcfg["vision_targets"])
+    target_regex = (rf"(.*language_model.*\.({llm_alt}))"
+                    rf"|(.*vision_tower.*\.({vis_alt})\.linear)")
 
     rank_pattern, alpha_pattern = {}, {}
     for i in glb:
-        # 匹配 …layers.{i}.<any>.{proj};结尾锚定防 5 匹配 51
+        # 匹配 …layers.{i}.<any>.{proj};结尾锚定防 5 匹配 51,
+        # 也天然不命中 vision 的 …q_proj.linear(结尾是 linear)
         for t in lcfg["llm_targets"]:
             key = rf".*\.layers\.{i}\..*\.{t}"
             rank_pattern[key] = lcfg["r_global"]
@@ -106,7 +199,7 @@ def build_lora(model, cfg):
     base_kwargs = dict(
         r=lcfg["r_sliding"],
         lora_alpha=int(lcfg["r_sliding"] * lcfg["alpha_ratio"]),
-        target_modules=targets,
+        target_modules=target_regex,
         lora_dropout=lcfg["dropout"],
         rank_pattern=rank_pattern,
         alpha_pattern=alpha_pattern,
@@ -121,6 +214,35 @@ def build_lora(model, cfg):
         print(f"[WARN] init_weights={lcfg['init_weights']} failed ({e}); "
               f"fallback to default init")
         peft_model = get_peft_model(model, LoraConfig(**base_kwargs))
+
+    # 审计: LoRA 不得落在排除关键字模块上(audio 等)
+    excl = lcfg.get("exclude_keywords", [])
+    if excl:
+        bad = [n for n, _ in peft_model.named_parameters()
+               if "lora" in n.lower()
+               and any(k in n.lower() for k in excl)]
+        if bad:
+            raise RuntimeError(f"LoRA 注入了排除模块: {bad[:3]}")
+    n_vis = sum(1 for n, _ in peft_model.named_parameters()
+                if "lora" in n.lower() and "vision" in n.lower())
+    n_llm = sum(1 for n, _ in peft_model.named_parameters()
+                if "lora" in n.lower() and "language" in n.lower())
+    if n_vis == 0 or n_llm == 0:
+        raise RuntimeError(
+            f"LoRA 注入不完整: vision={n_vis}, llm={n_llm} — 检查 target 正则")
+
+    # ⚠️ get_peft_model 会把所有非 adapter 参数重新冻结(v6e-1 烟测发现:
+    # freeze_base 打开的 Projector 被静默关掉,Phase 5/5b 将不训 projector)
+    # → 此处恢复;KTO 等只训 LoRA 的阶段在调用方自行再冻结
+    proj_kw = cfg["freeze"]["projector_keywords"]
+    n_proj = 0
+    for n, p in peft_model.named_parameters():
+        low = n.lower()
+        if any(k in low for k in proj_kw) and "lora" not in low:
+            p.requires_grad = True
+            n_proj += p.numel()
+    print(f"[LoRA] injected: llm={n_llm}, vision={n_vis} tensors; "
+          f"projector re-enabled: {n_proj/1e6:.1f}M params")
     return peft_model
 
 

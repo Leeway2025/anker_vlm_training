@@ -240,6 +240,23 @@ def test_kto_ref_divergence_and_brake():
         ["RoleType_acc"]
 
 
+def test_camera_fingerprint_cluster():
+    """背景指纹贪心聚类(无机位字段数据的伪 camera_id)。"""
+    import numpy as np
+    from data.camera_fingerprint import cluster
+    rng = np.random.RandomState(0)
+
+    def unit(v):
+        return v / np.linalg.norm(v)
+    a, b = unit(rng.randn(64)), unit(rng.randn(64))
+    fps = [unit(a + 0.02 * rng.randn(64)) for _ in range(5)] + \
+          [unit(b + 0.02 * rng.randn(64)) for _ in range(4)]
+    assign = cluster(fps, threshold=0.15)
+    assert len(set(assign[:5])) == 1 and len(set(assign[5:])) == 1
+    assert assign[0] != assign[5]        # 两个机位分开
+    # UCSD 实测: 98 条 → 2 簇(70/28),与 ped1/ped2 真实机位零混淆
+
+
 def test_hard_mining_replication():
     """hard mining 物理复制(XLA 安全的采样加权替代)。"""
     from training.train import apply_hard_mining

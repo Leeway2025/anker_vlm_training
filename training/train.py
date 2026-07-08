@@ -1,8 +1,8 @@
 """训练入口(torch_xla / TPU v6e-8)。
 
-启动(8 核):
-  PJRT_DEVICE=TPU python -m torch_xla.distributed.xla_spawn --num_cores 8 \
-      training/train.py --phase configs/phase5_sft.yaml --stage b \
+启动(torch_xla.launch 内置,自动铺满本机全部 TPU 核):
+  PJRT_DEVICE=TPU python training/train.py \
+      --phase configs/phase5_sft.yaml --stage b \
       [--init-from DIR] [--sample-weights sw.json] [--output DIR]
 
 阶段串联约定(每个 phase 的 final/ 目录 = 完整可续训检查点):
@@ -269,5 +269,16 @@ def main():
     save_final(model, out_dir, cfg, aux, inject_lora)
 
 
-if __name__ == "__main__":
+def _mp_fn(index=0):
     main()
+
+
+if __name__ == "__main__":
+    # PJRT: torch_xla.launch 自动铺满本机全部 TPU 核(v6e-8 → 8 进程)。
+    # 旧文档的 `python -m torch_xla.distributed.xla_spawn` 在 torch_xla 2.x
+    # 不存在(那是老版 transformers 的示例脚本),勿再使用。
+    try:
+        import torch_xla
+        torch_xla.launch(_mp_fn)
+    except ImportError:
+        main()                     # 无 TPU 环境(CPU 调试)直跑

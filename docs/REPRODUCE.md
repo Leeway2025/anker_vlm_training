@@ -1,5 +1,19 @@
 # 客户侧复现手册(从 labels.jsonl 到交付权重)
 
+## ⏱ 性能须知(v6e-1 真机实测,先读)
+
+- **前几步慢是预期**: XLA 对每个新计算图编译 5~8 分钟(5.4B 模型 ×
+  L2048 × 前向反向优化器)。同形状 step 编译一次后 ~2s/步,1M 数据
+  训练中编译占比 <0.1%。
+- **10 步后仍慢 = 在重编译**,先查: ① padding 是否固定
+  (base.yaml `pad_to_fixed_length: true` 不可关)② batch 内形状是否抖动。
+- **编译缓存**: 设 `XLA_PERSISTENT_CACHE_PATH` 可跨进程复用编译;
+  注意部分 libtpu 版本不支持反序列化(日志出现
+  "Failed to deserialize executable: UNIMPLEMENTED" 即无效,
+  升级 torch_xla/libtpu 可解)。
+- **逐 phase 独立进程会重复付模型加载 + 编译**,长链建议用
+  `python -m training.pipeline` 编排。
+
 ## 0. 环境
 
 ```
@@ -42,14 +56,18 @@ python -m annotation.consistency_filter --mode gt \
 ## 3. 训练(按序执行,每步产出进下一步 init_from)
 
 ```
-S=python -m torch_xla.distributed.xla_spawn --num_cores 8
+# torch_xla 2.x 无需外部 launcher: train.py/kto.py 内置 torch_xla.launch,
+# 自动铺满本机全部 TPU 核(v6e-8 → 8 进程)。
+# (旧命令 `python -m torch_xla.distributed.xla_spawn` 已随 torch_xla 2.x 消失)
+S="PJRT_DEVICE=TPU python"
 
 # Phase 5(基础 SFT)
 $S training/train.py --phase configs/phase5_sft.yaml --stage a
 $S training/train.py --phase configs/phase5_sft.yaml --stage b
 # Hard Mining(训 3 epoch 后)
-python -m training.inference_utils_run --ckpt outputs/phase5_sft/final \
-    --labels labels.jsonl --out preds_v0.jsonl        # 见 inference_utils
+PJRT_DEVICE=TPU python -m training.run_inference --ckpt outputs/phase5_sft_b/final \
+    --labels labels.jsonl --out preds_v0.jsonl
+    # XLA 用 static KV cache(inference_utils 内置);断点续跑安全
 python -m training.hard_mining --preds preds_v0.jsonl \
     --labels labels.jsonl --out sw.json
 $S training/train.py --phase configs/phase5_sft.yaml --stage b \

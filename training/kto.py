@@ -25,9 +25,8 @@ TPU 工程要点(对应 WORK_STATUS 风险清单):
   - 每步 4 次 forward(policy/ref × 匹配/错配),仅 policy×匹配带梯度;
     gradient_checkpointing 建议开启
 
-启动:
-  python -m torch_xla.distributed.xla_spawn --num_cores 8 \
-      training/kto.py --config configs/phase6_kto.yaml
+启动(torch_xla.launch 内置,自动铺满本机全部 TPU 核):
+  PJRT_DEVICE=TPU python training/kto.py --config configs/phase6_kto.yaml
 """
 import argparse
 import json
@@ -202,8 +201,11 @@ def kto_loss(logp_policy, logp_ref, kl_policy, kl_ref, is_desirable,
         # 图间噪声(XLA 融合调度差异),零检测请用 adapter_weight_gap
         "ref_gap": (kl_policy - kl_ref).abs().mean().detach(),
         "logratio_abs_mean": logratio.abs().mean().detach(),
-        "reward_desirable": (beta * logratio.detach())[d],
-        "reward_undesirable": (beta * logratio.detach())[~d],
+        # 静态形状(XLA: 布尔掩码索引是动态形状 → 触发重编译,真机踩坑)
+        "reward_desirable": (beta * logratio.detach() * d.float()).sum()
+        / d.float().sum().clamp(min=1),
+        "reward_undesirable": (beta * logratio.detach() * (1 - d.float()))
+        .sum() / (1 - d.float()).sum().clamp(min=1),
     }
 
 
@@ -235,6 +237,92 @@ def kto_step(model, batch, beta, w_d, w_u, chunk_size=256,
                     is_desirable, beta, w_d, w_u, kl_reduce_fn)
 
 
+# ====================== 数据 ======================
+
+class KTOVideoDataset:
+    """kto_data.jsonl(video_id/completion/label)→ 帧 + completion。
+    KTO 帧解码走确定性路径(均匀 16 帧,无增强)。"""
+
+    def __init__(self, kto_records, video_index, cfg):
+        self.records = kto_records
+        self.videos = video_index          # video_id → 视频文件路径
+        self.cfg = cfg
+
+    def __len__(self):
+        return len(self.records)
+
+    def __getitem__(self, i):
+        from data.sampling import decode_video, resize_production
+        r = self.records[i]
+        frames, _ = decode_video(
+            self.videos[r["video_id"]],
+            num_frames=self.cfg["sampling"]["num_frames"])
+        frames = resize_production(frames, self.cfg["sampling"]["image_size"])
+        return {"frames": frames, "completion": r["completion"],
+                "is_desirable": bool(r["label"])}
+
+
+class KTOCollator:
+    """复用 AnkerCollator 的 prompt/视频编码;completion 是完整目标串
+    (desirable=GT / undesirable=模型错误输出),直接 tokenize,无加权。"""
+
+    def __init__(self, processor, cfg):
+        from data.build_dataset import AnkerCollator
+        self.inner = AnkerCollator(processor, cfg)
+        self.cfg = cfg
+
+    def prompt_len(self):
+        """生产 prompt 锁死 → 静态长度(completion 窗口起点)。"""
+        import numpy as np
+        dummy = np.zeros((self.cfg["sampling"]["num_frames"],
+                          self.cfg["sampling"]["image_size"],
+                          self.cfg["sampling"]["image_size"], 3), np.uint8)
+        return self.inner._encode_prompt(dummy, "")["input_ids"].shape[1]
+
+    def __call__(self, batch):
+        import torch
+        from data.build_dataset import pad_fixed
+        tok = self.inner.p.tokenizer
+        model_dtype = getattr(torch, self.cfg["model"]["torch_dtype"])
+        ids_l, labels_l, mmtt_l, pixel_l, vpos_l, d_l = [], [], [], [], [], []
+        for ex in batch:
+            enc = self.inner._encode_prompt(ex["frames"], "")
+            p_ids = enc["input_ids"][0].tolist()
+            t_ids = tok(ex["completion"].strip(),
+                        add_special_tokens=False)["input_ids"] \
+                + [tok.eos_token_id]
+            ids_l.append(torch.tensor(p_ids + t_ids))
+            labels_l.append(torch.tensor([-100] * len(p_ids) + t_ids))
+            mmtt_l.append(torch.tensor(
+                enc["mm_token_type_ids"][0].tolist() + [0] * len(t_ids)))
+            pixel_l.append(enc["pixel_values_videos"][0].to(model_dtype))
+            vpos_l.append(enc["video_position_ids"][0])
+            d_l.append(1.0 if ex["is_desirable"] else 0.0)
+        pad = tok.pad_token_id or 0
+        out = {
+            "input_ids": pad_fixed(ids_l, pad, self.cfg),
+            "labels": pad_fixed(labels_l, -100, self.cfg),
+            "mm_token_type_ids": pad_fixed(mmtt_l, 0, self.cfg),
+            "pixel_values_videos": torch.stack(pixel_l),
+            "video_position_ids": torch.stack(vpos_l),
+            "is_desirable": torch.tensor(d_l),
+        }
+        out["attention_mask"] = (out["input_ids"] != pad).long()
+        return out
+
+
+def save_adapter_cpu(model, out_dir):
+    """CPU 安全的 adapter 保存(XLA 张量直接 safetensors 会崩,E2E 实测)。"""
+    import os as _os
+    from peft import get_peft_model_state_dict
+    from safetensors.torch import save_file
+    _os.makedirs(out_dir, exist_ok=True)
+    sd = {k: v.detach().cpu().contiguous()
+          for k, v in get_peft_model_state_dict(model).items()}
+    save_file(sd, _os.path.join(out_dir, "adapter_model.safetensors"))
+    model.peft_config["default"].save_pretrained(out_dir)
+
+
 # ====================== 入口 ======================
 
 def main():
@@ -248,7 +336,6 @@ def main():
     kcfg = yaml.safe_load(open(a.config, encoding="utf-8"))
 
     from training.common import load_model_and_processor, freeze_base, build_lora
-    from data.build_dataset import AnkerCollator
 
     model, processor = load_model_and_processor(cfg)
     freeze_base(model, cfg)
@@ -307,43 +394,78 @@ def main():
             ws = xm.xrt_world_size()
         return xm.all_reduce(xm.REDUCE_SUM, t) / max(ws, 1)
 
-    collator = AnkerCollator(processor, cfg)
-    # ---- 主循环骨架(DataLoader 拼装依赖 processor 真实签名,烟测时收尾):
-    # import random
-    # rng = random.Random(0)
-    # batches = plan_stratified_batches(
-    #     [r["label"] for r in kto_records],
-    #     cfg["train"]["per_device_batch_size"],
-    #     kcfg.get("undesirable_per_batch", 2), rng)
-    # baseline = <v1.5 在监控集上的分类指标>
-    # for step, idx in enumerate(batches):   # KTOVideoDataset + collator 出 batch
-    #     batch["is_desirable"] = ...        # 由 kto_data 的 label 字段构造
-    # import numpy as np
-    # dummy = np.zeros((16, 384, 384, 3), np.uint8)
-    # p_len = collator._encode_prompt(dummy, "")["input_ids"].shape[1]
-    #                                            # prompt 锁死 → 静态长度
-    # window = (p_len, p_len + kcfg.get("completion_budget", 256))
-    #     loss, logs = kto_step(model, batch, kcfg["beta"],
-    #                           kcfg["desirable_weight"],
-    #                           kcfg["undesirable_weight"],
-    #                           kcfg.get("logprob_chunk", 256), kl_all_reduce,
-    #                           window)   # TPU 必传,否则全长 logits 副本 OOM
-    #     loss.backward(); xm.optimizer_step(opt); opt.zero_grad()
-    #     if step % logging_steps == 0:
-    #         gap = adapter_weight_gap(model)     # 权重空间,起点精确 0
-    #         if ref_divergence_alert(gap, step,
-    #                 kcfg.get("ref_divergence_warn_after", 100)):
-    #             raise RuntimeError("policy 权重未离开 reference 起点 — "
-    #                                "优化器/梯度流失效,训练在空转")
-    #     if step % 100 == 0:
-    #         current = <监控集评测>
-    #         bad = classification_brake(baseline, current)
-    #         if bad: <停止;LR 减半重试或放弃保留 v1.5>
-    raise SystemExit(
-        "SMOKE: KTO 主循环骨架已就绪(损失/分块 logprob/分层 batch/告警"
-        "已实现并有测试),DataLoader 拼装在 TPU 烟测时完成"
-        "(依赖 processor 真实入参签名,见 WORK_STATUS 烟测清单)")
+    # ---- 数据: 分层 batch(每 batch 固定混入错例)+ 多核 shard ----
+    import random
+    from torch_xla import runtime as xr
+    labs = {json.loads(l)["video_id"]: json.loads(l)
+            for l in open(cfg["data"]["labels_file"], encoding="utf-8")}
+    video_index = {vid: os.path.join(
+        cfg["data"]["video_root"],
+        os.path.basename(d.get("video_uri", vid)))
+        for vid, d in labs.items()}
+    ds = KTOVideoDataset(kto_records, video_index, cfg)
+    collator = KTOCollator(processor, cfg)
+
+    p_len = collator.prompt_len()          # prompt 锁死 → 静态窗口
+    window = (p_len, p_len + kcfg.get("completion_budget", 256))
+    print(f"[kto] prompt len={p_len}, completion window={window}")
+
+    world, rank = xr.world_size(), xr.global_ordinal()
+    log_every = int(kcfg.get("logging_steps", 10))
+    save_every = int(kcfg.get("save_steps", 100))
+    step = 0
+    for ep in range(int(kcfg.get("epochs", 1))):
+        rng = random.Random(1000 + ep)
+        batches = plan_stratified_batches(
+            [bool(r["label"]) for r in kto_records],
+            cfg["train"]["per_device_batch_size"],
+            kcfg.get("undesirable_per_batch", 2), rng)
+        for bidx in batches[rank::max(world, 1)]:    # 简单跨核 shard
+            batch = collator([ds[i] for i in bidx])
+            batch = {k: v.to(device) for k, v in batch.items()}
+            loss, logs = kto_step(
+                model, batch, kcfg["beta"], kcfg["desirable_weight"],
+                kcfg["undesirable_weight"], kcfg.get("logprob_chunk", 256),
+                kl_all_reduce if world > 1 else None, window)
+            loss.backward()
+            xm.optimizer_step(opt)         # 多核含梯度 all_reduce
+            opt.zero_grad()
+            xm.mark_step()   # ⚠️ 手写 XLA 循环必须显式步界 —— 缺失时懒执行图
+                             # 跨步无界生长,步步重编译(真机踩坑: 每步 10 分钟)
+            step += 1
+            if step == 1 or step % log_every == 0:
+                gap = adapter_weight_gap(model)
+                print(f"[kto] ep{ep} step{step} loss={float(loss):.4f} "
+                      f"kl={float(logs['kl']):.3f} "
+                      f"ref_gap={float(logs['ref_gap']):.3f} "
+                      f"weight_gap={gap:.2e}", flush=True)
+                if ref_divergence_alert(
+                        gap, step, kcfg.get("ref_divergence_warn_after", 100)):
+                    raise RuntimeError(
+                        "policy 权重未离开 reference 起点 — 优化器/梯度流失效,"
+                        "训练在空转(见 adapter_weight_gap)")
+            if rank == 0 and step % save_every == 0:
+                save_adapter_cpu(model, os.path.join(
+                    a.output, f"checkpoint-{step}"))    # SWA 消费
+            # 分类刹车(training_plan 10.2): 每 100 step 在监控集上比对
+            # classification_brake(baseline, current);评测需 generate,
+            # 由客户侧接 run_inference + eval/metrics(REPRODUCE 第 3 节)
+
+    if rank == 0:
+        final = os.path.join(a.output, "final")
+        save_adapter_cpu(model, final)
+        if _os.path.exists(pj):          # projector 冻结不训,原样传递给下游
+            import shutil
+            shutil.copy(pj, _os.path.join(final, "projector.pt"))
+        print(f"[kto] done: {step} steps -> {final}")
+
+
+def _mp_fn(index=0):
+    main()
 
 
 if __name__ == "__main__":
-    main()
+    # PJRT: torch_xla.launch 自动铺满本机全部 TPU 核(v6e-8 → 8 进程;
+    # 旧文档的 torch_xla.distributed.xla_spawn 在 torch_xla 2.x 已不存在)
+    import torch_xla
+    torch_xla.launch(_mp_fn)

@@ -9,6 +9,8 @@ def main():
     ap.add_argument("--labels", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--max-new-tokens", type=int, default=64)
+    ap.add_argument("--batch-size", type=int, default=8)
     a = ap.parse_args()
     import yaml
     cfg = yaml.safe_load(open("configs/base.yaml", encoding="utf-8"))
@@ -19,10 +21,18 @@ def main():
     freeze_base(model, cfg)
     model = build_lora(model, cfg)
     restore_from(model, a.ckpt, inject_lora=True)
+    if cfg.get("platform") == "tpu":
+        try:
+            import torch_xla.core.xla_model as xm
+            model.to(xm.xla_device())     # E2E 实测: 不上卡会在 CPU 上爬
+        except ImportError:
+            pass
     records = [json.loads(l) for l in open(a.labels, encoding="utf-8")]
     if a.limit:
         records = records[:a.limit]
-    generate_predictions(model, processor, records, cfg, a.out)
+    generate_predictions(model, processor, records, cfg, a.out,
+                         max_new_tokens=a.max_new_tokens,
+                         batch_size=a.batch_size)
 
 
 if __name__ == "__main__":

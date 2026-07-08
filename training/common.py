@@ -206,6 +206,17 @@ def build_lora(model, cfg):
         use_rslora=lcfg["use_rslora"],
         task_type="CAUSAL_LM",
     )
+    # 多 LoRA 红线哨兵: 注入前采样 base 权重,注入后必须逐字节不变
+    # (PISSA 会就地改 base → 端侧共享 base 失效;此断言防止任何
+    #  init 方式静默突破红线)
+    import torch
+    probes = []
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if name.endswith("q_proj.weight") and "language" in name:
+                probes.append((name, p.flatten()[:64].clone()))
+                if len(probes) >= 3:
+                    break
     try:
         peft_model = get_peft_model(model, LoraConfig(
             init_lora_weights=lcfg["init_weights"], **base_kwargs))
@@ -214,6 +225,24 @@ def build_lora(model, cfg):
         print(f"[WARN] init_weights={lcfg['init_weights']} failed ({e}); "
               f"fallback to default init")
         peft_model = get_peft_model(model, LoraConfig(**base_kwargs))
+
+    # 红线断言: base 权重未被注入过程修改
+    # (包装后键名变为 …q_proj.base_layer.weight,按 stem 匹配)
+    with torch.no_grad():
+        pd = dict(peft_model.named_parameters())
+        for name, snap in probes:
+            stem = name[:-len(".weight")]
+            cur = next((v for k, v in pd.items()
+                        if k.endswith(stem + ".base_layer.weight")
+                        or k.endswith(name)), None)
+            if cur is None:
+                print(f"[WARN] base probe not found after wrap: {name}")
+                continue
+            if not torch.equal(cur.flatten()[:64].cpu(), snap.cpu()):
+                raise RuntimeError(
+                    f"base 权重在 LoRA 注入时被修改({name})— 多 LoRA "
+                    f"部署红线失守。init_weights 不能用 pissa/olora/corda "
+                    f"这类会改 base 的初始化")
 
     # 审计: LoRA 不得落在排除关键字模块上(audio 等)
     excl = lcfg.get("exclude_keywords", [])

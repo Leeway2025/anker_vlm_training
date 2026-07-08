@@ -48,7 +48,11 @@ lora:
   alpha_ratio: 2.0          # alpha = ratio * r
   dropout: 0.0
   use_rslora: true
-  init_weights: "pissa"     # 需 peft>=0.10;失败自动回退 "gaussian"
+  # ⚠️ PISSA 默认关闭(多 LoRA 部署红线): PISSA 初始化会就地修改 base
+  # 权重(W←W−BA),导出的 base 将与端侧 function LoRA 共享的 base 不一致;
+  # 且 peft 的 PISSA→标准 LoRA 转换与 rsLoRA/rank_pattern 互斥(官方警告)。
+  # 单 LoRA 场景如需 PISSA,须同时关 rsLoRA 与差异化 rank 并走转换流程。
+  init_weights: "gaussian"
   loraplus_lr_ratio: 16.0   # B 矩阵 LR = A 矩阵 LR × 16
   # gemma-4 带 audio_tower(也有 *_proj 模块),LoRA 禁止注入(烟测确认)
   exclude_keywords: ["audio"]

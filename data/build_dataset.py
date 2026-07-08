@@ -151,6 +151,21 @@ class AnkerVideoDataset:
         return {"frames": frames, **ex, "video_id": rec["video_id"]}
 
 
+def pad_fixed(seqs, value, cfg):
+    """固定长度 padding(TPU/XLA 防重编译)。SFT 与 KTO collator 共用。"""
+    import torch
+    from torch.nn.utils.rnn import pad_sequence
+    x = pad_sequence(seqs, batch_first=True, padding_value=value)
+    if cfg["train"].get("pad_to_fixed_length"):
+        L = cfg["train"]["max_seq_len"]
+        if x.shape[1] > L:
+            x = x[:, :L]          # 超长截断(监控 truncation 率)
+        elif x.shape[1] < L:
+            padder = x.new_full((x.shape[0], L - x.shape[1]), value)
+            x = torch.cat([x, padder], dim=1)
+    return x
+
+
 class AnkerCollator:
     """processor 编码 + labels/token_weights 构造。
 
@@ -213,19 +228,9 @@ class AnkerCollator:
                           for h in AUX_HEAD_ORDER])
 
         pad = tok.pad_token_id or 0
-        from torch.nn.utils.rnn import pad_sequence
 
         def _pad(seqs, value):
-            x = pad_sequence(seqs, batch_first=True, padding_value=value)
-            # TPU/XLA: 固定长度 padding,否则每个 batch 触发一次重编译
-            if self.cfg["train"].get("pad_to_fixed_length"):
-                L = self.cfg["train"]["max_seq_len"]
-                if x.shape[1] > L:
-                    x = x[:, :L]      # 超长截断(监控 truncation 率)
-                elif x.shape[1] < L:
-                    padder = x.new_full((x.shape[0], L - x.shape[1]), value)
-                    x = torch.cat([x, padder], dim=1)
-            return x
+            return pad_fixed(seqs, value, self.cfg)
 
         out = {
             "input_ids": _pad(input_ids_l, pad),

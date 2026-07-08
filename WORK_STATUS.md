@@ -1,5 +1,45 @@
 # 代码开发工作状态快照
 
+> 更新:2026-07-08(第 8 轮,**三项遗留收口: KTO 实装 / generate / 分布式入口**)
+> - **kto.py DataLoader 实装完成**(骨架清零): KTOVideoDataset(确定性
+>   16 帧,无增强)+ KTOCollator(复用 AnkerCollator 的 prompt/视频编码,
+>   completion 直接 tokenize)+ 主循环(分层 batch → kto_step →
+>   xm.optimizer_step → 权重分化告警 → checkpoint/final CPU 安全保存,
+>   projector 原样传递)。真机: step1 loss=0.624 / weight_gap=8.6e-06
+>   (优化器首步即真实更新)
+> - **分布式入口修正(bug #15)**: 文档所写 `torch_xla.distributed.xla_spawn`
+>   在 torch_xla 2.x 不存在(老版 transformers 示例脚本)。train.py/kto.py
+>   已内置 `torch_xla.launch(_mp_fn)`(v6e-8 自动 8 进程),README/REPRODUCE
+>   启动命令同步更新;kto 数据按 global_ordinal shard,KL all_reduce 跨核
+> - **generate 路径真机通过**: inference_utils 加 static KV cache
+>   (XLA 动态 cache 逐位置重编译不可用)+ run_inference 上卡修复与
+>   --max-new-tokens/--batch-size 参数;E2E: 加载→恢复→生成→解码→
+>   写盘→metrics 全通(合成模型输出退化属预期,format_fail 兜底正确)
+> - **两个手写 XLA 循环的致命坑(真机踩掉,已修)**:
+>   ⑯ 循环缺 xm.mark_step() → 懒执行图跨步无界生长,步步重编译
+>     (每步 ~10 分钟);加步界后稳态 ~30s/步,12 步 5 分钟跑完
+>   ⑰ 日志用布尔掩码索引(动态形状)→ 改静态形状(掩码乘法)
+> - KTO 真机 12 步: weight_gap 单调增长(8.6e-6 → 3.7e-5,优化器持续
+>   真实更新);checkpoint-6/12 + final(含 projector 传递)落盘
+> - 仍留客户侧首跑确认: 真 8 核(本机 v6e-1,world=1 已验证入口/shard/
+>   all_reduce 代码路径)/ per-device batch 8 显存 / RKLLM 工具链
+
+> 更新:2026-07-08(第 7 轮,**多 LoRA/NPU 部署红线加固**,S-LoRA 式
+> 共享 base 场景,用户提出 + peft 官方警告佐证)
+> - **PISSA 默认关闭**(base.yaml init_weights: gaussian): PISSA 初始化
+>   会就地修改 base 权重(W←W−BA),与端侧多 adapter 共享同一 base.rkllm
+>   直接冲突;且 peft 声明其"转回标准 LoRA"流程与 rsLoRA/rank_pattern 互斥
+> - **build_lora 加 base 不变性哨兵**: 注入前采样 base 权重切片,注入后
+>   逐字节比对,任何改 base 的初始化(pissa/olora/corda)当场 raise
+> - **split_deliverables 加 rsLoRA 折叠**: √r 折进 lora_B(数值恒等),
+>   导出 adapter 为纯标准 LoRA 语义 + use_rslora=false 配置
+>   —— 不折叠的话 RKLLM 按 α/r 读会差 √r 倍(r=256 → 16 倍,静默精度崩)
+> - 遗留 Phase 0 客户工具链测试项: RKLLM 是否接受逐层异构 rank(512/256);
+>   不接受则 base.yaml 设 r_global=r_sliding 一行回退(统一 rank)
+> - ✅ gaussian init 下复验通过: 5d(退火回调触发)→ SWA(2 ckpt 平均)
+>   → 导出(rsLoRA 折叠 205 个 lora_B / llm_adapter 410 键 /
+>   vision_merged 659 张量)→ metrics 全指标;base 哨兵静默通过
+
 > 更新:2026-07-07(第 6 轮,**多阶段流水线 E2E 在 TPU v6e-1 真机跑通**)
 > 合成 12 条视频小数据集,完整执行: Phase 5a(projector warmup)→
 > 5b(LoRA 联合)→ 5b_aux(7 辅助头)→ 5d(隐式 CoT,退火回调真机触发)

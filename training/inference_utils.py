@@ -34,8 +34,16 @@ def generate_predictions(model, processor, records, cfg, out_path,
                 messages, add_generation_prompt=True, tokenize=True,
                 return_dict=True, return_tensors="pt", padding=True,
                 do_sample_frames=False).to(model.device)
-            out = model.generate(**inputs, max_new_tokens=max_new_tokens,
-                                 do_sample=False)
+            # XLA: 动态 KV cache 每个解码位置都触发重编译(几十张图);
+            # static cache 只编 prefill + decode 两张图(真机确认项)
+            gen = dict(max_new_tokens=max_new_tokens, do_sample=False)
+            try:
+                out = model.generate(**inputs,
+                                     cache_implementation="static", **gen)
+            except Exception as e:
+                print(f"[WARN] static cache 失败({str(e)[:80]}),"
+                      f"回退动态 cache(XLA 下会很慢)")
+                out = model.generate(**inputs, **gen)
             texts = processor.batch_decode(
                 out[:, inputs["input_ids"].shape[1]:],
                 skip_special_tokens=True)

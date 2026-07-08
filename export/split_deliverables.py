@@ -43,6 +43,25 @@ def main():
     sd = load_file(os.path.join(a.adapter, "adapter_model.safetensors"))
     llm_keys, vis_keys = split_adapter_keys(list(sd), vis_kw)
     llm_sd = {k: sd[k] for k in llm_keys}
+
+    # rsLoRA 折叠(多 LoRA/NPU 兼容关键): RKLLM 等标准运行时按 α/r 缩放,
+    # rsLoRA 训练语义是 α/√r —— 直接导出会差 √r 倍(r=256 时 16 倍)。
+    # 把 √r 折进 lora_B(数值恒等),产物成为纯标准 LoRA;
+    # r 从张量形状取(lora_B: [out, r]),天然兼容 rank_pattern 异构 rank。
+    import json as _json
+    import math
+    acfg_path = os.path.join(a.adapter, "adapter_config.json")
+    acfg = _json.load(open(acfg_path, encoding="utf-8"))
+    if acfg.get("use_rslora"):
+        n_fold = 0
+        for k in list(llm_sd):
+            if "lora_B" in k:
+                r = llm_sd[k].shape[1]
+                llm_sd[k] = llm_sd[k] * math.sqrt(r)
+                n_fold += 1
+        acfg["use_rslora"] = False
+        print(f"[rslora] folded sqrt(r) into {n_fold} lora_B tensors "
+              f"→ 标准 LoRA 语义(端侧运行时无需理解 rsLoRA)")
     if a.issue480:
         # 仓库相对路径,不依赖 cwd(E2E 实测: 在别的目录运行时 "docs" 失效)
         sys.path.insert(0, os.path.join(os.path.dirname(
@@ -53,7 +72,9 @@ def main():
     llm_dir = os.path.join(a.out, "llm_adapter")
     os.makedirs(llm_dir, exist_ok=True)
     save_file(llm_sd, os.path.join(llm_dir, "adapter_model.safetensors"))
-    shutil.copy(os.path.join(a.adapter, "adapter_config.json"), llm_dir)
+    with open(os.path.join(llm_dir, "adapter_config.json"), "w",
+              encoding="utf-8") as f:
+        _json.dump(acfg, f, indent=2)    # 折叠后 use_rslora=false 的配置
     print(f"(a) llm_adapter: {len(llm_keys)} keys "
           f"(stripped {len(vis_keys)} vision keys)")
 

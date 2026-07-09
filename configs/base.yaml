@@ -10,6 +10,9 @@ model:
   name_or_path: "google/gemma-4-e2b-it"
   torch_dtype: "bfloat16"          # TPU 原生 bf16
   attn_implementation: "sdpa"      # TPU/XLA 用 sdpa
+  # 本任务无音频输入: 加载时剥离 audio_tower/embed_audio,省 HBM 加速加载
+  # (forward 的音频分支本就永不触发;交付物不受影响)
+  strip_audio: true
 
 # ---------- 采样与预处理(与生产逐字对齐,已确认) ----------
 sampling:

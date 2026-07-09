@@ -12,6 +12,24 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from data.taxonomy import AUX_VOCABS, AUX_HEAD_ORDER, KS_CLASSES  # noqa: E402
 
 
+def strip_audio_modules(model):
+    """剥离 audio_tower / embed_audio(本任务无音频输入,forward 的音频
+    分支永不触发,但参数常驻 HBM)。省显存 + 加速加载;
+    注意: 剥离后的进程内 state_dict 不含 audio 键,跨阶段 restore 均
+    strict=False,不受影响;交付物(llm_adapter/vision_merged)本就不含 audio。"""
+    n = 0
+    for _, mod in list(model.named_modules()):
+        for child in ("audio_tower", "embed_audio"):
+            sub = getattr(mod, child, None)
+            if sub is not None and hasattr(sub, "parameters"):
+                n += sum(p.numel() for p in sub.parameters())
+                setattr(mod, child, None)
+    if n:
+        print(f"[strip] audio 模块已剥离: {n/1e6:.0f}M 参数"
+              f"(bf16 ≈ {n*2/1e9:.2f}GB HBM)")
+    return model
+
+
 def load_model_and_processor(cfg):
     import torch
     from transformers import AutoProcessor
@@ -25,6 +43,8 @@ def load_model_and_processor(cfg):
     except Exception:
         kwargs["attn_implementation"] = "sdpa"
         model = _load(name, **kwargs)
+    if cfg["model"].get("strip_audio", True):
+        strip_audio_modules(model)
     return model, processor
 
 

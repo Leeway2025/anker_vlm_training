@@ -15,7 +15,11 @@
 #   破线处置: LR 减半重试 → 仍不达则保留 v2
 phase: "7_1m_calib"
 init_from: "outputs/swa_final"    # v2(含 projector);无 SWA 则 phase6_kto/final
-epochs: 2                          # 上限;早停决定实际长度
+epochs: 2                          # 上限;早停决定实际长度。
+# 预期口径(客户实测): 1M 收益被容量截断 —— r64 基线提升明显,
+# 全参 EunoVLM 提升更大;我方 378M 可训容量(r512/256+vision+proj)
+# 预期靠近全参侧。若 2ep 用尽且验证曲线仍在降(容量未吃饱 1M),
+# 用 --init-from <本阶段final> --epochs 追加,勿机械停
 learning_rate_scale: 0.5           # 真学习与保成果的折中
 use_whitelist_only: false
 enable_ks_parent_head: false       # 资产阶段不重跑,纯生产格式 SFT

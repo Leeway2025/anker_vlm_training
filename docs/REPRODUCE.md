@@ -32,6 +32,10 @@ labels.jsonl 每行(与 annotation_spec 2.2 一致):
  "labels": {"role_type": "B", "sub_keyscene": "i", "description": "..."},
  "meta": {"camera_id": "cam_001", ...}}
 
+⓪ euno WDS 数据(客户正式)先转换(标注/帧定位元数据齐全):
+   python -m data.euno_wds --annotation <euno标注.json> \
+       --wds-dir <本地或gcsfuse路径> --out DATA/labels.jsonl
+   (训练是随机读,分片须本地盘/gcsfuse;gs:// 直读仅标注作业)
 ① 改 configs/base.yaml → data.* 路径
 ② 格式字节核对(整串,不止分隔符):
    从数据文件原样复制 3+ 条真实 GT 输出串存 gt_samples.txt(每行一条)
@@ -45,12 +49,19 @@ labels.jsonl 每行(与 annotation_spec 2.2 一致):
 ## 2. Gemini 增强标注(资产 A/C/D)
 
 ```
-python -m annotation.gemini_labeler --labels labels.jsonl \
-    --video-root videos/ --out pass1.jsonl --temperature 0.1
+# 客户 WDS 数据(正式路径):
+python -m annotation.label_euno_wds --wds-dir <dir> \
+    --annotation <euno标注.json> --out pass1.jsonl \
+    --model gemini-3.1-pro --vertex-project <P> --workers 8
+# (代理集视频文件用 annotation.gemini_labeler --video-root)
 python -m annotation.consistency_filter --mode gt \
     --gemini pass1.jsonl --gt labels.jsonl --out-dir filtered/
-# filtered/whitelist_ids.txt → configs/base.yaml data.whitelist_file
-# 白名单率应 ≥80%;discarded 抽 500 条人工看(可能是 GT 错标)
+python -m annotation.split_assets --gemini pass1.jsonl \
+    --whitelist filtered/whitelist_ids.txt --out-dir DATA/
+# ⚠️ split_assets 是训练消费的最后一环(资产层过滤);样本永远全量,
+#    白名单不过滤训练样本(GT=Gemini+人工修正,质量高于 Gemini)
+# 白名单率应 ≥85%;discarded 高频对 = Gemini 系统性盲区(报供应方
+#    改标注 prompt),而非 GT 错标
 ```
 
 ## 3. 训练(按序执行,每步产出进下一步 init_from)
@@ -71,17 +82,21 @@ PJRT_DEVICE=TPU python -m training.run_inference --ckpt outputs/phase5_sft_b/fin
 python -m training.hard_mining --preds preds_v0.jsonl \
     --labels labels.jsonl --out sw.json
 $S training/train.py --phase configs/phase5_sft.yaml --stage b \
-    --sample-weights sw.json
+    --init-from outputs/phase5_sft_b/final --sample-weights sw.json \
+    --output outputs/phase5_sft_hm   # 必须换目录,勿覆盖 3b 产物
 
 # Phase 5b(辅助头)→ Phase 5d(隐式 CoT)
 $S training/train.py --phase configs/phase5b_aux.yaml
 $S training/train.py --phase configs/phase5d_cot.yaml
+# v1.5 推理(KTO 数据与验收共用;大规模可 --shard i/n 多机切片)
+PJRT_DEVICE=TPU python -m training.run_inference \
+    --ckpt outputs/phase5d_cot/final --labels labels.jsonl --out preds_v15.jsonl
 # 验收: think 泄漏率必须 = 0%
 python -m eval.metrics --pred preds_v15.jsonl --gt labels.jsonl | grep think_leak
 
 # Phase 6(KTO)→ SWA
 python -m training.build_kto_data --preds preds_v15.jsonl \
-    --labels labels.jsonl --whitelist filtered/whitelist_ids.txt \
+    --labels labels.jsonl \
     --out outputs/kto_data.jsonl
 $S training/kto.py --config configs/phase6_kto.yaml
 python -m training.swa --ckpts 'outputs/phase6_kto/checkpoint-*' \
@@ -92,7 +107,9 @@ python -m training.swa --ckpts 'outputs/phase6_kto/checkpoint-*' \
 
 ```
 python -m export.split_deliverables --adapter outputs/swa_final \
-    --base google/gemma-4-e2b-it --out deliverables/ --issue480
+    --base google/gemma-4-e2b-it \
+    --projector outputs/phase5d_cot/final/projector.pt \
+    --out deliverables/ --issue480   # --projector 必传,否则丢训练成果
 python -m export.export_onnx --base google/gemma-4-e2b-it \
     --vision-merged deliverables/vision_merged.pt --out vision_video.onnx
 # → deliverables/llm_adapter/  交给 rkllm-toolkit(base+adapter)
@@ -106,5 +123,5 @@ python -m export.export_onnx --base google/gemma-4-e2b-it \
 | Phase 5 | SubKS/RT 显著高于基线;loss_cls 曲线在降(不能只有 loss_desc 降) |
 | Phase 5b | RT 相对 Phase 5 +1 以上;辅助头 loss 正常下降 |
 | Phase 5d | 分类不降 + think 泄漏率 = 0% |
-| KTO | 监控集分类不降(任一降 >0.5 自动停);热区对混淆减少 |
+| KTO | 监控集分类不降(离线对中间 checkpoint 评测,任一降 >0.5 → 停/换 ckpt);热区对混淆减少 |
 | 导出 | 格式合规率 100%;非法组合率 <0.5%;INT8 回归 <1.5%(客户端侧) |

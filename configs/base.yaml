@@ -99,7 +99,9 @@ data:
   video_root: "DATA/videos"
   attributes_file: "DATA/asset_A_attributes.jsonl"   # Phase 5b 用
   reasoning_file: "DATA/asset_C_reasoning.jsonl"     # Phase 5d 用
-  whitelist_file: "DATA/asset_D_whitelist.txt"       # 5b/5d/KTO 用
+  whitelist_file: "DATA/asset_D_whitelist.txt"  # 客户方案: 仅留档,样本不
+                                              # 过滤(资产层已过滤);
+                                              # 代理集伪 GT 场景才启用
   val_holdout_key: "camera_id"   # 按摄像头/住户切分验证集,防泄漏
   val_size: 30000
   num_workers: 8

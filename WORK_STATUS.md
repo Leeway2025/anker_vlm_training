@@ -1,5 +1,21 @@
 # 代码开发工作状态快照
 
+> 更新:2026-07-09(第 14 轮,**训练部分整体 review: 5 硬伤修复 + 真机回归**)
+>   ㉖ trainer 整段 .float() 物化 (B,L,262k) fp32 → bs8≈17GB v6e 必 OOM
+>     → 分块加权 CE(ce_chunk=256,步数静态单编译)+ 监控量张量累积
+>     (log 步才 .item(),消除每步 XLA 同步)【原版遗留,bs2 演练侥幸】
+>   ㉗ 辅助头/KS 父类头**从未进优化器**(懒初始化晚于 build_optimizer,
+>     随机权重陪跑)→ eager 初始化(fp32 头)+ aux/ks 分别空参守卫
+>     + 单测(一步优化权重必变)。真机再踩两坑一并修:维度须在全部
+>     匹配模块找 2D 权重(最深匹配可能是 norm);钩子须挂顶层 embedder
+>     (最深层是投影前 768 维,与 1536 头错位)【原版遗留】
+>   ㉘ pipeline.py 仍生成已消失的 xla_spawn 启动器【原版遗留】
+>   ㉙ val_size 30000(1M 设定)→ 8000(100k 阶段)【原版配置】
+>   ㉚ split_by_camera 把 camera_id=unknown 当同一机位整组切分 →
+>     退化为按 video_id【euno 流程引入的交互问题】
+> 真机回归(UCSD 沙盒 5b): 新 trainer 训练+eval 正常、loss_cls 记录,
+>   final 四件套含真训 aux_heads.pt(1536 维 fp32);24/24 + 6/6 全绿
+
 > 更新:2026-07-08(第 13 轮,**全阶段六维 review + "GT 质量>Gemini"原则贯穿**)
 > 六维审计(数据来源/前置就绪/下降风险/输出/结束判定/文档)新修:
 >   ㉒ euno_to_labels 不支持 gs://(裸 open)→ 复用 open_binary

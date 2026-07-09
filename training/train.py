@@ -53,14 +53,23 @@ def load_records(cfg, phase):
 
 
 def apply_hard_mining(records, sample_weights: dict):
-    """错例按权重物理复制(权重 3.0 → 出现 3 次)。
+    """错例按权重物理复制(3.0 → 3 次;分数权重走流式最大余数法,
+    总质量精确≈Σw —— per-class 膨胀上限会产生 1.3 这类分数权重,
+    直接 round 会把 <1.5 全部截成 1,上限失效)。
     为什么不用 WeightedRandomSampler: XLA 多核下 Trainer 会套
     DistributedSampler,二者不能组合;物理复制在任何 sampler 下都成立。"""
     out = []
+    acc = 0.0
     for r in records:
-        n = max(1, round(sample_weights.get(r["video_id"], 1.0)))
+        w = max(1.0, float(sample_weights.get(r["video_id"], 1.0)))
+        n = int(w)
+        acc += w - n
+        if acc >= 1.0:
+            n += 1
+            acc -= 1.0
         out.extend([r] * n)
-    print(f"[hard-mining] {len(records)} -> {len(out)} samples")
+    print(f"[hard-mining] {len(records)} -> {len(out)} samples "
+          f"(Σw={sum(max(1.0, float(sample_weights.get(r['video_id'], 1.0))) for r in records):.1f})")
     return out
 
 

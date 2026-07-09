@@ -338,6 +338,35 @@ def test_hard_mining_replication():
     out = apply_hard_mining(recs, {"b": 3.0})
     ids = [r["video_id"] for r in out]
     assert ids.count("b") == 3 and ids.count("a") == 1 and len(out) == 5
+    # 分数权重(per-class 膨胀上限产物): 流式最大余数,总质量守恒
+    recs4 = [{"video_id": x} for x in "abcd"]
+    out = apply_hard_mining(recs4, {x: 1.5 for x in "abcd"})
+    assert len(out) == 6                      # Σw = 6.0 精确命中
+
+
+def test_hard_mining_class_cap_and_whitelist():
+    """错例×3 的下滑防护: per-class 膨胀上限 + 白名单过滤 GT 噪声。"""
+    from training.hard_mining import build_weights
+    # 类 s: 10 条全错(难类扎堆);类 m: 10 条只错 1 条
+    gts = {f"s{i}": ("C", "s") for i in range(10)}
+    gts.update({f"m{i}": ("D", "m") for i in range(10)})
+    preds = {f"s{i}": "D|m|wrong" for i in range(10)}       # s 全错
+    preds.update({f"m{i}": "D|m|ok" for i in range(1, 10)})
+    preds["m0"] = "C|s|wrong"                               # m 错 1 条
+    w, st = build_weights(preds, gts, hard_weight=3.0,
+                          max_class_inflation=1.5)
+    # s 类全错: 不封顶质量会 ×3,封顶后权重压到 1.5(质量 ×1.5)
+    assert abs(w["s0"] - 1.5) < 1e-6
+    assert st["class_inflation"]["s"]["mass_x"] == 1.5
+    # m 类仅 1 错: ×3 后质量 = 12/10 = 1.2 ≤ 1.5,不受压制
+    assert w["m0"] == 3.0
+    assert w["m1"] == 1.0
+    # 白名单: 不在名单内的错例视为疑似 GT 噪声,不放大
+    w2, st2 = build_weights(preds, gts, 3.0,
+                            whitelist={f"s{i}" for i in range(10)},
+                            max_class_inflation=0)
+    assert w2["m0"] == 1.0 and st2["wrong_untrusted"] == 1
+    assert w2["s0"] == 3.0 and st2["wrong_trusted"] == 10
 
 
 

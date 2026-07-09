@@ -7,6 +7,54 @@
 > 标签为规则伪标(`meta.label_source="rule_pseudo"`),资产 A/C/D 为模拟
 > (记录含 `simulated:true`)—— 正式代理训练前须 gemini_labeler 重打。
 
+## 数据流总览(每步的命令、输入 → 输出、如何接入自己的数据)
+
+**客户真实数据(euno WDS 格式)接入——一条命令转换后全链通用**:
+```
+python -m data.euno_wds --annotation euno_train_v3.0.18_balanced_100k_frames.json \
+    --wds-dir anker_video_clips_wds_full --out DATA/labels.jsonl
+# camera_id 自动从设备序列号提取;uuid 命名的补跑 camera_fingerprint
+# 基线复现: python -m eval.euno_results_adapter --results <euno推理结果.json> \
+#     --out-dir baseline_eval/ && python -m eval.metrics --pred ... --gt ...
+```
+(帧已上游预处理 → 训练自动走 EunoWDSDataset,时序裁剪/原图 crop 增强
+自动禁用;分隔符已按真实 GT 核对为 `|` 无空格。)
+
+**接入自己的数据只需两件事**:
+1. 视频文件放一个目录;labels.jsonl 按 Step 1a 的字段写好(每行一条);
+2. 改 `configs/base.yaml` 的 `data.*` 六个路径(labels_file / video_root /
+   attributes_file / reasoning_file / whitelist_file / val_holdout_key)。
+   之后所有命令**不带数据参数**的,都从 base.yaml 读;带 `--labels/--out`
+   参数的,直接在命令行指过去。
+
+| 步 | 命令(可直接复制) | 输入 | 输出 |
+|---|---|---|---|
+| 0 | `python3 tests/test_core.py` | 代码库 | 21/21 通过 |
+| 1b | `python -m eval.check_format_alignment --gt-samples gt3.txt --tokenizer <模型路径>` | 3+ 条原样复制的 GT 串 | 通过/FAIL 提示 |
+| 1b' | `python -m data.camera_fingerprint --labels <labels.jsonl> --video-root <视频目录>` | 无机位字段的 labels | meta.camera_id 回写 |
+| 1c | `python -m eval.monitor_set --labels <labels.jsonl> --out monitor.jsonl` | labels | 分层监控集 |
+| 2 | `python -m annotation.gemini_labeler --labels <labels> --video-root <目录> --out pass1.jsonl --model <m> [--vertex-project P --location L] --temperature 0.1`(0.4 再跑一遍) | labels+视频 | gemini_pass{1,2}.jsonl |
+| 2' | `python -m annotation.consistency_filter --mode double --gemini pass1.jsonl --gemini2 pass2.jsonl --out-dir filtered/`(有人工 GT 用 `--mode gt --gt labels.jsonl`) | 两遍标注 | 资产 A/C/D(whitelist) |
+| 3a | `PJRT_DEVICE=TPU python training/train.py --phase configs/phase5_sft.yaml --stage a` | base.yaml data.* | outputs/phase5_sft_a/final |
+| 3b | `… --stage b --init-from outputs/phase5_sft_a/final` | 3a final | outputs/phase5_sft_b/final |
+| 4a | `PJRT_DEVICE=TPU python -m training.run_inference --ckpt outputs/phase5_sft_b/final --labels <labels> --out preds_v0.jsonl` | 3b final | preds_v0.jsonl |
+| 4b | `python -m training.hard_mining --preds preds_v0.jsonl --labels <labels> --out sw.json` → `train.py --stage b --init-from outputs/phase5_sft_b/final --sample-weights sw.json --output outputs/phase5_sft_hm` | preds+labels | sw.json → hm/final |
+| 5 | `… train.py --phase configs/phase5b_aux.yaml [--init-from outputs/phase5_sft_hm/final]` | 资产 A + 白名单 | outputs/phase5b_aux/final |
+| 6 | `… train.py --phase configs/phase5d_cot.yaml` | 资产 C + 白名单 | outputs/phase5d_cot/final |
+| 7a | `python -m training.build_kto_data --preds <v1.5 preds> --labels <labels> --whitelist <D> --out outputs/kto_data.jsonl` | preds+labels+D | kto_data.jsonl |
+| 7b | `PJRT_DEVICE=TPU python training/kto.py --config configs/phase6_kto.yaml` | kto_data + 5d final | outputs/phase6_kto/{checkpoint-*,final} |
+| 7c | `python -m training.swa --ckpts 'outputs/phase6_kto/checkpoint-*' --out outputs/swa_final` | KTO ckpts | swa_final |
+| 8 | `python -m export.split_deliverables --adapter outputs/swa_final --base <base权重> --projector outputs/phase5d_cot/final/projector.pt --out deliverables/ [--issue480]` | swa_final | llm_adapter/ + vision_merged.pt |
+
+**训练不是必须全链跑**(阶段可选/可跳/可从外部起步):
+- 编排器: `configs/pipeline.yaml` 每阶段 `enabled: true/false`,跳过的阶段
+  链条自动缝合到最近已启用产出;`python -m training.pipeline --dry-run`
+  先看执行计划。
+- 任意点起步: 已有外部 checkpoint 设 `start_from_checkpoint`,或任何
+  train.py 命令直接 `--init-from <目录>`。
+- 最小可用链 = 只跑 3a+3b(基础 SFT);4~7 每级都是可选增益
+  (hard mining / 辅助头 / CoT / KTO predictably +0.3~2 分,见 training_plan)。
+
 ## Step 0 环境自检
 
 - **目的**: 确认依赖齐全、纯逻辑测试全绿,才允许碰 TPU。

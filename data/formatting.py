@@ -24,7 +24,7 @@ class TargetSpec:
     weight_spans: List[Tuple[int, int, float]] = field(default_factory=list)
 
 
-def build_target(rt: str, sk: str, desc: str, sep: str = " | ",
+def build_target(rt: str, sk: str, desc: str, sep: str = "|",
                  cls_weight: float = 4.0) -> TargetSpec:
     """生产格式目标: "B | i | A delivery person ..."
 
@@ -42,7 +42,7 @@ def build_target(rt: str, sk: str, desc: str, sep: str = " | ",
 
 
 def build_cot_target(rt: str, sk: str, desc: str, reasoning: str,
-                     sep: str = " | ", cls_weight: float = 4.0,
+                     sep: str = "|", cls_weight: float = 4.0,
                      think_open: str = "<think>",
                      think_close: str = "</think>") -> TargetSpec:
     """Phase 5d 推理链模式目标:

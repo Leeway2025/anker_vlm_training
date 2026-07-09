@@ -17,12 +17,12 @@ sampling:
   image_size: 384           # 直接 resize 384x384(拉伸,不保纵横比)
   visual_tokens: 70         # Gemma 4 官方档位,勿改
 
-# ---------- 输出格式(须与客户 3 条真实 GT 字符串字节核对) ----------
+# ---------- 输出格式(已与客户真实 GT 字节核对) ----------
 format:
-  # TODO(开训前): python -m eval.check_format_alignment --gt-samples …
-  # 整串字节核对(separator 与 prompt.txt 的空格/换行均须与生产一致,
-  # PDF 的 prompt 代码块含排版产物,prompt.txt 为清理版,不可默认可信)
-  separator: " | "
+  # ✅ 2026-07-08 按 euno数据集说明.md 的 5 条真实 GT 核对:
+  # 真实分隔符**无空格**("D|g|A man..."),prompt.txt 与客户模板逐字节一致。
+  # 客户如换版式,用 eval/check_format_alignment.py --gt-samples 重核。
+  separator: "|"
   prompt_file: "configs/prompt.txt"
   rt_letters: "ABCDE"
   sk_letters: "abcdefghijklmnopqrstu"

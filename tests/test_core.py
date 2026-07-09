@@ -11,13 +11,17 @@ from annotation.consistency_filter import filter_gt, filter_double
 
 
 def test_build_target_basic():
+    # 默认分隔符 = "|"(euno 真实 GT 字节核对结论,2026-07-08)
     t = build_target("B", "i", "A delivery person places a package.")
-    assert t.text == "B | i | A delivery person places a package."
-    # 分类段 = "B | i | " 共 8 字符,权重 4.0
-    assert t.weight_spans == [(0, 8, 4.0)]
+    assert t.text == "B|i|A delivery person places a package."
+    # 分类段 = "B|i|" 共 4 字符,权重 4.0
+    assert t.weight_spans == [(0, 4, 4.0)]
     assert char_weight_at(t, 0) == 4.0     # 'B'
-    assert char_weight_at(t, 4) == 4.0     # 'i'
-    assert char_weight_at(t, 8) == 1.0     # desc 第一个字符
+    assert char_weight_at(t, 2) == 4.0     # 'i'
+    assert char_weight_at(t, 4) == 1.0     # desc 第一个字符
+    # 旧空格版式仍可显式传入(客户换版式时只改 config)
+    t2 = build_target("B", "i", "x", sep=" | ")
+    assert t2.text == "B | i | x" and t2.weight_spans == [(0, 8, 4.0)]
 
 
 def test_build_target_rejects_bad_letters():
@@ -37,30 +41,28 @@ def test_cot_target_think_masked():
     # think 段权重 0
     assert char_weight_at(t, 0) == 0.0
     assert char_weight_at(t, close - 1) == 0.0
-    # 答案分类段权重 4.0
+    # 答案分类段权重 4.0("C|n|" 共 4 字符)
     assert t.text[close] == "C"
     assert char_weight_at(t, close) == 4.0
     # description 权重 1.0
-    assert char_weight_at(t, close + 8) == 1.0
+    assert char_weight_at(t, close + 4) == 1.0
 
 
 def test_token_weight_mapping():
-    t = build_target("B", "i", "Hi.")
-    # 模拟 tokenizer offsets: "B"|" |"|" i"|" |"|" Hi"(跨界)|special
-    offsets = [(0, 1), (1, 3), (3, 5), (5, 7), (7, 11), (0, 0)]
+    t = build_target("B", "i", "Hi.")            # "B|i|Hi."
+    # 模拟 tokenizer offsets: "B"|"|"|"i"|"|"|"Hi."(跨界不涉及)|special
+    offsets = [(0, 1), (1, 2), (2, 3), (3, 4), (4, 7), (0, 0)]
     w = char_spans_to_token_weights(t, offsets)
     assert w[0] == 4.0            # "B"
-    assert w[2] == 4.0            # " i"
-    assert w[4] == 4.0            # (7,11) 跨过 cls_end=8,含位置 7 → max=4.0
+    assert w[2] == 4.0            # "i"
+    assert w[3] == 4.0            # 第二个 "|"
+    assert w[4] == 1.0            # desc
     assert w[5] == 0.0            # special token
-    # 纯 desc token(不跨界)权重 1.0
-    w2 = char_spans_to_token_weights(t, [(8, 11)])
-    assert w2[0] == 1.0
 
 
 def test_token_weight_crossing_boundary():
-    t = build_target("B", "i", "Hi.")
-    w = char_spans_to_token_weights(t, [(6, 9)])  # 跨过 cls_end=8
+    t = build_target("B", "i", "Hi.")            # cls_end = 4
+    w = char_spans_to_token_weights(t, [(3, 6)])  # 跨过 cls_end=4
     assert w[0] == 4.0  # 覆盖到分类段 → 取最大权重
 
 
@@ -98,11 +100,15 @@ def test_parse_output_dq_illegal():
 def test_format_alignment_verify():
     """交付前 GT 整串字节核对(eval/check_format_alignment)。"""
     from eval.check_format_alignment import verify_gt_line
+    # euno 真实 GT 样例(无空格)= 默认约定
     assert verify_gt_line(
-        "B | i | A delivery person places a package.") is None
-    assert verify_gt_line("B|i|no spaces") is not None      # 分隔符约定不同
-    assert verify_gt_line("b | i | lowercase rt") is not None  # GT 不该需矫正
-    assert verify_gt_line("garbage") is not None            # 解析失败
+        "D|g|A man in a hat approached a camera at a residence.") is None
+    assert verify_gt_line(
+        "B | i | spaced variant") is not None     # 版式不同 → 必须 FAIL
+    assert verify_gt_line(
+        "B | i | spaced variant", sep=" | ") is None  # 显式旧版式仍可核
+    assert verify_gt_line("b|i|lowercase rt") is not None  # GT 不该需矫正
+    assert verify_gt_line("garbage") is not None           # 解析失败
 
 
 def test_parse_output_think_leak():
@@ -238,6 +244,74 @@ def test_kto_ref_divergence_and_brake():
     assert classification_brake(base, {"RoleType_acc": 88.9,
                                        "SubKeyScene_acc": 81.2}) == \
         ["RoleType_acc"]
+
+
+def test_euno_wds_roundtrip(tmp_root="/tmp/_euno_wds_test"):
+    """euno WDS 全链: 造 mini 分片 → 转 labels → 数据集读帧 → 结果适配。"""
+    import io
+    import json
+    import pickle
+    import shutil
+    import tarfile
+    import numpy as np
+    import cv2
+    from data.euno_wds import (euno_to_labels, EunoWDSDataset,
+                               camera_from_video_rel, parse_gpt_label)
+
+    shutil.rmtree(tmp_root, ignore_errors=True)
+    os.makedirs(tmp_root)
+    # 两个样本: 设备序列号命名 + uuid 命名(euno 文档两种真实命名)
+    keys = ["trainset_4k/decrypt_T8030P2322510409_T8160P_seg_1",
+            "testset_1k/0006f134-a7da-405e-a47a_segment_1"]
+    ok, jpg = cv2.imencode(".jpg", np.zeros((384, 384, 3), np.uint8))
+    assert ok
+    with tarfile.open(os.path.join(tmp_root, "shard-000000.tar"), "w") as tf:
+        for k in keys:
+            payload = pickle.dumps({"frames": [jpg.tobytes()] * 16,
+                                    "video_rel": k, "num_frames": 16})
+            info = tarfile.TarInfo(k.replace("/", "__") + ".pyd")
+            info.size = len(payload)
+            tf.addfile(info, io.BytesIO(payload))
+    json.dump({k: 0 for k in keys},
+              open(os.path.join(tmp_root, "index.json"), "w"))
+    anns = [{"id": str(i), "videos": [k], "conversations": [
+        {"from": "human", "value": "<video>prompt"},
+        {"from": "gpt", "value": "B|i|A worker delivers a package."}]}
+        for i, k in enumerate(keys)]
+    ann_path = os.path.join(tmp_root, "ann.json")
+    json.dump(anns, open(ann_path, "w"))
+
+    out = os.path.join(tmp_root, "labels.jsonl")
+    recs = euno_to_labels(ann_path, tmp_root, out)
+    assert len(recs) == 2
+    assert recs[0]["meta"]["camera_id"].startswith("T8030")   # 设备号提取
+    assert recs[1]["meta"]["camera_id"] == "unknown"          # uuid → 兜底
+    assert parse_gpt_label("D|g|desc, with | pipe")[2] == "desc, with | pipe"
+    assert camera_from_video_rel("abc_uuid_segment_1") == "unknown"
+
+    cfg = {"format": {"separator": "|"}, "loss": {"cls_token_weight": 4.0},
+           "augment": {"hflip_prob": 0.0, "color_jitter": 0.0,
+                       "frame_dropout_prob": 0.0},
+           "sampling": {"num_frames": 16, "image_size": 384}}
+    ds = EunoWDSDataset(recs, cfg, {"cot_mode": False}, training=True)
+    ex = ds[0]
+    assert ex["frames"].shape == (16, 384, 384, 3)            # 免二次处理
+    assert ex["target_spec"].text.startswith("B|i|")
+
+    from eval.euno_results_adapter import convert
+    results = [{"id": "0", "video": keys[0] + ".mp4",
+                "conversations": anns[0]["conversations"],
+                "pred": {"result": "B|i|ok", "score": [0.9, 1.0]}}]
+    assert convert(results, os.path.join(tmp_root, "ev")) == 0
+    from eval.metrics import evaluate
+    preds = {json.loads(l)["video_id"]: json.loads(l)["output"]
+             for l in open(os.path.join(tmp_root, "ev/preds.jsonl"))}
+    gts = {json.loads(l)["video_id"]:
+           (json.loads(l)["labels"]["role_type"],
+            json.loads(l)["labels"]["sub_keyscene"])
+           for l in open(os.path.join(tmp_root, "ev/gt.jsonl"))}
+    assert evaluate(preds, gts)["RoleType_acc"] == 1.0
+    shutil.rmtree(tmp_root, ignore_errors=True)
 
 
 def test_camera_fingerprint_cluster():

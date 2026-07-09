@@ -28,7 +28,7 @@ from eval.format_validator import parse_output          # noqa: E402
 from data.formatting import build_target                # noqa: E402
 
 
-def verify_gt_line(line: str, sep: str = " | "):
+def verify_gt_line(line: str, sep: str = "|"):
     """单条 GT 原始串核对。返回 None(逐字节一致)或错误说明字符串。"""
     r = parse_output(line)
     if not r.ok:
@@ -45,7 +45,7 @@ def verify_gt_line(line: str, sep: str = " | "):
     return None
 
 
-def tokenizer_report(tokenizer_name: str, sep: str = " | "):
+def tokenizer_report(tokenizer_name: str, sep: str = "|"):
     """②: 分类字母切分报告。返回 (字母, 上下文, token 串) 异常列表。"""
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(tokenizer_name)

@@ -1,5 +1,25 @@
 # 代码开发工作状态快照
 
+> 更新:2026-07-08(第 9 轮,**接入客户真实数据规格 euno数据集说明.md**)
+> 客户数据一手规格落地,修正多项纸面假设:
+> - **真实 GT 分隔符无空格**("D|g|A man...")→ base.yaml separator="|",
+>   5 条真实样例字节核对 5/5;prompt.txt 与客户模板**逐字节一致** ✓;
+>   无空格上下文里 26 分类字母仍独立 token ✓;全代码默认值同步迁移
+>   (含 build_kto_data —— 原本会按错误格式构造 desirable 串)
+> - **客户数据 = WDS 分片(帧已上游均匀 16 帧 + 384×384)**:
+>   新增 data/euno_wds.py(标注转换 + EunoWDSDataset,train.py 按
+>   meta.storage 自动选择);增强受限——时序裁剪/原图 RandomCrop 失效
+>   (拿不到原片),仅保留翻转/亮度/帧 dropout
+> - **无 resolution 字段** → 4.2 节 view_type 分辨率免费打标规则不可用,
+>   view_type 全靠 Gemini(方案影响,需知会客户)
+> - **camera_id**: video_rel 内设备序列号(T8xxx)提取;uuid 命名 →
+>   camera_fingerprint 兜底
+> - **euno 训练标注是 balanced 100k(98,395)而非 1M 自然分布** ——
+>   与方案 6.3"自然分布训练"前提冲突,基线口径待与客户确认
+> - eval/euno_results_adapter.py: euno 推理结果 json(pred.result/score)
+>   → metrics 输入,基线复现同口径
+> - 全链 mini-WDS 回归测试(test_euno_wds_roundtrip),22/22 绿
+
 > 更新:2026-07-08(第 8 轮,**三项遗留收口: KTO 实装 / generate / 分布式入口**)
 > - **kto.py DataLoader 实装完成**(骨架清零): KTOVideoDataset(确定性
 >   16 帧,无增强)+ KTOCollator(复用 AnkerCollator 的 prompt/视频编码,

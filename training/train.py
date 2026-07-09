@@ -181,10 +181,16 @@ def main():
     reasoning = load_jsonl(cfg["data"]["reasoning_file"]) \
         if phase.get("cot_mode") else {}
 
-    train_ds = AnkerVideoDataset(train_recs, cfg, phase, training=True,
-                                 attributes=attributes, reasoning=reasoning)
-    val_ds = AnkerVideoDataset(val_recs[:2000], cfg, phase, training=False,
-                               attributes=attributes, reasoning=reasoning)
+    # 数据存储自适应: 客户 euno 数据为 WDS 分片(meta.storage=="wds",
+    # 帧已上游采样/resize),其余走视频文件解码路径
+    ds_cls = AnkerVideoDataset
+    if records and (records[0].get("meta") or {}).get("storage") == "wds":
+        from data.euno_wds import EunoWDSDataset as ds_cls
+        print("[data] Euno WDS 存储格式(帧已预处理,增强受限,见 euno_wds)")
+    train_ds = ds_cls(train_recs, cfg, phase, training=True,
+                      attributes=attributes, reasoning=reasoning)
+    val_ds = ds_cls(val_recs[:2000], cfg, phase, training=False,
+                    attributes=attributes, reasoning=reasoning)
 
     # ---- 模型: load → freeze → (LoRA) → restore 上一 phase ----
     model, processor = load_model_and_processor(cfg)

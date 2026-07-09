@@ -13,7 +13,7 @@ from eval.format_validator import parse_output       # noqa: E402
 from data.formatting import build_target             # noqa: E402
 
 
-def build_pairs(preds: dict, gt_records: dict, sep=" | "):
+def build_pairs(preds: dict, gt_records: dict, sep="|"):
     """gt_records: video_id → labels dict。返回 KTO 样本列表。"""
     out = []
     for vid, lab in gt_records.items():
@@ -48,7 +48,15 @@ def main():
         if wl and d["video_id"] not in wl:
             continue
         gts[d["video_id"]] = d.get("labels", d)
-    pairs = build_pairs(preds, gts)
+    # separator 以 base.yaml 为单一来源(euno 真实 GT 已核对为 "|",
+    # desirable 串格式错误会让 KTO 直接教坏模型)
+    import os
+    sep = "|"
+    if os.path.exists("configs/base.yaml"):
+        import yaml
+        sep = yaml.safe_load(open("configs/base.yaml",
+                                  encoding="utf-8"))["format"]["separator"]
+    pairs = build_pairs(preds, gts, sep)
     with open(a.out, "w", encoding="utf-8") as f:
         for p in pairs:
             f.write(json.dumps(p, ensure_ascii=False) + "\n")

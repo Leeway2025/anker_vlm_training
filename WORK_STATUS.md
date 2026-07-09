@@ -14,8 +14,15 @@
 >   view_type 全靠 Gemini(方案影响,需知会客户)
 > - **camera_id**: video_rel 内设备序列号(T8xxx)提取;uuid 命名 →
 >   camera_fingerprint 兜底
-> - **euno 训练标注是 balanced 100k(98,395)而非 1M 自然分布** ——
->   与方案 6.3"自然分布训练"前提冲突,基线口径待与客户确认
+> - **数据口径已定(2026-07-08 用户确认): 先用 balanced 100k 训练,
+>   1M 自然分布训练后续第二轮再做**。连带影响:
+>   ① 100k 阶段与 EunoVLM 同口径,对比公平;6.3"不做类别均衡"在此阶段
+>     天然不适用(数据本身已均衡),1M 阶段回归自然分布原则
+>   ② 训练/验证集(balanced)与冻结测试集(自然分布,m 占 27.5% vs
+>     训练 12.7%)分布不一致是**有意设计** —— 早停用的 eval_loss 有
+>     分布偏差,监控集指标解读须记住这一点
+>   ③ 1M 阶段依赖客户提供 1M 标注文件(现有标注仅 balanced 100k;
+>     wds_full 的 1,082,100 样本帧数据已在)
 > - eval/euno_results_adapter.py: euno 推理结果 json(pred.result/score)
 >   → metrics 输入,基线复现同口径
 > - 全链 mini-WDS 回归测试(test_euno_wds_roundtrip),22/22 绿

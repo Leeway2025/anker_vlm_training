@@ -10,6 +10,9 @@
 ## 数据流总览(每步的命令、输入 → 输出、如何接入自己的数据)
 
 **客户真实数据(euno WDS 格式)接入——一条命令转换后全链通用**:
+> 数据口径(已确认): **第一轮用 balanced 100k 训练**(与 EunoVLM 同口径);
+> 1M 自然分布训练为后续第二轮,届时只换 `--annotation` 指向 1M 标注文件
+> (帧数据 wds_full 已含 1M 样本;1M 标注需客户提供)。
 ```
 python -m data.euno_wds --annotation euno_train_v3.0.18_balanced_100k_frames.json \
     --wds-dir anker_video_clips_wds_full --out DATA/labels.jsonl

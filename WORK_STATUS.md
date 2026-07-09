@@ -1,5 +1,23 @@
 # 代码开发工作状态快照
 
+> 更新:2026-07-09(第 15 轮,**真 v6e-8 八卡验证完成**,europe-west4-a spot,
+> 用后即删)—— 此前"待客户环境确认"的 8 卡项全部关闭:
+> - ✅ torch_xla.launch 8 进程,world=8,ordinal 连续
+> - ✅ XLA 集合通信实测(CPU 模拟不可验层): all_reduce SUM 精确、
+>   xm.optimizer_step 跨核梯度平均精确(w=-4.5)、rendezvous、
+>   rank0 落盘唯一 —— REAL8 PASS
+> - ✅ Trainer 8 核真训: **每核步数 = ceil(84/(8×2)) = 6 精确命中**
+>   (DistributedSampler 切分正确),loss 8.74→6.18 平滑降,eval 正常,
+>   [save] 仅 rank0 一次;跨阶段恢复(3a→3b projector)正常
+> - ✅ **bs 显存定论: bs8/芯 OOM(34.8G/31.25G,超 3.55G);bs4 全流程
+>   通过**(LoRA 512/256 全量,训练+eval+保存)→ base.yaml 默认改
+>   bs4 + grad_accum 8(全局 256 与方案等效),REPRODUCE 同步
+> - 经验入档: spawn 子进程重 import → 自定义启动脚本必须
+>   `if __name__ == "__main__"` 守卫(train/kto 本有,临时脚本踩过);
+>   spot 抢占 = 机器删除不可重启,产物须即时外存 + 断点续跑
+> 剩余客户侧确认项仅剩: RKLLM 工具链(Issue #480、异构 rank)——
+> 端侧职责,与 TPU 无关
+
 > 更新:2026-07-09(第 14 轮,**训练部分整体 review: 5 硬伤修复 + 真机回归**)
 >   ㉖ trainer 整段 .float() 物化 (B,L,262k) fp32 → bs8≈17GB v6e 必 OOM
 >     → 分块加权 CE(ce_chunk=256,步数静态单编译)+ 监控量张量累积

@@ -75,8 +75,10 @@ freeze:
 
 # ---------- 训练 ----------
 train:
-  per_device_batch_size: 8
-  gradient_accumulation: 4
+  # v6e-8 真机实测(2026-07-09): bs8/芯 OOM(34.8G/31.25G),bs4 通过
+  # → bs4 × 8 芯 × accum8 = 全局 256,与方案等效
+  per_device_batch_size: 4
+  gradient_accumulation: 8
   warmup_steps: 300
   weight_decay: 0.0
   max_grad_norm: 1.0

@@ -14,6 +14,15 @@
 - **逐 phase 独立进程会重复付模型加载 + 编译**,长链建议用
   `python -m training.pipeline` 编排。
 
+## ✅ v6e-8 八卡实测结论(2026-07-09,直接照抄)
+
+- **per_device_batch_size=4 + gradient_accumulation=8**(全局 256):
+  bs8/芯 OOM 实测(34.8G/31.25G),bs4 全流程通过 —— base.yaml 已为此默认
+- 启动即 `PJRT_DEVICE=TPU python training/train.py ...`,自动 8 进程;
+  每核每 epoch 步数 = ceil(N_train/(8×bs)),日志核对该值即验证切分
+- checkpoint/final 仅 rank0 写一份;spot 机器抢占=删除,checkpoint
+  目录务必放 GCS/gcsfuse
+
 ## 0. 环境
 
 ```

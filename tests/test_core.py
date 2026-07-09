@@ -185,8 +185,9 @@ def test_pipeline_chain():
     assert "phase5_sft" in p5b["init_from"], p5b["init_from"]
     assert p5d["init_from"] == "outputs/phase5b_aux/final"
     assert p6["init_from"] == "outputs/phase5d_cot/final"
-    # 白名单约定: 5b/5d 必须只用白名单(伪标签/推理链质量前提)
-    assert p5b["use_whitelist_only"] and p5d["use_whitelist_only"]
+    # 白名单约定(2026-07-08 反转): 客户 GT 质量 > Gemini → 样本全量,
+    # 白名单只裁 Gemini 自产资产(split_assets 在资产层过滤)
+    assert not p5b["use_whitelist_only"] and not p5d["use_whitelist_only"]
     # train.py 必须同时保存和恢复 projector(跨 phase 断点的回归防线)
     src = open(os.path.join(root, "training/train.py"), encoding="utf-8").read()
     assert 'projector.pt' in src

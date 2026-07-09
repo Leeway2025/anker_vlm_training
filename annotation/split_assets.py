@@ -24,14 +24,21 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def split(gemini_path, out_dir, whitelist_path=None):
+    """传 whitelist 时,资产文件**只写白名单内的条目** —— 过滤在资产层
+    完成,训练样本永远全量(客户 GT 质量高于 Gemini,白名单只约束
+    Gemini 自产资产的采用范围,绝不裁样本/裁 GT)。"""
+    wl = set(open(whitelist_path).read().split()) if whitelist_path else None
     os.makedirs(out_dir, exist_ok=True)
-    n = n_bad = 0
+    n = n_bad = n_out_wl = 0
     with open(os.path.join(out_dir, "asset_A_attributes.jsonl"), "w",
               encoding="utf-8") as fa, \
             open(os.path.join(out_dir, "asset_C_reasoning.jsonl"), "w",
                  encoding="utf-8") as fc:
         for line in open(gemini_path, encoding="utf-8"):
             d = json.loads(line)
+            if wl is not None and d["video_id"] not in wl:
+                n_out_wl += 1        # Gemini 与 GT 不一致 → 其资产不采用
+                continue
             g = d.get("gemini_output") or {}
             attrs, chain = g.get("attributes"), g.get("reasoning_chain")
             if not attrs or not chain:
@@ -48,7 +55,8 @@ def split(gemini_path, out_dir, whitelist_path=None):
     if whitelist_path:
         shutil.copy(whitelist_path,
                     os.path.join(out_dir, "asset_D_whitelist.txt"))
-    print(f"{n} 条 → asset_A/asset_C(跳过缺字段 {n_bad})"
+    print(f"{n} 条 → asset_A/asset_C(缺字段 {n_bad},白名单外 {n_out_wl}"
+          f" —— 这些样本仍全量参训,只是无增强监督)"
           f"{';whitelist 已拷入' if whitelist_path else ''} -> {out_dir}")
     return n
 

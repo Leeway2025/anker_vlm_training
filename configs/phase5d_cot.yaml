@@ -3,7 +3,7 @@ phase: "5d_cot"
 init_from: "outputs/phase5b_aux/final"
 epochs: 2   # 上限预算;早停可能提前结束,不够可 --epochs 追加
 learning_rate_scale: 0.5
-use_whitelist_only: true
+use_whitelist_only: false      # 样本全量;资产文件已按白名单过滤
 enable_ks_parent_head: false
 enable_aux_heads: false
 cot_mode: true

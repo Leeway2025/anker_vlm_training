@@ -11,6 +11,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from data.euno_wds import load_frames_for_record  # noqa: E402
 
 
+def shard_records(records, spec):
+    """'i/n' → 第 i 片(0 起)。大规模推理按分片多进程/多机并行,
+    各片独立断点续跑(out 文件不同名)。"""
+    if not spec:
+        return records
+    i, n = (int(x) for x in spec.split("/"))
+    return records[i::n]
+
+
 def generate_predictions(model, processor, records, cfg, out_path,
                          max_new_tokens=64, batch_size=8):
     """对 records 逐批生成 "{RT} | {SubKS} | {desc}",写 preds jsonl。

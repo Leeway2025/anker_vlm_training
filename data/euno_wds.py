@@ -38,11 +38,31 @@ _DEVICE_SN = re.compile(r"(T8[0-9A-Za-z]{6,})")
 _TAR_CACHE = {}
 
 
+def open_binary(path):
+    """gs:// 或本地路径 → 二进制流(顺序读;标注/转换用)。"""
+    if path.startswith("gs://"):
+        from google.cloud import storage
+        bucket_name, blob_name = path[5:].split("/", 1)
+        return storage.Client().bucket(bucket_name).blob(blob_name).open("rb")
+    return open(path, "rb")
+
+
+def read_json(path):
+    import io as _io
+    with open_binary(path) as f:
+        return json.load(_io.TextIOWrapper(f, encoding="utf-8"))
+
+
 def load_wds_frames(rec) -> np.ndarray:
     """按 record 的 meta(wds_dir/shard)读 16 帧 → (T,H,W,3) uint8 RGB。
     推理/KTO 与 EunoWDSDataset 共用(模块级 tar 句柄缓存)。"""
     import cv2
     meta = rec["meta"]
+    if str(meta["wds_dir"]).startswith("gs://"):
+        raise RuntimeError(
+            "训练/推理是逐样本随机读,不支持 gs:// 直连(延迟不可用)。"
+            "请把分片下载到本地盘,或用 gcsfuse 挂载后把 labels 的 "
+            "meta.wds_dir 改为挂载路径(标注作业不受此限,走流式)。")
     path = os.path.join(meta["wds_dir"], f"shard-{meta['shard']:06d}.tar")
     tf = _TAR_CACHE.get(path)
     if tf is None:
@@ -88,9 +108,8 @@ def parse_gpt_label(value: str):
 def euno_to_labels(annotation_path: str, wds_dir: str, out_path: str,
                    limit: int = 0):
     """LlamaFactory 标注 json → 通用 labels.jsonl(meta.storage='wds')。"""
-    anns = json.load(open(annotation_path, encoding="utf-8"))
-    index = json.load(open(os.path.join(wds_dir, "index.json"),
-                           encoding="utf-8"))
+    anns = read_json(annotation_path)                       # 支持 gs://
+    index = read_json(f"{wds_dir.rstrip('/')}/index.json")
     n_bad = n_noshard = 0
     out = []
     for ann in anns:

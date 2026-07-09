@@ -37,24 +37,10 @@ from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from annotation.gemini_labeler import build_prompt, validate_record  # noqa: E402
+from data.euno_wds import open_binary, read_json                     # noqa: E402
 
 FRAMES_PREFACE = ("以下是同一段家用摄像头视频按时间顺序均匀抽取的 16 帧"
                   "(第 1 帧最早,第 16 帧最晚)。请把它们当作一段视频理解。\n")
-
-
-def open_binary(path):
-    """gs:// 或本地路径 → 可顺序读的二进制流。"""
-    if path.startswith("gs://"):
-        from google.cloud import storage
-        bucket_name, blob_name = path[5:].split("/", 1)
-        client = storage.Client()
-        return client.bucket(bucket_name).blob(blob_name).open("rb")
-    return open(path, "rb")
-
-
-def read_json(path):
-    with open_binary(path) as f:
-        return json.load(io.TextIOWrapper(f, encoding="utf-8"))
 
 
 def iter_shard_samples(wds_dir, shard_id):

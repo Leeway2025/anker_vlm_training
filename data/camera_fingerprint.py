@@ -23,20 +23,30 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-def fingerprint(video_path, size=16):
-    """首帧 → 灰度 16×16 → 零均值单位方差向量(光照鲁棒)。"""
+def fingerprint_from_frame(frame, size=16):
+    """单帧(H,W,3)→ 灰度 16×16 → 零均值单位范数向量(光照鲁棒)。"""
     import cv2
-    cap = cv2.VideoCapture(video_path)
-    ok, frame = cap.read()
-    cap.release()
-    if not ok:
-        return None
-    g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
     g = cv2.resize(g, (size, size), interpolation=cv2.INTER_AREA)
     v = g.astype(np.float32).flatten()
     v -= v.mean()
     n = np.linalg.norm(v)
     return v / n if n > 1e-6 else v
+
+
+def fingerprint(rec_or_path, size=16):
+    """首帧指纹。入参: 视频路径,或带 meta.storage=='wds' 的 record
+    (euno 数据无视频文件,从 WDS 分片取首帧)。"""
+    import cv2
+    if isinstance(rec_or_path, dict):
+        from data.euno_wds import load_wds_frames
+        return fingerprint_from_frame(load_wds_frames(rec_or_path)[0], size)
+    cap = cv2.VideoCapture(rec_or_path)
+    ok, frame = cap.read()
+    cap.release()
+    if not ok:
+        return None
+    return fingerprint_from_frame(frame, size)
 
 
 def cluster(fps, threshold=0.15):
@@ -71,9 +81,12 @@ def main():
     recs = [json.loads(l) for l in open(a.labels, encoding="utf-8")]
     fps, keep = [], []
     for r in recs:
-        p = os.path.join(a.video_root,
-                         os.path.basename(r.get("video_uri", r["video_id"])))
-        v = fingerprint(p)
+        if (r.get("meta") or {}).get("storage") == "wds":
+            v = fingerprint(r)                    # euno: WDS 首帧
+        else:
+            v = fingerprint(os.path.join(
+                a.video_root,
+                os.path.basename(r.get("video_uri", r["video_id"]))))
         if v is not None:
             fps.append(v)
             keep.append(r)

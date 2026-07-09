@@ -1,5 +1,23 @@
 # 代码开发工作状态快照
 
+> 更新:2026-07-08(第 13 轮,**全阶段六维 review + "GT 质量>Gemini"原则贯穿**)
+> 六维审计(数据来源/前置就绪/下降风险/输出/结束判定/文档)新修:
+>   ㉒ euno_to_labels 不支持 gs://(裸 open)→ 复用 open_binary
+>   ㉓ load_wds_frames 对 gs:// 明确报错+指引(训练随机读需本地盘/
+>     gcsfuse;gs:// 直读仅标注流式作业支持)
+>   ㉔ camera_fingerprint 支持 WDS 首帧(euno uuid 样本兜底路径打通)
+>   ㉕ run_inference 加 --shard i/n(10 万级推理多进程/多机切片,
+>     各片独立断点续跑)
+> **原则贯穿(用户确认: 人工修正 GT 质量 > Gemini)**:
+>   GT 全量信任;白名单只裁 Gemini 自产资产的采用范围,不裁样本:
+>   - split_assets 过滤前移到资产层(白名单外条目不写入资产文件)
+>   - phase5b/5d use_whitelist_only → false(全量样本;无资产样本
+>     自动降级: aux=-100 / CoT 走生产模式,代码天然支持)
+>   - KTO 数据构造客户数据不传 --whitelist
+> 文档: WALKTHROUGH 新增"各训练阶段一览表"(数据来源/结束判定/产出/
+>   下降防护与回退)+ 通用回退协议 + 监控集离线消费方式说明
+>   (训练内早停=val eval_loss;监控集=阶段闸门,离线推理+metrics)
+
 > 更新:2026-07-08(第 12 轮,**GT 来源事实确认: Gemini 标注+人工修正**)
 > 连锁语义修正(代码参数不变,用法与解读反转):
 > - hard mining **客户数据不要传 --whitelist**: GT 人工背书 → 错例

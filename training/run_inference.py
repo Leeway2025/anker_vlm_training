@@ -11,6 +11,9 @@ def main():
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--max-new-tokens", type=int, default=64)
     ap.add_argument("--batch-size", type=int, default=8)
+    ap.add_argument("--shard", default=None,
+                    help="'i/n': 只处理第 i 片(100k 级推理多进程/多机并行;"
+                         "各片 --out 用不同文件名,最后 cat 合并)")
     a = ap.parse_args()
     import yaml
     cfg = yaml.safe_load(open("configs/base.yaml", encoding="utf-8"))
@@ -28,6 +31,8 @@ def main():
         except ImportError:
             pass
     records = [json.loads(l) for l in open(a.labels, encoding="utf-8")]
+    from training.inference_utils import shard_records
+    records = shard_records(records, a.shard)
     if a.limit:
         records = records[:a.limit]
     generate_predictions(model, processor, records, cfg, a.out,

@@ -102,6 +102,16 @@ def restore_from(model, init_dir, inject_lora):
 def save_final(model, out_dir, cfg, aux, inject_lora):
     import torch
     final = os.path.join(out_dir, "final")
+    # 8 卡守卫: 仅 rank0 落盘,其余核栅栏等待 —— 否则 8 进程并发写同一
+    # final/ 会损坏 adapter 文件(review 发现,KTO 侧本有守卫、SFT 侧漏)
+    try:
+        import torch_xla.core.xla_model as xm
+        from torch_xla import runtime as xr
+        if xr.world_size() > 1 and xr.global_ordinal() != 0:
+            xm.rendezvous("save_final_done")
+            return final
+    except ImportError:
+        xm = None
     os.makedirs(final, exist_ok=True)
     if inject_lora:
         # 不能直接 model.save_pretrained: XLA 张量过 safetensors 会报
@@ -126,6 +136,11 @@ def save_final(model, out_dir, cfg, aux, inject_lora):
                    os.path.join(final, "aux_heads.pt"))
     print(f"[save] {final} (adapter={inject_lora}, "
           f"projector tensors={len(proj_sd)})")
+    try:
+        if xm is not None and xr.world_size() > 1:
+            xm.rendezvous("save_final_done")   # 放行其余核
+    except Exception:
+        pass
     return final
 
 

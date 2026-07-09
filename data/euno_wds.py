@@ -35,6 +35,40 @@ from data.build_dataset import AnkerVideoDataset          # noqa: E402
 
 _DEVICE_SN = re.compile(r"(T8[0-9A-Za-z]{6,})")
 
+_TAR_CACHE = {}
+
+
+def load_wds_frames(rec) -> np.ndarray:
+    """按 record 的 meta(wds_dir/shard)读 16 帧 → (T,H,W,3) uint8 RGB。
+    推理/KTO 与 EunoWDSDataset 共用(模块级 tar 句柄缓存)。"""
+    import cv2
+    meta = rec["meta"]
+    path = os.path.join(meta["wds_dir"], f"shard-{meta['shard']:06d}.tar")
+    tf = _TAR_CACHE.get(path)
+    if tf is None:
+        tf = tarfile.open(path)
+        _TAR_CACHE[path] = tf
+    name = rec["video_id"].replace("/", "__") + ".pyd"
+    data = pickle.load(tf.extractfile(tf.getmember(name)))
+    return np.stack([
+        cv2.cvtColor(cv2.imdecode(np.frombuffer(b, np.uint8),
+                                  cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
+        for b in data["frames"]])
+
+
+def load_frames_for_record(rec, cfg) -> np.ndarray:
+    """存储自适应帧加载(推理/KTO 用,确定性无增强):
+    meta.storage=='wds' → WDS 分片;否则视频文件解码 + 生产预处理。"""
+    if (rec.get("meta") or {}).get("storage") == "wds":
+        return load_wds_frames(rec)
+    from data.sampling import decode_video, resize_production
+    path = os.path.join(cfg["data"]["video_root"],
+                        os.path.basename(rec.get("video_uri",
+                                                 rec["video_id"])))
+    frames, _ = decode_video(path,
+                             num_frames=cfg["sampling"]["num_frames"])
+    return resize_production(frames, cfg["sampling"]["image_size"])
+
 
 def camera_from_video_rel(video_rel: str) -> str:
     """文件名内设备序列号 → camera_id;uuid 命名 → 'unknown'
@@ -100,30 +134,10 @@ class EunoWDSDataset(AnkerVideoDataset):
     时序裁剪与空间 crop 被强制关闭。
     """
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._tar_cache = {}
-
-    def _load_pyd(self, rec):
-        wds_dir, shard = rec["meta"]["wds_dir"], rec["meta"]["shard"]
-        path = os.path.join(wds_dir, f"shard-{shard:06d}.tar")
-        tf = self._tar_cache.get(path)
-        if tf is None:
-            tf = tarfile.open(path)
-            self._tar_cache[path] = tf
-        name = rec["video_id"].replace("/", "__") + ".pyd"
-        return pickle.load(tf.extractfile(tf.getmember(name)))
-
     def __getitem__(self, i):
-        import cv2
         rec = self.records[i]
         ex = self.build_text_example(rec)
-        data = self._load_pyd(rec)
-        frames = np.stack([
-            cv2.cvtColor(cv2.imdecode(
-                np.frombuffer(b, np.uint8), cv2.IMREAD_COLOR),
-                cv2.COLOR_BGR2RGB)
-            for b in data["frames"]])
+        frames = load_wds_frames(rec)
         if self.training:
             from data.augmentation import spatial_augment
             aug = dict(self.cfg["augment"])

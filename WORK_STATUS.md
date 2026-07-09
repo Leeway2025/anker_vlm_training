@@ -1,5 +1,21 @@
 # 代码开发工作状态快照
 
+> 更新:2026-07-08(第 10 轮,**训练阶段衔接审计: 4 个文件级断点修复**)
+> 逐衔接点重推全链(用户质疑触发),发现并修复:
+>   ⑱ **资产拆分器缺失**: pass1.jsonl 的属性嵌在 gemini_output 里,
+>     训练读顶层字段 → 辅助头/CoT 监督静默丢失。新增
+>     annotation/split_assets.py(pass1+whitelist → asset_A/C/D),
+>     已用真 API 标注产出验证与训练消费端对齐
+>   ⑲ **推理不支持 WDS**: run_inference/generate_predictions 只读视频
+>     文件,客户数据(WDS 帧)下 hard mining/KTO 前置推理跑不了 →
+>     euno_wds.load_frames_for_record 存储自适应,推理/KTO 统一接入
+>   ⑳ KTOVideoDataset 同病 → 同修(按 labels 的 meta.storage 分流)
+>   ㉑ swa_final 缺 projector.pt → 终评静默用 base projector →
+>     swa.py 自动从兄弟 final/ 附带(缺失时显式 WARN)
+>   另: stage b 未传 --init-from 时 WARN(防静默从零训);
+>   WALKTHROUGH 新增文件级衔接图(谁产出→谁消费),明确 7a 的 preds
+>   必须用 5d final 重新推理(preds_v15),不能复用 v0 的 preds
+
 > 更新:2026-07-08(第 9 轮,**接入客户真实数据规格 euno数据集说明.md**)
 > 客户数据一手规格落地,修正多项纸面假设:
 > - **真实 GT 分隔符无空格**("D|g|A man...")→ base.yaml separator="|",

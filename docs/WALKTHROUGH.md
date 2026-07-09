@@ -37,7 +37,8 @@ python -m data.euno_wds --annotation euno_train_v3.0.18_balanced_100k_frames.jso
 | 1b' | `python -m data.camera_fingerprint --labels <labels.jsonl> --video-root <视频目录>` | 无机位字段的 labels | meta.camera_id 回写 |
 | 1c | `python -m eval.monitor_set --labels <labels.jsonl> --out monitor.jsonl` | labels | 分层监控集 |
 | 2 | `python -m annotation.gemini_labeler --labels <labels> --video-root <目录> --out pass1.jsonl --model <m> [--vertex-project P --location L] --temperature 0.1`(0.4 再跑一遍) | labels+视频 | gemini_pass{1,2}.jsonl |
-| 2' | `python -m annotation.consistency_filter --mode double --gemini pass1.jsonl --gemini2 pass2.jsonl --out-dir filtered/`(有人工 GT 用 `--mode gt --gt labels.jsonl`) | 两遍标注 | 资产 A/C/D(whitelist) |
+| 2' | `python -m annotation.consistency_filter --mode double --gemini pass1.jsonl --gemini2 pass2.jsonl --out-dir filtered/`(有人工 GT 用 `--mode gt --gt labels.jsonl`) | 两遍标注 | filtered/whitelist_ids.txt 等 |
+| 2'' | `python -m annotation.split_assets --gemini pass1.jsonl --whitelist filtered/whitelist_ids.txt --out-dir DATA/` | 标注+白名单 | **DATA/asset_{A,C,D}**(训练直接消费) |
 | 3a | `PJRT_DEVICE=TPU python training/train.py --phase configs/phase5_sft.yaml --stage a` | base.yaml data.* | outputs/phase5_sft_a/final |
 | 3b | `… --stage b --init-from outputs/phase5_sft_a/final` | 3a final | outputs/phase5_sft_b/final |
 | 4a | `PJRT_DEVICE=TPU python -m training.run_inference --ckpt outputs/phase5_sft_b/final --labels <labels> --out preds_v0.jsonl` | 3b final | preds_v0.jsonl |
@@ -48,6 +49,33 @@ python -m data.euno_wds --annotation euno_train_v3.0.18_balanced_100k_frames.jso
 | 7b | `PJRT_DEVICE=TPU python training/kto.py --config configs/phase6_kto.yaml` | kto_data + 5d final | outputs/phase6_kto/{checkpoint-*,final} |
 | 7c | `python -m training.swa --ckpts 'outputs/phase6_kto/checkpoint-*' --out outputs/swa_final` | KTO ckpts | swa_final |
 | 8 | `python -m export.split_deliverables --adapter outputs/swa_final --base <base权重> --projector outputs/phase5d_cot/final/projector.pt --out deliverables/ [--issue480]` | swa_final | llm_adapter/ + vision_merged.pt |
+
+### 训练阶段衔接图(文件级,谁产出 → 谁消费)
+
+```
+DATA/labels.jsonl(1a/2A①)──────────────┬─→ 3a/3b/5/6/7b 训练数据
+DATA/asset_A_attributes.jsonl(2'')──────┼─→ 5(辅助头监督)
+DATA/asset_C_reasoning.jsonl(2'')───────┼─→ 6(推理链目标)
+DATA/asset_D_whitelist.txt(2'')─────────┴─→ 5/6/7a(样本过滤)
+
+3a outputs/phase5_sft_a/final ──--init-from─→ 3b
+3b outputs/phase5_sft_b/final ──--ckpt──→ 4a preds_v0.jsonl
+   preds_v0 ─→ 4b sw.json ─--sample-weights+--init-from(3b final)─→
+   outputs/phase5_sft_hm/final ──--init-from─→ 5
+5  outputs/phase5b_aux/final ──yaml init_from─→ 6
+6  outputs/phase5d_cot/final ──--ckpt─→ 4a'(再推理)preds_v15.jsonl
+   preds_v15 + labels + whitelist ─→ 7a outputs/kto_data.jsonl
+6  final ──yaml init_from─→ 7b(policy/ref 双 adapter 起点,projector 冻结传递)
+7b outputs/phase6_kto/checkpoint-* ─→ 7c swa_final(adapter 平均,
+   projector 自动从 6 final 附带)
+7c swa_final + 6 final/projector.pt ─→ 8 deliverables/
+```
+- 所有 `--ckpt/--init-from` 目录 = 上一步的 `final/`(内含
+  adapter_model.safetensors + adapter_config.json + projector.pt)。
+- **7a 的 preds 必须重新用 6 的 final 推理产出(preds_v15)**,
+  不能复用 4a 的 preds_v0(那是 v0 模型的错例,KTO 要修的是 v1.5)。
+- 推理/KTO 的帧加载存储自适应(视频文件或客户 WDS,自动识别
+  meta.storage),客户数据无需落地 mp4。
 
 **训练不是必须全链跑**(阶段可选/可跳/可从外部起步):
 - 编排器: `configs/pipeline.yaml` 每阶段 `enabled: true/false`,跳过的阶段
@@ -129,7 +157,11 @@ python -m data.euno_wds --annotation euno_train_v3.0.18_balanced_100k_frames.jso
       [--shards 0-99]   # 可按分片切分多机并行
   python -m annotation.consistency_filter --mode gt \
       --gemini pass1.jsonl --gt DATA/labels.jsonl --out-dir filtered/
+  python -m annotation.split_assets --gemini pass1.jsonl \
+      --whitelist filtered/whitelist_ids.txt --out-dir DATA/
   ```
+  (第 4 条是训练消费的最后一环 —— 没有它,pass1 的属性/推理链
+  嵌在 gemini_output 里,训练会**静默拿不到**辅助头/CoT 监督。)
 - **输出**: pass1.jsonl(逐条 attributes/reasoning/predictions)→
   filtered/{whitelist.jsonl, whitelist_ids.txt, partial_match.jsonl,
   discarded.jsonl, gt_suspect_stats.jsonl}。

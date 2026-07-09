@@ -241,23 +241,21 @@ def kto_step(model, batch, beta, w_d, w_u, chunk_size=256,
 
 class KTOVideoDataset:
     """kto_data.jsonl(video_id/completion/label)→ 帧 + completion。
-    KTO 帧解码走确定性路径(均匀 16 帧,无增强)。"""
+    帧走确定性路径(无增强),存储自适应(视频文件 / 客户 WDS 分片)。"""
 
-    def __init__(self, kto_records, video_index, cfg):
+    def __init__(self, kto_records, label_records, cfg):
         self.records = kto_records
-        self.videos = video_index          # video_id → 视频文件路径
+        # video_id → 完整 label record(含 meta.storage/wds 定位信息)
+        self.by_vid = {r["video_id"]: r for r in label_records}
         self.cfg = cfg
 
     def __len__(self):
         return len(self.records)
 
     def __getitem__(self, i):
-        from data.sampling import decode_video, resize_production
+        from data.euno_wds import load_frames_for_record
         r = self.records[i]
-        frames, _ = decode_video(
-            self.videos[r["video_id"]],
-            num_frames=self.cfg["sampling"]["num_frames"])
-        frames = resize_production(frames, self.cfg["sampling"]["image_size"])
+        frames = load_frames_for_record(self.by_vid[r["video_id"]], self.cfg)
         return {"frames": frames, "completion": r["completion"],
                 "is_desirable": bool(r["label"])}
 
@@ -397,13 +395,9 @@ def main():
     # ---- 数据: 分层 batch(每 batch 固定混入错例)+ 多核 shard ----
     import random
     from torch_xla import runtime as xr
-    labs = {json.loads(l)["video_id"]: json.loads(l)
-            for l in open(cfg["data"]["labels_file"], encoding="utf-8")}
-    video_index = {vid: os.path.join(
-        cfg["data"]["video_root"],
-        os.path.basename(d.get("video_uri", vid)))
-        for vid, d in labs.items()}
-    ds = KTOVideoDataset(kto_records, video_index, cfg)
+    label_records = [json.loads(l) for l in
+                     open(cfg["data"]["labels_file"], encoding="utf-8")]
+    ds = KTOVideoDataset(kto_records, label_records, cfg)
     collator = KTOCollator(processor, cfg)
 
     p_len = collator.prompt_len()          # prompt 锁死 → 静态窗口

@@ -1,10 +1,14 @@
-"""批量推理工具(hard_mining / build_kto_data / 评测共用)。"""
+"""批量推理工具(hard_mining / build_kto_data / 评测共用)。
+
+帧来源存储自适应(euno_wds.load_frames_for_record):
+  meta.storage=='wds'(客户数据)→ 分片直读;否则视频文件解码。
+"""
 import json
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from data.sampling import decode_video, resize_production  # noqa: E402
+from data.euno_wds import load_frames_for_record  # noqa: E402
 
 
 def generate_predictions(model, processor, records, cfg, out_path,
@@ -58,12 +62,7 @@ def generate_predictions(model, processor, records, cfg, out_path,
         vid = rec["video_id"]
         if vid in done:
             continue
-        path = os.path.join(cfg["data"]["video_root"],
-                            os.path.basename(rec.get("video_uri", vid)))
-        frames, _ = decode_video(path,
-                                 num_frames=cfg["sampling"]["num_frames"])
-        frames = resize_production(frames, cfg["sampling"]["image_size"])
-        batch.append(frames)                       # (T,H,W,3) np.uint8
+        batch.append(load_frames_for_record(rec, cfg))   # (T,H,W,3) uint8
         metas.append(vid)
         if len(batch) >= batch_size:
             flush()

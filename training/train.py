@@ -168,6 +168,9 @@ def main():
     out_dir = a.output or f"outputs/phase{phase['phase']}{suffix}"
     os.makedirs(out_dir, exist_ok=True)
     init_dir = a.init_from or phase.get("init_from")
+    if is_phase5 and a.stage == "b" and not init_dir:
+        print("[WARN] stage b 未指定 --init-from — 将不继承 stage a 的 "
+              "projector warmup,从零开始(确认这是有意为之)")
 
     # ---- 数据 ----
     records = load_records(cfg, phase)

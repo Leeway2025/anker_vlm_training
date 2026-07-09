@@ -37,6 +37,16 @@ def main():
         if os.path.exists(src):
             shutil.copy(src, a.out)
     save_file(avg, os.path.join(a.out, fname))
+    # projector 不参与 SWA(KTO 冻结不训),从兄弟 final/ 原样带上 ——
+    # 否则下游 run_inference --ckpt swa_final 会静默用 base projector
+    pj = os.path.join(os.path.dirname(dirs[-1].rstrip("/")),
+                      "final", "projector.pt")
+    if os.path.exists(pj):
+        shutil.copy(pj, os.path.join(a.out, "projector.pt"))
+        print(f"projector 附带: {pj}")
+    else:
+        print(f"[WARN] {pj} 不存在 — swa_final 无 projector,"
+              f"终评/导出须显式 --projector 传入")
     print(f"saved -> {a.out}")
 
 

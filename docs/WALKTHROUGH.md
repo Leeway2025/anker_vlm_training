@@ -106,18 +106,54 @@ python -m data.euno_wds --annotation euno_train_v3.0.18_balanced_100k_frames.jso
   客户 1M 数据上 q/r/u/n/j 各 300、边界对各 500 才会真实生效。
 - **实测**: `python -m eval.monitor_set` → total=98。
 
-## Step 2 Gemini 增强标注(资产 A/C/D)
+## Step 2 Gemini 增强标注(资产 A/C/D)—— 客户数据的第一步作业
 
-- **目的**: 属性标签(A,喂辅助头)/ 推理链(C,喂隐式 CoT)/
-  GT 一致白名单(D,5b/5d/KTO 数据筛选)。
-- **输入**: labels.jsonl + 视频;Gemini API(客户环境 3.1-pro)。
-- **输出**: asset_A/C.jsonl + asset_D_whitelist.txt。
-- **注意事项**: ① `max_output_tokens` 须 8192(thinking 模型的思考 token
-  吃输出预算,900 会截断 JSON——真 API 集成测试踩过);② 白名单率应 ≥80%,
-  discarded 抽查可能是 GT 错标;③ 断点续跑安全。
-- **实测**: 本环境无 API key —— **用规则模拟资产代跑**(记录含
-  `simulated:true`,README_SIMULATED.txt 说明),whitelist=98(全量)。
-  labeler 本体此前已用真 API(cloud-llm-preview1 / 2.5-pro)集成验证。
+> **每步独立执行原则**: 本文档各 Step 均可独立运行,只要满足其
+> "前置条件";每步末尾有"验收标准",**达标后才进入下一步的训练实验**。
+
+### 2A 客户 GCS/WDS 数据标注(正式路径,annotation/label_euno_wds.py)
+
+- **目的**: 对 GCS 上的 WDS 数据产出属性(A,喂辅助头)/ 推理链
+  (C,喂隐式 CoT);随后 gt 模式过滤产出白名单(D)。
+- **前置条件**: Step 1 的 GT 转换已完成(`data/euno_wds.py` 产出
+  labels.jsonl);Vertex 项目对 Gemini 有 `aiplatform.endpoints.predict`
+  权限;GCS 读权限。
+- **输入**: `--wds-dir gs://…/anker_video_clips_wds_full`(或本地)、
+  `--annotation` euno 标注 json(限定只标 balanced 100k 覆盖的 key,
+  不传会标全量 1M)。
+- **命令**(三条,顺序执行):
+  ```
+  python -m data.euno_wds --annotation <euno标注.json> --wds-dir <dir> --out DATA/labels.jsonl
+  python -m annotation.label_euno_wds --wds-dir <dir> --annotation <euno标注.json> \
+      --out pass1.jsonl --model gemini-3.1-pro --vertex-project <P> --workers 8 \
+      [--shards 0-99]   # 可按分片切分多机并行
+  python -m annotation.consistency_filter --mode gt \
+      --gemini pass1.jsonl --gt DATA/labels.jsonl --out-dir filtered/
+  ```
+- **输出**: pass1.jsonl(逐条 attributes/reasoning/predictions)→
+  filtered/{whitelist.jsonl, whitelist_ids.txt, partial_match.jsonl,
+  discarded.jsonl, gt_suspect_stats.jsonl}。
+- **注意事项**: ① 输入是 16 帧图序列(数据已上游采样),labeler 以
+  16 个 image part + 时序前言喂 Gemini;② `max_output_tokens` 必须
+  8192(thinking 模型思考 token 吃输出预算,900 截断 JSON——真 API
+  踩过);③ 断点续跑安全(--out 已有 id 自动跳过),可随时中断;
+  ④ 吞吐: 2.5-flash 单条 ~5s,--workers 8 + 分片并行估算 100k ≈
+  1~2 天/单机,注意项目配额;⑤ uuid 命名样本 camera_id=unknown,
+  转换后对其补跑 `data/camera_fingerprint.py`。
+- **验收标准(达标才开训)**: whitelist 率 ≥80%(过低先抽查
+  discarded——可能是 GT 错标而非 Gemini 错);.errors 文件占比 <2%;
+  gt_suspect_stats 里的高频 GT 可疑对报给客户。
+- **实测(2026-07-08,真 API)**: mini-WDS(2 条真实监控帧样本,
+  cloud-llm-preview1 / 2.5-flash)全链跑通: 标注 2/2 ok → gt 过滤
+  whitelist=1/2 —— 与 GT 一致者进白名单,规则粗标的异常段被 Gemini
+  正确质疑丢弃(质量闸门符合设计)。客户环境换 3.1-pro 只改 --model。
+
+### 2B 代理数据集标注(视频文件路径,annotation/gemini_labeler.py)
+
+- 与 2A 同产出,输入为视频文件(我方代理集无 WDS);伪 GT 用
+  `--mode double` 双温度一致性替代 gt 模式。
+- **实测**: UCSD 98 条 pass1 全部完成 + pass2 31 条截断演示,
+  labeler/过滤链真 API 验证通过。
 
 > **Step 3~8 说明**: 全部机制已在第 5/6/8 轮真机验证通过
 > (烟测 9/9 + 合成数据 E2E 全链 + KTO 12 步 + generate,见 WORK_STATUS)。

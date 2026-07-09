@@ -1,0 +1,15 @@
+# Phase 7: 1M 自然分布校准轮(两阶段数据策略的第二轮)
+# 定位: 从 v2(100k balanced 全链产物)热启,只做分布先验校准 ——
+#   能力(辅助头蒸馏/CoT/KTO 偏好)已在 100k 轮注入,不重跑 HM/5b/5d。
+# 前置: ① 1M 全量 GT 标注文件(euno_to_labels 转换后指到 data.labels_file)
+#       ② val_size 调回 30000;监控集用 1M 重建(自然分布下安全类配额才生效)
+# 监控红线: 安全类 q/r/u/n/j recall ≥ v2 基线 -1pt;热区对混淆不回退;
+#   回退处置: 半轮 KTO(1M 错例)+ SWA,或放弃校准保留 v2
+phase: "7_1m_calib"
+init_from: "outputs/swa_final"    # v2(含 projector);无 SWA 则 phase6_kto/final
+epochs: 1                          # 上限;分布校准通常 0.5 epoch 即早停
+learning_rate_scale: 0.3           # 小步校准,防冲掉 100k 轮注入的能力
+use_whitelist_only: false
+enable_ks_parent_head: false       # 知识已注入,纯生产格式 SFT
+enable_aux_heads: false
+cot_mode: false

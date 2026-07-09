@@ -38,6 +38,8 @@ def split_by_camera(records, val_size, holdout_key="camera_id", seed=0):
     by_cam = {}
     for r in records:
         cam = (r.get("meta") or {}).get(holdout_key) or r["video_id"]
+        if cam == "unknown":          # euno uuid 样本: 不可当同一机位
+            cam = r["video_id"]       # 整组切分会撑爆一侧(review 修复)
         by_cam.setdefault(cam, []).append(r)
     cams = sorted(by_cam)
     rng.shuffle(cams)

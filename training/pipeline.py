@@ -89,7 +89,7 @@ def build_cmds(stage, pcfg, data_cfg, exists=os.path.exists):
     """生成该阶段的命令列表(纯逻辑,可测)。"""
     ncores = pcfg.get("num_cores", 1)
     sp = "python" if ncores <= 1 else \
-        f"python -m torch_xla.distributed.xla_spawn --num_cores {ncores}"
+        "PJRT_DEVICE=TPU python"  # torch_xla.launch 内置于 train/kto,自动铺满全部核
     prev = init_for(stage, pcfg, exists)
     out = OUT[stage]
     init = f" --init-from {prev}" if prev else ""

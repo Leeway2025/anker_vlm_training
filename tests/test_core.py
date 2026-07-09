@@ -332,6 +332,42 @@ def test_camera_fingerprint_cluster():
     # UCSD 实测: 98 条 → 2 簇(70/28),与 ped1/ped2 真实机位零混淆
 
 
+def test_aux_heads_eager_init_and_optimizer():
+    """review 修复回归: 辅助头必须在优化器构建前完成初始化并可更新
+    (原版懒初始化 → 参数从未进优化器,随机权重陪跑)。"""
+    import torch
+    import torch.nn as nn
+    from training.common import AuxHeads, KSParentHead
+
+    class Dummy(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed_vision_projection = nn.Linear(8, 32)
+
+        def forward(self, x):
+            return self.embed_vision_projection(x)
+
+    m = Dummy()
+    aux = AuxHeads({}).attach(m, ["embed_vision"])
+    assert aux.heads is not None, "attach 后必须已 eager 初始化"
+    params = list(aux.parameters())
+    assert params, "优化器构建时参数不能为空"
+    ks = KSParentHead(dim=32)
+    assert list(ks.parameters())
+
+    opt = torch.optim.AdamW(params, lr=1e-2)
+    m(torch.randn(2, 5, 8))                      # 触发 hook 抓特征
+    labels = torch.full((2, 7), -100)
+    labels[:, 0] = 1                              # clothing 有标签
+    before = aux.heads["clothing"].weight.detach().clone()
+    loss = aux.compute_loss(labels)
+    assert loss.requires_grad
+    loss.backward()
+    opt.step()
+    assert not torch.equal(before, aux.heads["clothing"].weight), \
+        "一步优化后辅助头权重必须变化"
+
+
 def test_hard_mining_replication():
     """hard mining 物理复制(XLA 安全的采样加权替代)。"""
     from training.train import apply_hard_mining

@@ -275,7 +275,8 @@ def build_lora(model, cfg):
     return peft_model
 
 
-def build_optimizer(model, cfg, aux_module=None, lr_scale=1.0):
+def build_optimizer(model, cfg, aux_module=None, lr_scale=1.0,
+                    ks_module=None):
     """参数分组: LoRA+ (B×16) / vision vs llm / projector / aux heads。"""
     import torch
     lrs = cfg["lr"]
@@ -298,8 +299,19 @@ def build_optimizer(model, cfg, aux_module=None, lr_scale=1.0):
             groups["proj"].append(p)
         else:
             groups["proj"].append(p)     # 其余可训参数按 projector 处理
+    # 分别校验(真机踩坑: 合并校验时 KS 参数会掩盖 aux 为空的事实)
     if aux_module is not None:
-        groups["aux"] = list(aux_module.parameters())
+        aux_params = list(aux_module.parameters())
+        if not aux_params:
+            raise RuntimeError("辅助头参数为空 — eager 初始化未生效,"
+                               "参数将不进优化器(随机权重陪跑),拒绝开训")
+        groups["aux"] = aux_params
+    if ks_module is not None:
+        ks_params = list(ks_module.parameters())
+        if not ks_params:
+            raise RuntimeError("KS 父类头参数为空 — 需以 dim 构造"
+                               "(eager),拒绝开训")
+        groups["aux"] += ks_params                      # 与 aux 同组同 LR
 
     s = lr_scale
     param_groups = [
@@ -329,23 +341,44 @@ class AuxHeads:
         self._feat = None
 
     def attach(self, model, projector_keywords):
-        target = None
-        for name, mod in model.named_modules():
-            if any(k in name.lower() for k in projector_keywords):
-                target = mod         # 取最后一个匹配(最外层 projector)
-        if target is None:
+        matched = [mod for name, mod in model.named_modules()
+                   if any(k in name.lower() for k in projector_keywords)]
+        if not matched:
             raise RuntimeError("projector module not found for aux hook")
-        target.register_forward_hook(self._hook)
+        # 钩子挂**顶层** embedder(named_modules 父先于子 → matched[0]):
+        # 其输出 = 投影后的最终特征(1536),与下方 2D 权重推断的维度一致。
+        # 真机踩坑: 挂最深层匹配会拿到投影前 768 维特征,与头维度错位
+        matched[0].register_forward_hook(self._hook)
+        # ⚠️ 必须在此(优化器构建前)eager 初始化 —— 懒初始化晚于
+        # build_optimizer,辅助头参数将不进优化器(随机权重陪跑,原版 bug)。
+        # 维度在**所有**匹配模块中找 2D 权重(真机踩坑: 最深层匹配可能是
+        # norm,只有 1D 权重,单看它推不出维度 → eager 静默失败)
+        w = next((p for m in matched for p in m.parameters()
+                  if p.dim() == 2), None)
+        if w is None:
+            raise RuntimeError(
+                "无法从 projector 模块推断特征维度(未找到 2D 权重)— "
+                "eager 初始化失败会让辅助头绕过优化器,拒绝继续")
+        self._lazy_init(w.shape[0], "cpu", None)
+        print(f"[aux] heads eager-init: dim={w.shape[0]} (fp32)", flush=True)
+        return self
+
+    def to(self, device):
+        if self.heads is not None:
+            self.pool_score.to(device)
+            self.heads.to(device)
         return self
 
     def _hook(self, module, inp, out):
         self._feat = out if not isinstance(out, tuple) else out[0]
 
     def _lazy_init(self, dim, device, dtype):
+        # 头参数固定 fp32(小张量;bf16 + lr1e-4 有更新被舍入吞掉的风险),
+        # 特征在 compute_loss 内升 fp32 对齐
         nn = self.nn
-        self.pool_score = nn.Linear(dim, 1).to(device, dtype)
+        self.pool_score = nn.Linear(dim, 1).to(device)
         self.heads = nn.ModuleDict({
-            h: nn.Linear(dim, len(v)).to(device, dtype)
+            h: nn.Linear(dim, len(v)).to(device)
             for h, v in AUX_VOCABS.items()})
 
     def parameters(self):
@@ -364,8 +397,8 @@ class AuxHeads:
         if f.dim() == 2:
             f = f.unsqueeze(0)
         B = aux_labels.shape[0]
-        f = f.reshape(B, -1, f.shape[-1])    # 帧维并入 token 维
-        if self.heads is None:
+        f = f.reshape(B, -1, f.shape[-1]).float()   # 帧维并 token 维;fp32 头
+        if self.heads is None:               # 兜底(正常已在 attach eager)
             self._lazy_init(f.shape[-1], f.device, f.dtype)
         attn = torch.softmax(self.pool_score(f).squeeze(-1), dim=-1)
         pooled = torch.einsum("bn,bnd->bd", attn, f)
@@ -381,10 +414,22 @@ class AuxHeads:
 
 
 class KSParentHead:
-    """KeyScene 6 大类父类头(Phase 5 轻量辅助)。"""
+    """KeyScene 6 大类父类头(Phase 5 轻量辅助)。
 
-    def __init__(self):
+    dim 必传(eager 初始化)—— 懒初始化会晚于优化器构建,参数进不了
+    优化器(与 AuxHeads 同源 bug,整体 review 修复)。fp32 头。
+    """
+
+    def __init__(self, dim=None):
         self.head = None
+        if dim:
+            import torch.nn as nn
+            self.head = nn.Linear(dim, len(KS_CLASSES))
+
+    def to(self, device):
+        if self.head is not None:
+            self.head.to(device)
+        return self
 
     def compute_loss(self, hidden_states, labels_mask, ks_labels):
         import torch
@@ -392,13 +437,13 @@ class KSParentHead:
         import torch.nn.functional as F
         if (ks_labels == -100).all():
             return torch.tensor(0.0, device=hidden_states.device)
-        if self.head is None:
+        if self.head is None:                 # 兜底
             self.head = nn.Linear(hidden_states.shape[-1],
-                                  len(KS_CLASSES)).to(
-                hidden_states.device, hidden_states.dtype)
-        m = labels_mask.unsqueeze(-1).to(hidden_states.dtype)   # 目标段位置
-        pooled = (hidden_states * m).sum(1) / m.sum(1).clamp_min(1)
-        return F.cross_entropy(self.head(pooled).float(), ks_labels,
+                                  len(KS_CLASSES)).to(hidden_states.device)
+        h = hidden_states.float()             # fp32 头
+        m = labels_mask.unsqueeze(-1).float()
+        pooled = (h * m).sum(1) / m.sum(1).clamp_min(1)
+        return F.cross_entropy(self.head(pooled), ks_labels,
                                ignore_index=-100)
 
     def parameters(self):

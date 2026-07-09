@@ -35,31 +35,46 @@ class WeightedSFTTrainer(Trainer):
         outputs = model(**inputs, output_hidden_states=need_hidden)
         logits = outputs.logits
 
-        # shift
-        s_logits = logits[:, :-1].float()
+        # shift(保持 bf16,分块内再升 fp32 —— 整段 .float() 会物化
+        # (B,L,V) fp32: bs8×L2047×V262k ≈ 17GB,v6e 单芯必 OOM,真机确认)
+        s_logits = logits[:, :-1]
         s_labels = labels[:, 1:]
         s_weights = weights[:, 1:]
 
         ls = self.run_cfg["loss"]["label_smoothing"]
-        ce = F.cross_entropy(
-            s_logits.reshape(-1, s_logits.size(-1)),
-            s_labels.reshape(-1),
-            reduction="none", ignore_index=-100, label_smoothing=ls,
-        ).view(s_labels.shape)
+        V = s_logits.size(-1)
+        chunk = int(self.run_cfg["train"].get("ce_chunk", 256))
+        loss_num = logits.new_zeros((), dtype=torch.float32)
+        loss_den = logits.new_zeros((), dtype=torch.float32)
+        cls_sum = logits.new_zeros((), dtype=torch.float32)
+        cls_cnt = logits.new_zeros((), dtype=torch.float32)
+        desc_sum = logits.new_zeros((), dtype=torch.float32)
+        desc_cnt = logits.new_zeros((), dtype=torch.float32)
+        for s in range(0, s_labels.shape[1], chunk):     # 步数静态,XLA 单编译
+            lg = s_logits[:, s:s + chunk].float()
+            lb = s_labels[:, s:s + chunk]
+            wt = s_weights[:, s:s + chunk]
+            ce = F.cross_entropy(
+                lg.reshape(-1, V), lb.reshape(-1),
+                reduction="none", ignore_index=-100, label_smoothing=ls,
+            ).view(lb.shape)
+            valid = (lb != -100).float()
+            loss_num = loss_num + (ce * wt * valid).sum()
+            loss_den = loss_den + (wt * valid).sum()
+            # 监控: 分类/desc loss 分开(张量累积,log 步才 .item(),
+            # 避免每步 XLA 同步)
+            with torch.no_grad():
+                cls_m = (wt > 1.0).float() * valid
+                desc_m = (wt == 1.0).float() * valid
+                cls_sum = cls_sum + (ce.detach() * cls_m).sum()
+                cls_cnt = cls_cnt + cls_m.sum()
+                desc_sum = desc_sum + (ce.detach() * desc_m).sum()
+                desc_cnt = desc_cnt + desc_m.sum()
+        loss = loss_num / loss_den.clamp_min(1.0)
 
-        valid = (s_labels != -100).float()
-        w = s_weights * valid
-        loss = (ce * w).sum() / w.sum().clamp_min(1.0)
-
-        # 监控: 分类 loss 与 desc loss 分开(训练监控清单要求 —— 验证
-        # "分类 loss 在降",不能只有 description 在降)
         with torch.no_grad():
-            cls_m = (s_weights > 1.0) & (s_labels != -100)
-            desc_m = (s_weights == 1.0) & (s_labels != -100)
-            if cls_m.any():
-                self._loss_log["cls"] += ce[cls_m].mean().item()
-            if desc_m.any():
-                self._loss_log["desc"] += ce[desc_m].mean().item()
+            self._loss_log["cls"] += (cls_sum / cls_cnt.clamp_min(1.0))
+            self._loss_log["desc"] += (desc_sum / desc_cnt.clamp_min(1.0))
             self._loss_log["n"] += 1
 
         if self.ks_head is not None and ks_labels is not None:
@@ -76,7 +91,11 @@ class WeightedSFTTrainer(Trainer):
 
     def log(self, logs, *args, **kwargs):
         n = max(self._loss_log["n"], 1)
-        logs["loss_cls"] = round(self._loss_log["cls"] / n, 4)
-        logs["loss_desc"] = round(self._loss_log["desc"] / n, 4)
+        cls_v, desc_v = self._loss_log["cls"], self._loss_log["desc"]
+        # 张量累积 → 仅在 log 步同步一次
+        logs["loss_cls"] = round(
+            (cls_v.item() if hasattr(cls_v, "item") else cls_v) / n, 4)
+        logs["loss_desc"] = round(
+            (desc_v.item() if hasattr(desc_v, "item") else desc_v) / n, 4)
         self._loss_log = {"cls": 0.0, "desc": 0.0, "n": 0}
         return super().log(logs, *args, **kwargs)

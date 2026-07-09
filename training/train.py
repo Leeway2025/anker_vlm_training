@@ -222,17 +222,25 @@ def main():
     aux = None
     if phase.get("enable_aux_heads"):
         aux = AuxHeads(cfg).attach(model, cfg["freeze"]["projector_keywords"])
-    ks = KSParentHead() if phase.get("enable_ks_parent_head") else None
+    ks = None
+    if phase.get("enable_ks_parent_head"):
+        tc = getattr(model.config, "text_config", model.config)
+        ks = KSParentHead(dim=tc.hidden_size)     # eager,进优化器
 
     # XLA: 模型必须先上卡再建优化器(Trainer 校验两者同设备;真机烟测确认)
     if cfg.get("platform") == "tpu":
         try:
             import torch_xla.core.xla_model as xm
             model.to(xm.xla_device())
+            if aux is not None:
+                aux.to(xm.xla_device())           # 头不在 model 内,单独上卡
+            if ks is not None:
+                ks.to(xm.xla_device())
         except ImportError:
             pass
     optimizer = build_optimizer(model, cfg, aux_module=aux,
-                                lr_scale=phase.get("learning_rate_scale", 1.0))
+                                lr_scale=phase.get("learning_rate_scale", 1.0),
+                                ks_module=ks)
 
     # ---- Trainer ----
     from transformers import TrainingArguments

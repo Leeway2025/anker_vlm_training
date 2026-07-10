@@ -71,7 +71,7 @@ GOOD = {
                    "posture": "walking", "action": "taking_item",
                    "view_type": "doorbell", "sub_role_type": "Passerby",
                    "dwell": "brief_stop"},
-    "reasoning_chain": "[身份线索] x [场景线索] y [结论] z",
+    "reasoning_chain": "[Identity cues] casual clothes, hesitant pace [Scene cues] front door, no package [Conclusion] unfamiliar visitor lingering, so RoleType D with loitering",
     "predictions": {"role_type": "C", "sub_keyscene": "n",
                     "description": ("A person in casual clothes picks up a "
                                     "package from the porch and quickly "

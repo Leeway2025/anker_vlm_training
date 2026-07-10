@@ -88,10 +88,10 @@ E|p|At night, outside the residence, a bear knocked over a blue bucket placed on
    "attributes": {"clothing": "casual", "held_items": "none", "posture": "walking",
                   "action": "walking", "view_type": "non_doorbell",
                   "sub_role_type": "Passerby", "dwell": "passes_through"},
-   "reasoning_chain": "[身份线索] 多名行人穿着休闲,无特定身份标识 [场景线索] 户外步道,行人正常通行 [结论] 未指定身份的其他正常活动 → D|m",
+   "reasoning_chain": "[Identity cues] Multiple pedestrians in casual clothes, no identifying attire [Scene cues] Outdoor walkway, normal passing traffic [Conclusion] Unspecified persons in routine activity → D|m",
    "predictions": {"role_type": "D", "sub_keyscene": "m",
                    "description": "Multiple pedestrians walk across a paved outdoor area from an overhead camera view."}}}</pre>
-<div>要点: ① <code>attributes</code> 七键的取值 = <code>data/taxonomy.AUX_VOCABS</code> 枚举(训练两端单一来源);② <code>predictions</code> 只用于 2A' 一致性过滤,<b>不作训练标签</b>(GT 全量信任);③ 失败记录写同名 <code>.errors</code> 文件(含 errors 字段),重跑自动重试。</div>
+<div>要点: ⓪ <b>reasoning_chain 必须英文</b>(2026-07-10 起校验器强制: 该文本是 5d 阶段 E2B 的 think 上下文,小模型英文强于中文且更省 token,中文超限自动重试);① <code>attributes</code> 七键的取值 = <code>data/taxonomy.AUX_VOCABS</code> 枚举(训练两端单一来源);② <code>predictions</code> 只用于 2A' 一致性过滤,<b>不作训练标签</b>(GT 全量信任);③ 失败记录写同名 <code>.errors</code> 文件(含 errors 字段),重跑自动重试。</div>
 
 <h3 style="font-size:9.5pt;margin:8px 0 2px">4.5 filtered/whitelist_ids.txt(2A')与 4.6 资产文件(2A'')</h3>
 <pre style="background:#f4f6fa;border:0.5pt solid #ccd;padding:4pt;font-size:7.6pt;white-space:pre-wrap"># whitelist_ids.txt —— 每行一个 video_id;语义 = "该样本的 Gemini 增强标注可信"(非 GT 对错证据)
@@ -105,7 +105,7 @@ trainset_4k_250825/T8030P2322510409_T8160P2122501B2C_20230719_segment_1
 
 # asset_C_reasoning.jsonl —— Phase 5d 隐式 CoT 目标(仅白名单内条目)
 {"video_id": "trainset_4k_250825/T8030P2322510409_..._segment_1",
- "reasoning_chain": "[身份线索] 制服+径直走向门口 [场景线索] 手持包裹放置于门垫 [结论] 工作人员投递包裹 → B|i"}</pre>
+ "reasoning_chain": "[Identity cues] Uniform, walks straight to the door [Scene cues] Places a package on the doormat [Conclusion] Staff delivering a package → B|i"}</pre>
 <div>要点: 资产层已按白名单过滤 —— <b>训练样本永远全量</b>;无资产/低置信(&lt;0.5)样本自动降级: aux 标签 -100(该头 loss=0)、CoT 走生产模式,样本不丢。</div>
 
 <h3 style="font-size:9.5pt;margin:8px 0 2px">4.7 训练目标串 —— 模型实际学习的 label 段(3b/4b/5 用 ①;6 用 ①+②混合)</h3>
@@ -114,7 +114,7 @@ B|i|A uniformed delivery person places a package at the front door and walks awa
    ^^^^ RT字母+两个|+SK字母 → loss 权重 ×4;描述段 ×1;前缀 prompt 段全部 -100
 
 ② 推理链模式(仅 5d,占 60%,prompt 尾加 [REASON] 标记):
-&lt;think&gt;[身份线索] 制服+径直走向门口 [场景线索] 手持包裹放置 [结论] B|i&lt;/think&gt;
+&lt;think&gt;[Identity cues] Uniform, walks straight to the door [Scene cues] places a package [Conclusion] B|i&lt;/think&gt;
 B|i|A uniformed courier places a parcel at the door and leaves.
    &lt;think&gt; 段 loss 权重 0(只作条件不反传);最后 0.5 epoch 强制全 ①(退火防泄漏)</pre>
 

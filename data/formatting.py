@@ -94,6 +94,7 @@ def char_spans_to_token_weights(spec: TargetSpec,
 def format_reasoning(identity_clues: str, scene_clues: str,
                      conclusion: str) -> str:
     """把 Gemini 资产 C 的三段推理拼成训练用文本(与 annotation_spec 3.2 对齐)。"""
-    return (f"[身份线索] {identity_clues.strip()} "
-            f"[场景线索] {scene_clues.strip()} "
-            f"[结论] {conclusion.strip()}")
+    # 英文标签: think 段是 E2B 的推理上下文,与生产语言/模型强项一致
+    return (f"[Identity cues] {identity_clues.strip()} "
+            f"[Scene cues] {scene_clues.strip()} "
+            f"[Conclusion] {conclusion.strip()}")

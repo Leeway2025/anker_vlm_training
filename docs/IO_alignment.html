@@ -1,0 +1,54 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+@page { size: A4 landscape; margin: 12mm; }
+body { font-family: "Noto Sans CJK SC", sans-serif; font-size: 8.5pt; }
+h1 { font-size: 14pt; margin: 0 0 6px; }
+h2 { font-size: 11pt; margin: 12px 0 4px; color: #1a3c6e; }
+table { border-collapse: collapse; width: 100%; table-layout: fixed; }
+th, td { border: 0.5pt solid #9db2cc; padding: 3pt 4pt; vertical-align: top; word-wrap: break-word; }
+th { background: #e8eef7; text-align: left; }
+tr:nth-child(even) td { background: #f6f8fb; }
+code { font-family: "Noto Sans Mono CJK SC", monospace; font-size: 8pt; background: #eef2f7; padding: 0 2px; }
+.note { color: #8a3b00; margin-top: 8px; font-size: 8.5pt; }
+.w1{width:5%}.w2{width:16%}.w3{width:28%}.w4{width:28%}.w5{width:23%}
+</style></head><body>
+<h1>Anker VLM 训练流程 · 阶段输入/输出对齐表</h1>
+<div>2026-07-09 · 与 docs/WALKTHROUGH.md 衔接图逐字一致 · commit 以 GitHub main 为准</div>
+
+<h2>一、准备段(标注线,可与训练完全并行)</h2>
+<table><tr><th class="w1">#</th><th class="w2">阶段</th><th class="w3">输入(来自)</th><th class="w4">输出</th><th class="w5">被谁消费</th></tr>
+<tr><td>1a</td><td>GT 转换<br><code>data/euno_wds</code></td><td>euno 标注 json + wds 目录(客户 GCS)</td><td><code>DATA/labels.jsonl</code></td><td>之后所有训练/推理/评测</td></tr>
+<tr><td>1b</td><td>字节核对<br><code>eval/check_format_alignment</code></td><td>3+ 条 GT 原始串(原样复制)</td><td>通过/FAIL(闸门,无文件)</td><td>放行开训</td></tr>
+<tr><td>1b'</td><td>机位兜底<br><code>data/camera_fingerprint</code></td><td>labels 中 camera=unknown 条目</td><td><code>meta.camera_id</code> 回写</td><td>验证集防泄漏切分</td></tr>
+<tr><td>1c</td><td>监控集<br><code>eval/monitor_set</code></td><td><code>labels.jsonl</code></td><td><code>monitor.jsonl</code></td><td>每阶段结束的离线验收闸门</td></tr>
+<tr><td>2A</td><td>Gemini 标注<br><code>annotation/label_euno_wds</code></td><td>wds 帧 +(可选)标注 json 限定范围</td><td><code>pass1.jsonl</code></td><td>2A' / 2A''</td></tr>
+<tr><td>2A'</td><td>gt 过滤<br><code>annotation/consistency_filter</code></td><td>pass1 + labels(GT)</td><td><code>filtered/whitelist_ids.txt</code></td><td>2A''</td></tr>
+<tr><td>2A''</td><td>资产拆分<br><code>annotation/split_assets</code></td><td>pass1 + whitelist</td><td><code>DATA/asset_A_attributes.jsonl</code><br><code>DATA/asset_C_reasoning.jsonl</code><br><code>DATA/asset_D_whitelist.txt</code></td><td>5(A)/ 6(C);D 仅留档<br><b>样本永远全量,白名单不裁样本</b></td></tr>
+</table>
+
+<h2>二、训练段(100k balanced 轮)</h2>
+<table><tr><th class="w1">#</th><th class="w2">阶段</th><th class="w3">输入(来自)</th><th class="w4">输出(final/ 内容)</th><th class="w5">被谁消费</th></tr>
+<tr><td>3a</td><td>Projector warmup</td><td>labels</td><td><code>phase5_sft_a/final</code>(<b>仅 projector.pt</b>,无 adapter)</td><td>3b <code>--init-from</code></td></tr>
+<tr><td>3b</td><td>SFT 联合</td><td>labels + 3a final</td><td><code>phase5_sft_b/final</code>(adapter 两件套 + projector.pt)</td><td>4a <code>--ckpt</code>;4b <code>--init-from</code></td></tr>
+<tr><td>4a</td><td>v0 推理</td><td>3b final + labels</td><td><code>preds_v0.jsonl</code></td><td>4b</td></tr>
+<tr><td>4b</td><td>Hard Mining 续训</td><td>preds_v0 + labels → <code>sw.json</code>;+3b final</td><td><code>phase5_sft_hm/final</code>(<b>必须 --output 换目录!</b>)</td><td>5 <code>--init-from</code></td></tr>
+<tr><td>5</td><td>辅助头(5b)</td><td>labels 全量 + asset_A + hm final</td><td><code>phase5b_aux/final</code>(+aux_heads.pt,不交付)</td><td>6(yaml init_from)</td></tr>
+<tr><td>6</td><td>隐式 CoT(5d)</td><td>labels 全量 + asset_C + 5 final</td><td><code>phase5d_cot/final</code>(= v1.5)</td><td>4a' ckpt;7b init;<b>8 的 --projector 来源</b></td></tr>
+<tr><td>4a'</td><td>v1.5 再推理</td><td>6 final + labels</td><td><code>preds_v15.jsonl</code>(<b>不能复用 preds_v0!</b>)</td><td>7a + think 泄漏验收</td></tr>
+<tr><td>7a</td><td>KTO 数据</td><td>preds_v15 + labels(客户数据不传 whitelist)</td><td><code>outputs/kto_data.jsonl</code></td><td>7b</td></tr>
+<tr><td>7b</td><td>KTO</td><td>kto_data + 6 final</td><td><code>phase6_kto/{checkpoint-*, final}</code></td><td>7c</td></tr>
+<tr><td>7c</td><td>SWA</td><td>7b 的 checkpoint-*</td><td><code>swa_final</code>(adapter 平均 + projector 自动附带)= v2</td><td>8</td></tr>
+<tr><td>8</td><td>导出</td><td>swa_final + base 权重 + 6 final/projector.pt</td><td><code>deliverables/llm_adapter/</code>(→rkllm)<br><code>vision_merged.pt</code>(→onnx→rknn)</td><td>客户端侧编译部署</td></tr>
+</table>
+
+<h2>三、1M 自然分布轮(第二轮,真续训)</h2>
+<table><tr><th class="w1">#</th><th class="w2">阶段</th><th class="w3">输入(来自)</th><th class="w4">输出</th><th class="w5">被谁消费</th></tr>
+<tr><td>9</td><td>1M 续训<br><code>configs/phase7_1m_calib</code></td><td>1M GT 标注(客户 D7 交付)转换的 labels_1m + swa_final(v2);LR×0.5,≤2ep 早停</td><td><code>phase7_1m_calib/final</code></td><td>1M 上重复 4a/4b(HM)</td></tr>
+<tr><td>9'</td><td>1M HM + KTO + SWA</td><td>同 100k 轮衔接方式,数据换 1M</td><td>新 <code>swa_final</code>(= 最终模型)</td><td>Step 8 重新导出 = 最终交付</td></tr>
+</table>
+
+<p class="note"><b>⚠ 三个最易接错的衔接点(审计中真实出过错):</b>
+① 7a 必须用 preds_v15(v1.5 的错例),不能复用 preds_v0;
+② hard mining 续训必须 --output 换目录,否则覆盖 3b 产物;
+③ Step 8 的 --projector 必传(6 final/projector.pt),否则视觉端丢训练成果。</p>
+<p class="note"><b>通用规则:</b>所有 --ckpt/--init-from 都指上一步的 final/;任何阶段监控集验收不达标 → 弃该产物,下一阶段直接 init 上一个达标 final(回退协议)。</p>
+</body></html>

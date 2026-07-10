@@ -28,12 +28,25 @@ import time
 from pathlib import Path
 
 SYS = """You are a precise translator for a video-surveillance ML pipeline.
-Translate each Chinese reasoning chain into concise English (~30-40 words each).
-Keep the three-part structure, converting the tags exactly:
+Translate each Chinese reasoning chain into natural English.
+FIDELITY IS THE TOP PRIORITY: translate EVERY piece of evidence — do not drop,
+merge, add, or embellish any detail (counts like "multiple", qualifiers like
+"most", negations like "no uniform or tools" must all survive). Be concise in
+wording, but never at the cost of completeness.
+If the source contains structure tags, convert them exactly:
 [身份线索]→[Identity cues]  [场景线索]→[Scene cues]  [结论]→[Conclusion]
-Keep any trailing label like "→ D|m" byte-identical. Do not add or drop evidence.
+If the source has NO tags, do NOT add any.
+Keep any trailing label like "→ D|m" byte-identical.
 Input is a JSON array of strings; output MUST be a JSON array of the same
 length, same order, translations only. No markdown, no commentary."""
+
+JUDGE_SYS = """You are a strict translation auditor. For each item decide whether EN
+is a faithful and complete translation of ZH: same evidence, same entities/actions/
+qualifiers/negations, same conclusion, nothing added or dropped that changes meaning.
+Structure-tag conversion ([身份线索]→[Identity cues] etc.) is expected, not an issue;
+flag tags ADDED where ZH had none. Minor rewording is fine.
+Output a JSON array, one object per input item, SAME order:
+{"id": "<echo id>", "faithful": true/false, "issue": "<short reason if false>"}"""
 
 
 TAG_MAP = {"[身份线索]": "[Identity cues]", "[场景线索]": "[Scene cues]",
@@ -90,6 +103,88 @@ def translate_batch(client, model: str, chains: list) -> list:
     return out, toks
 
 
+def judge_pairs(client, model: str, pairs: list) -> list:
+    """pairs: [{id, zh, en}] → [{id, faithful, issue}](回显 id 校验防裁判错位)"""
+    from google.genai import types
+    verdicts = []
+    for b0 in range(0, len(pairs), 10):
+        batch = pairs[b0:b0 + 10]
+        rsp = client.models.generate_content(
+            model=model, contents=json.dumps(batch, ensure_ascii=False),
+            config=types.GenerateContentConfig(
+                system_instruction=JUDGE_SYS, temperature=0.0,
+                response_mime_type="application/json"))
+        res = json.loads(rsp.text)
+        if len(res) != len(batch):
+            raise ValueError("judge batch shape mismatch")
+        for want, got in zip(batch, res):
+            if got.get("id") != want["id"]:
+                raise ValueError(f"judge id echo mismatch: {got.get('id')}")
+            verdicts.append(got)
+    return verdicts
+
+
+def retranslate_one(client, model: str, zh: str, issue: str) -> str:
+    """不合格条目单条重译(带裁判意见,零错位风险)。"""
+    from google.genai import types
+    rsp = client.models.generate_content(
+        model=model,
+        contents=(f"Previous translation was rejected by an auditor: {issue}\n"
+                  f"Translate again, complete and faithful:\n{zh}"),
+        config=types.GenerateContentConfig(system_instruction=SYS,
+                                           temperature=0.0))
+    t = normalize_tags(rsp.text.strip().strip('"'))
+    if cjk_ratio(t) > 0:
+        raise ValueError(f"retranslation not English: {t[:60]}")
+    return t
+
+
+def verify_and_fix(client, model: str, out_path: str, rounds: int = 2) -> None:
+    """翻译后自检: 裁判全量 → 不合格单条重译 → 复判;仍不合格写 .lowfidelity"""
+    recs = [json.loads(l) for l in open(out_path, encoding="utf-8")]
+    def chain_obj(r):
+        return r.get("gemini_output") if isinstance(r.get("gemini_output"), dict) else r
+    idx = {r["video_id"]: r for r in recs}
+    pending = [{"id": r["video_id"], "zh": chain_obj(r).get("reasoning_chain_zh", ""),
+                "en": chain_obj(r)["reasoning_chain"]}
+               for r in recs if chain_obj(r).get("reasoning_chain_zh")]
+    low = []
+    for rd in range(rounds):
+        if not pending:
+            break
+        verdicts = judge_pairs(client, model, pending)
+        bad = [p for p, v in zip(pending, verdicts) if not v["faithful"]]
+        issues = {v["id"]: v.get("issue", "") for v in verdicts if not v["faithful"]}
+        print(f"[verify] round {rd + 1}: {len(pending)} judged, "
+              f"{len(bad)} unfaithful", file=sys.stderr)
+        nxt = []
+        for p in bad:
+            if rd == rounds - 1:
+                low.append({**p, "issue": issues[p["id"]]})
+                continue
+            try:
+                en = retranslate_one(client, model, p["zh"], issues[p["id"]])
+                chain_obj(idx[p["id"]])["reasoning_chain"] = en
+                nxt.append({"id": p["id"], "zh": p["zh"], "en": en})
+            except Exception as e:                    # noqa: BLE001
+                low.append({**p, "issue": str(e)})
+        pending = nxt
+    tmp = out_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fo:
+        for r in recs:
+            fo.write(json.dumps(r, ensure_ascii=False) + "\n")
+    Path(tmp).replace(out_path)
+    if low:
+        lp = Path(out_path + ".lowfidelity")
+        with lp.open("w", encoding="utf-8") as fl:
+            for x in low:
+                fl.write(json.dumps(x, ensure_ascii=False) + "\n")
+        print(f"[verify] {len(low)} 条复判仍不合格 → {lp}(建议人工抽看)",
+              file=sys.stderr)
+    else:
+        print("[verify] 全部通过", file=sys.stderr)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--in", dest="inp", required=True)
@@ -99,6 +194,9 @@ def main():
     ap.add_argument("--vertex-location", default="global")
     ap.add_argument("--batch", type=int, default=20)
     ap.add_argument("--retries", type=int, default=3)
+    ap.add_argument("--no-verify", action="store_true",
+                    help="跳过翻译后自动裁判(默认开启)")
+    ap.add_argument("--verify-rounds", type=int, default=2)
     args = ap.parse_args()
 
     from google import genai
@@ -161,6 +259,8 @@ def main():
               file=sys.stderr)
     print(f"[translate] passthrough(已英文)={passthrough} translated={ok} "
           f"failed={len(failed)} total_tokens={total_tok}", file=sys.stderr)
+    if not args.no_verify:
+        verify_and_fix(client, args.model, args.out, rounds=args.verify_rounds)
 
 
 if __name__ == "__main__":

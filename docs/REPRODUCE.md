@@ -67,6 +67,12 @@ python -m annotation.consistency_filter --mode gt \
     --gemini pass1.jsonl --gt labels.jsonl --out-dir filtered/
 python -m annotation.split_assets --gemini pass1.jsonl \
     --whitelist filtered/whitelist_ids.txt --out-dir DATA/
+# ⚠️ 2026-07-10 前跑的标注: reasoning_chain 为中文(旧 prompt 未强制
+#    语言)。不必重标 —— attributes/predictions/description 全部有效,
+#    只需对 pass1 做纯文本翻译(实测 ~132 token/条,≈重标成本的 1~2%):
+#    python -m annotation.translate_chains --in pass1.jsonl \
+#        --out pass1_en.jsonl --vertex-project <P>
+#    (断点续跑安全;之后用 pass1_en.jsonl 走 split_assets,下游零改动)
 # ⚠️ split_assets 是训练消费的最后一环(资产层过滤);样本永远全量,
 #    白名单不过滤训练样本(GT=Gemini+人工修正,质量高于 Gemini)
 # 白名单率应 ≥85%;discarded 高频对 = Gemini 系统性盲区(报供应方

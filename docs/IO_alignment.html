@@ -51,4 +51,92 @@ code { font-family: "Noto Sans Mono CJK SC", monospace; font-size: 8pt; backgrou
 ② hard mining 续训必须 --output 换目录,否则覆盖 3b 产物;
 ③ Step 8 的 --projector 必传(6 final/projector.pt),否则视觉端丢训练成果。</p>
 <p class="note"><b>通用规则:</b>所有 --ckpt/--init-from 都指上一步的 final/;任何阶段监控集验收不达标 → 弃该产物,下一阶段直接 init 上一个达标 final(回退协议)。</p>
+
+<h2 style="page-break-before: always">四、各阶段数据文件格式与示例(逐字段)</h2>
+
+<h3 style="font-size:9.5pt;margin:8px 0 2px">4.1 euno 原始标注 json —— 客户输入(LlamaFactory 对话格式,1a 消费)</h3>
+<pre style="background:#f4f6fa;border:0.5pt solid #ccd;padding:4pt;font-size:7.6pt;white-space:pre-wrap">[
+  {"id": "8000",
+   "videos": ["trainset_4k_250828/5911b3bd-ae4d-4d1a-9aaf-91a1462a5ae6_segment_1"],
+   "conversations": [
+     {"from": "human", "value": "&lt;video&gt;You are an AI surveillance analyst. ...(生产 prompt 全文,所有样本相同)"},
+     {"from": "gpt",   "value": "C|n|During the day, a man in light-colored clothes took a package from a residential doorway and left."}
+   ]}
+]</pre>
+<div>要点: <code>videos[0]</code> = index.json 的 key(定位 wds 分片);<code>gpt.value</code> = GT 串,分隔符为 <b>无空格的 |</b>(已 5/5 字节核对)。</div>
+
+<h3 style="font-size:9.5pt;margin:8px 0 2px">4.2 DATA/labels.jsonl —— 通用主标签(1a 产出;3a/3b/4b/5/6/7b 全消费)</h3>
+<pre style="background:#f4f6fa;border:0.5pt solid #ccd;padding:4pt;font-size:7.6pt;white-space:pre-wrap">{"video_id": "trainset_4k_250828/5911b3bd-ae4d-4d1a-9aaf-91a1462a5ae6_segment_1",
+ "video_uri": "trainset_4k_250828/5911b3bd-ae4d-4d1a-9aaf-91a1462a5ae6_segment_1",
+ "duration_sec": null,
+ "resolution": "384x384",
+ "labels": {"role_type": "C", "sub_keyscene": "n",
+            "description": "During the day, a man in light-colored clothes took a package from a residential doorway and left."},
+ "meta": {"camera_id": "unknown", "storage": "wds",
+          "wds_dir": "/data/anker_video_clips_wds_full", "shard": 15, "euno_id": "8000"}}</pre>
+<div>要点: ① <code>meta.storage="wds"</code> → 训练/推理自动走分片帧读取,无需 mp4;② <code>camera_id</code> 从文件名设备序列号(T8xxx)提取,uuid 命名 → "unknown" → 跑 camera_fingerprint 兜底(切分时 unknown 按单条处理);③ duration/原分辨率被上游预处理抹掉,固定 384x384;④ 代理集(视频文件)变体: meta 无 storage 字段,<code>video_uri</code> 为文件名,去 <code>data.video_root</code> 下解码。</div>
+
+<h3 style="font-size:9.5pt;margin:8px 0 2px">4.3 gt_samples.txt —— 字节核对输入(1b;从数据文件原样复制,禁手敲)</h3>
+<pre style="background:#f4f6fa;border:0.5pt solid #ccd;padding:4pt;font-size:7.6pt;white-space:pre-wrap">D|g|A man in a hat approached a camera at a residence, paused, then turned and left.
+B|i|Daytime at a residence, a male worker puts down a package, pauses, then picks it up and continues delivering.
+E|p|At night, outside the residence, a bear knocked over a blue bucket placed on the porch.</pre>
+
+<h3 style="font-size:9.5pt;margin:8px 0 2px">4.4 pass1.jsonl —— Gemini 增强标注产物(2A;真实实测记录)</h3>
+<pre style="background:#f4f6fa;border:0.5pt solid #ccd;padding:4pt;font-size:7.6pt;white-space:pre-wrap">{"video_id": "trainset_ucsd/decrypt_T8030TEST0001_ped2_train001_segment_1",
+ "gemini_model": "gemini-2.5-flash", "temperature": 0.1,
+ "gemini_output": {
+   "attributes": {"clothing": "casual", "held_items": "none", "posture": "walking",
+                  "action": "walking", "view_type": "non_doorbell",
+                  "sub_role_type": "Passerby", "dwell": "passes_through"},
+   "reasoning_chain": "[身份线索] 多名行人穿着休闲,无特定身份标识 [场景线索] 户外步道,行人正常通行 [结论] 未指定身份的其他正常活动 → D|m",
+   "predictions": {"role_type": "D", "sub_keyscene": "m",
+                   "description": "Multiple pedestrians walk across a paved outdoor area from an overhead camera view."}}}</pre>
+<div>要点: ① <code>attributes</code> 七键的取值 = <code>data/taxonomy.AUX_VOCABS</code> 枚举(训练两端单一来源);② <code>predictions</code> 只用于 2A' 一致性过滤,<b>不作训练标签</b>(GT 全量信任);③ 失败记录写同名 <code>.errors</code> 文件(含 errors 字段),重跑自动重试。</div>
+
+<h3 style="font-size:9.5pt;margin:8px 0 2px">4.5 filtered/whitelist_ids.txt(2A')与 4.6 资产文件(2A'')</h3>
+<pre style="background:#f4f6fa;border:0.5pt solid #ccd;padding:4pt;font-size:7.6pt;white-space:pre-wrap"># whitelist_ids.txt —— 每行一个 video_id;语义 = "该样本的 Gemini 增强标注可信"(非 GT 对错证据)
+trainset_4k_250825/T8030P2322510409_T8160P2122501B2C_20230719_segment_1
+
+# asset_A_attributes.jsonl —— Phase 5b 辅助头监督(仅白名单内条目)
+{"video_id": "trainset_4k_250825/T8030P2322510409_..._segment_1", "confidence": 1.0,
+ "attributes": {"clothing": "uniform", "held_items": "package", "posture": "walking",
+                "action": "placing_item", "view_type": "doorbell",
+                "sub_role_type": "DeliveryPerson", "dwell": "brief_stop"}}
+
+# asset_C_reasoning.jsonl —— Phase 5d 隐式 CoT 目标(仅白名单内条目)
+{"video_id": "trainset_4k_250825/T8030P2322510409_..._segment_1",
+ "reasoning_chain": "[身份线索] 制服+径直走向门口 [场景线索] 手持包裹放置于门垫 [结论] 工作人员投递包裹 → B|i"}</pre>
+<div>要点: 资产层已按白名单过滤 —— <b>训练样本永远全量</b>;无资产/低置信(&lt;0.5)样本自动降级: aux 标签 -100(该头 loss=0)、CoT 走生产模式,样本不丢。</div>
+
+<h3 style="font-size:9.5pt;margin:8px 0 2px">4.7 训练目标串 —— 模型实际学习的 label 段(3b/4b/5 用 ①;6 用 ①+②混合)</h3>
+<pre style="background:#f4f6fa;border:0.5pt solid #ccd;padding:4pt;font-size:7.6pt;white-space:pre-wrap">① 生产模式(全阶段):
+B|i|A uniformed delivery person places a package at the front door and walks away.
+   ^^^^ RT字母+两个|+SK字母 → loss 权重 ×4;描述段 ×1;前缀 prompt 段全部 -100
+
+② 推理链模式(仅 5d,占 60%,prompt 尾加 [REASON] 标记):
+&lt;think&gt;[身份线索] 制服+径直走向门口 [场景线索] 手持包裹放置 [结论] B|i&lt;/think&gt;
+B|i|A uniformed courier places a parcel at the door and leaves.
+   &lt;think&gt; 段 loss 权重 0(只作条件不反传);最后 0.5 epoch 强制全 ①(退火防泄漏)</pre>
+
+<h3 style="font-size:9.5pt;margin:8px 0 2px">4.8 preds_v0 / preds_v15.jsonl(4a / 4a' 推理产物)与 sw.json(4b)</h3>
+<pre style="background:#f4f6fa;border:0.5pt solid #ccd;padding:4pt;font-size:7.6pt;white-space:pre-wrap"># preds_*.jsonl —— 贪心解码原始输出;断点续跑按 video_id 去重追加
+{"video_id": "trainset_.../..._segment_1", "output": "C|s|A person lingers near the front door at night."}
+
+# sw.json —— hard mining 样本权重(video_id → 权重)
+{"trainset_.../seg_1": 1.0, "trainset_.../seg_7": 3.0, "trainset_.../seg_9": 1.3}</pre>
+<div>要点: 1.0=答对样本;3.0=可信错例;<b>分数权重(如 1.3)= per-class 膨胀封顶(1.5×)压缩后的值</b>,物理复制用流式最大余数法保证总质量守恒。</div>
+
+<h3 style="font-size:9.5pt;margin:8px 0 2px">4.9 kto_data.jsonl(7a → 7b)</h3>
+<pre style="background:#f4f6fa;border:0.5pt solid #ccd;padding:4pt;font-size:7.6pt;white-space:pre-wrap">{"video_id": "trainset_.../seg_1", "completion": "B|i|A courier leaves a parcel at the front door.", "label": true}
+{"video_id": "trainset_.../seg_7", "completion": "D|m|A person walks past the porch casually.",      "label": false}</pre>
+<div>要点: <code>label=true</code> → desirable = <b>GT 完整输出串</b>(含 GT 描述,隐式保住描述质量);<code>false</code> → undesirable = v1.5 <b>分类判错的原始输出</b>(RT 或 SubKS 任一字母错即入选,纯规则判定零标注成本)。训练时每 batch 由分层采样保证混入错例。</div>
+
+<h3 style="font-size:9.5pt;margin:8px 0 2px">4.10 euno 推理结果 json —— 基线复现输入(eval/euno_results_adapter 消费)</h3>
+<pre style="background:#f4f6fa;border:0.5pt solid #ccd;padding:4pt;font-size:7.6pt;white-space:pre-wrap">[{"id": "3", "video": "testset_1k_250730/00e22ff1-..._segment_1.mp4",
+  "conversations": [{"from": "human", "value": "...(prompt)"},
+                    {"from": "gpt", "value": "B|i|Daytime at a residence, a male worker puts down a package, ..."}],
+  "pred": {"result": "B|i|A person in a blue vest approaches a walkway camera, ...",
+           "score": [0.9472, 1.0]}}]</pre>
+<div>要点: adapter 拆成 preds.jsonl + gt.jsonl 喂 <code>eval/metrics</code>,即客户基线 93.60/76.14/86.22 的同口径复现路径。</div>
+
 </body></html>

@@ -121,6 +121,9 @@ def main():
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--vertex-project", default=None,
                     help="走 Vertex 时的 GCP 项目(不传则用 GOOGLE_API_KEY)")
+    ap.add_argument("--api-key", default=None,
+                    help="Gemini API key(客户 API key 方式;也可用环境变量 "
+                         "GOOGLE_API_KEY / GEMINI_API_KEY)")
     ap.add_argument("--location", default="global")
     a = ap.parse_args()
 
@@ -129,7 +132,7 @@ def main():
         client = genai.Client(vertexai=True, project=a.vertex_project,
                               location=a.location)
     else:
-        client = genai.Client()      # GOOGLE_API_KEY / ADC
+        client = genai.Client(api_key=a.api_key)  # None → SDK 读环境变量
     prompt = build_prompt()
 
     done = set()

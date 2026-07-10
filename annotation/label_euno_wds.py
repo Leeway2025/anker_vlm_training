@@ -105,13 +105,15 @@ def main():
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--vertex-project", default=None)
+    ap.add_argument("--api-key", default=None,
+                    help="Gemini API key(客户 API key 方式;也可用环境变量 GOOGLE_API_KEY / GEMINI_API_KEY)")
     ap.add_argument("--location", default="global")
     a = ap.parse_args()
 
     from google import genai
     client = genai.Client(vertexai=True, project=a.vertex_project,
                           location=a.location) if a.vertex_project \
-        else genai.Client()
+        else genai.Client(api_key=a.api_key)   # None → SDK 读环境变量
     prompt = build_prompt()
 
     index = read_json(f"{a.wds_dir.rstrip('/')}/index.json")

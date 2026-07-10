@@ -58,10 +58,12 @@ labels.jsonl 每行(与 annotation_spec 2.2 一致):
 ## 2. Gemini 增强标注(资产 A/C/D)
 
 ```
-# 客户 WDS 数据(正式路径):
+# 客户 WDS 数据(正式路径)。鉴权二选一:
+#   API key 方式(客户默认): --api-key <KEY>(或 export GOOGLE_API_KEY)
+#   Vertex ADC 方式:        --vertex-project <P>
 python -m annotation.label_euno_wds --wds-dir <dir> \
     --annotation <euno标注.json> --out pass1.jsonl \
-    --model gemini-3.1-pro --vertex-project <P> --workers 8
+    --model gemini-3.1-pro --api-key <KEY> --workers 8
 # (代理集视频文件用 annotation.gemini_labeler --video-root)
 python -m annotation.consistency_filter --mode gt \
     --gemini pass1.jsonl --gt labels.jsonl --out-dir filtered/
@@ -71,7 +73,7 @@ python -m annotation.split_assets --gemini pass1.jsonl \
 #    语言)。不必重标 —— attributes/predictions/description 全部有效,
 #    只需对 pass1 做纯文本翻译(实测 ~132 token/条,≈重标成本的 1~2%):
 #    python -m annotation.translate_chains --in pass1.jsonl \
-#        --out pass1_en.jsonl --vertex-project <P>
+#        --out pass1_en.jsonl --api-key <KEY>   # Vertex 则 --vertex-project <P>
 #    (断点续跑安全;之后用 pass1_en.jsonl 走 split_assets,下游零改动)
 # ⚠️ split_assets 是训练消费的最后一环(资产层过滤);样本永远全量,
 #    白名单不过滤训练样本(GT=Gemini+人工修正,质量高于 Gemini)

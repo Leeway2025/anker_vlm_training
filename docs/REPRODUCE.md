@@ -40,8 +40,15 @@ export TPU_ACCELERATOR_TYPE=v6e-8      # 补上本应从 metadata 读的值
 
 ```
 TPU VM(v6e-8 或同级)/ Python ≥3.10
-pip install torch~=2.5 torch_xla[tpu] transformers>=4.53 peft>=0.13 \
-    safetensors pyyaml opencv-python-headless decord google-genai tensorboard
+# ⚠️ 全部精确 pin,勿用浮动版本(现场两次事故: torch~=2.5 装出不支持
+#    v6e 的栈 → 编译器 bf16/pred 布局错配;transformers 未 pin 不可追溯)。
+#    完整清单见 requirements-lock.txt;推荐直接 bash scripts/setup_tpu_env.sh
+pip install torch==2.9.0 --index-url https://download.pytorch.org/whl/cpu
+pip install 'torch_xla[tpu]==2.9.0'   # 带 libtpu 0.0.21;先卸净 libtpu-nightly
+pip install torchvision==0.24.0 --index-url https://download.pytorch.org/whl/cpu
+pip install transformers==5.13.0 peft==0.19.1 accelerate==1.14.0 \
+    safetensors==0.8.0 sentencepiece==0.2.1 pyyaml \
+    opencv-python-headless decord google-genai tensorboard
 python3 tests/test_core.py     # 必须全部 passed(个别用例需 torch)
 ```
 

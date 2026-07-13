@@ -21,7 +21,11 @@ echo "== pip 栈(torch 与 torch_xla 版本必须一致,ABI 锁定)=="
 pip install --quiet torch==2.9.0 --index-url https://download.pytorch.org/whl/cpu
 pip install --quiet torch_xla[tpu]==2.9.0
 pip install --quiet torchvision==0.24.0 --index-url https://download.pytorch.org/whl/cpu
-pip install --quiet "transformers>=4.53" "peft>=0.13" safetensors pyyaml \
+# 2026-07-13 教训: 曾用浮动版本(transformers>=4.53),导致验证机与
+# 客户机版本不可追溯;sentencepiece 曾靠间接依赖带入,客户机上缺失。
+# 现全部精确 pin,与 requirements-lock.txt(验证机 freeze)一致:
+pip install --quiet transformers==5.13.0 peft==0.19.1 accelerate==1.14.0 \
+    safetensors==0.8.0 sentencepiece==0.2.1 pyyaml \
     opencv-python-headless pillow sentencepiece accelerate tensorboard \
     "jinja2>=3.1" google-genai google-cloud-storage
 

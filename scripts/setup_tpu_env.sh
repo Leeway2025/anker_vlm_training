@@ -3,6 +3,20 @@
 # 用法: bash scripts/setup_tpu_env.sh [--with-model]
 set -e
 
+# ── 非标准 TPU 环境(GKE 节点/自定义镜像)排障 ──────────────────
+# 症状: torch_xla 启动即 KeyError: 'ACCELERATOR_TYPE'(tpu.py version())
+# 原因: 该环境的 metadata `tpu-env` 键带 TPU_ 前缀,与 torch_xla 路径 A
+#       的无前缀假设不符。解法 = 走 torch_xla 官方路径 B(环境变量),
+#       两个变量必须成对(①绕开 metadata ②补上绕开后缺的数据):
+# export TPU_SKIP_MDS_QUERY=1
+# export TPU_ACCELERATOR_TYPE=v6e-8        # 按实际机型
+# 若再报 bounds/worker None(单机 v6e-8):
+# export TPU_PROCESS_BOUNDS=1,1,1
+# export TPU_CHIPS_PER_PROCESS_BOUNDS=2,4,1
+# export TPU_WORKER_ID=0
+# 标准 Cloud TPU VM 不需要以上任何变量(metadata 即无前缀格式)。
+
+
 echo "== pip 栈(torch 与 torch_xla 版本必须一致,ABI 锁定)=="
 pip install --quiet torch==2.9.0 --index-url https://download.pytorch.org/whl/cpu
 pip install --quiet torch_xla[tpu]==2.9.0

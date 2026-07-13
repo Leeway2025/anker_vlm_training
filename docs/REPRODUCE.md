@@ -23,6 +23,19 @@
 - checkpoint/final 仅 rank0 写一份;spot 机器抢占=删除,checkpoint
   目录务必放 GCS/gcsfuse
 
+### 排障: 启动即 KeyError: 'ACCELERATOR_TYPE'
+
+非标准 TPU 供给(GKE 节点/自定义镜像)的 metadata `tpu-env` 键带
+`TPU_` 前缀,torch_xla 默认路径按无前缀键读取 → KeyError。用 torch_xla
+官方环境变量路径绕开(两个变量必须**成对**设置):
+
+```
+export TPU_SKIP_MDS_QUERY=1            # 不读 metadata
+export TPU_ACCELERATOR_TYPE=v6e-8      # 补上本应从 metadata 读的值
+```
+
+只影响主机侧拓扑发现,训练数值无影响。标准 Cloud TPU VM 无需设置。
+
 ## 0. 环境
 
 ```

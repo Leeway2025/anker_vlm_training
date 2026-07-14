@@ -98,4 +98,16 @@ class WeightedSFTTrainer(Trainer):
         logs["loss_desc"] = round(
             (desc_v.item() if hasattr(desc_v, "item") else desc_v) / n, 4)
         self._loss_log = {"cls": 0.0, "desc": 0.0, "n": 0}
+        # HBM 观测: 每个 logging 周期打一行(客户反馈"看不到显存"→ 集成进日志)
+        try:
+            import torch_xla
+            import torch_xla.core.xla_model as xm
+            mi = xm.get_memory_info(torch_xla.device())
+            gb = 1024 ** 3
+            logs["hbm_gb"] = round(mi["bytes_used"] / gb, 2)
+            logs["hbm_peak_gb"] = round(mi.get("peak_bytes_used",
+                                               mi["bytes_used"]) / gb, 2)
+            logs["hbm_limit_gb"] = round(mi["bytes_limit"] / gb, 2)
+        except Exception:                        # 非 XLA 环境静默跳过
+            pass
         return super().log(logs, *args, **kwargs)

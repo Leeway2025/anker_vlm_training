@@ -16,6 +16,9 @@ export TPU_HOST_BOUNDS="${TPU_HOST_BOUNDS:-1,1,1}"
 export TPU_CHIPS_PER_HOST_BOUNDS="${TPU_CHIPS_PER_HOST_BOUNDS:-2,4,1}"
 # 切勿在此设 TPU_PROCESS_BOUNDS/TPU_CHIPS_PER_PROCESS_BOUNDS(libtpu 会
 # 误读为多进程分片声明 → INVALID_ARGUMENT;torch_xla spawn 时自行注入)
+# libtpu metrics 端口: 让 tpu-info 能实时读 HBM/利用率(跳过 metadata 后
+# 此变量不会自动生效,须显式设;每芯一个端口)
+export TPU_RUNTIME_METRICS_PORTS="${TPU_RUNTIME_METRICS_PORTS:-8431,8432,8433,8434,8435,8436,8437,8438}"
 
 echo "[run_train] TPU env:"; env | grep -E "^(TPU_|PJRT_)" | sed 's/^/  /'
 exec python3 training/train.py "$@"

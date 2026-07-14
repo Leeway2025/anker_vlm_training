@@ -29,7 +29,10 @@ class WeightedSFTTrainer(Trainer):
         weights = inputs.pop("token_weights")
         ks_labels = inputs.pop("ks_labels", None)
         aux_labels = inputs.pop("aux_labels", None)
-        labels = inputs["labels"]
+        # 必须 pop: labels 若留在 inputs 进 forward,Gemma4 会额外计算内置
+        # 全词表 CE,物化 (B,L-1,262k) logits 及中间量(bs2 实测 +16GB,
+        # 直接 OOM;transformers 5.13 不会 DCE 这条未使用的 loss 路径)
+        labels = inputs.pop("labels")
 
         need_hidden = self.ks_head is not None
         outputs = model(**inputs, output_hidden_states=need_hidden)

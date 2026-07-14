@@ -14,6 +14,12 @@ import torch
 import torch.nn.functional as F
 from transformers import Trainer
 
+try:                                   # TPU 图切割用;CPU 调试环境无 xla
+    import torch_xla.core.xla_model as xm
+    _XLA = True
+except ImportError:
+    _XLA = False
+
 
 class WeightedSFTTrainer(Trainer):
     def __init__(self, *args, run_cfg=None, ks_head=None, aux_heads=None,
@@ -23,6 +29,26 @@ class WeightedSFTTrainer(Trainer):
         self.ks_head = ks_head
         self.aux_heads = aux_heads
         self._loss_log = {"cls": 0.0, "desc": 0.0, "n": 0}
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        # 入口切图: 把上一累积窗口尾部的 optimizer.step/zero_grad 子图与
+        # 本 micro-step 的 fwd+bwd 隔离,避免二者融成一张随 LR/步数变化
+        # 而反复重编译的大图(实测该融合图 2 号 step 编译 >14 分钟)。
+        if _XLA:
+            xm.mark_step()
+        loss = super().training_step(model, inputs, num_items_in_batch)
+        # OOM 修复(勿删): transformers>=4.46 的 get_batch_samples 会把整个
+        # 梯度累积窗口的 micro-batch 一次性从 dataloader 取完(算
+        # num_items_in_batch),MpDeviceLoader 的 mark_step 因此全部在取数期
+        # 触发;之后 N 次 forward+backward 之间没有任何图切割,N 步被展开成
+        # 单张巨型 HLO 图,XLA 编译器工作内存随 N 爆炸——v6e 实测 bs1:
+        #   accum32: 单进程 RSS 峰值 225GB(ckpt on)/ >136GB(ckpt off),
+        #            30 分钟编不完第一步;8 进程合计 1.34TB → 内核 OOM killer
+        #   accum1:  RSS 31GB,正常出步
+        # 每个 micro-step 后手动切图: 梯度在 .grad 缓冲区跨图累积,语义不变。
+        if _XLA:
+            xm.mark_step()
+        return loss
 
     def compute_loss(self, model, inputs, return_outputs=False,
                      num_items_in_batch=None):

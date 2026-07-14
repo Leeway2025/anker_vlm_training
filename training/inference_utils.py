@@ -10,6 +10,29 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from data.euno_wds import load_frames_for_record  # noqa: E402
 
+try:
+    import torch_xla.core.xla_model as xm
+    _XLA = True
+except ImportError:
+    _XLA = False
+
+
+class _XlaStepMarker:
+    """LogitsProcessor: 每个解码步前向后立刻切图(勿删)。
+
+    transformers 的 generate 循环每步都要读停止条件的张量值
+    (stopping_criteria / _has_unfinished_sequences),而解码步之间
+    没有任何图边界 → 惰性图逐 token 增长,每 token 强制编译一张
+    更大的图(v6e 实测: 4 样本 50 分钟 0 输出,22 张图越编越大)。
+    LogitsProcessor 恰好在每步前向之后、停止判断取值之前被调用:
+    在这里 mark_step,图上限 = 单个解码步;配合 static cache,
+    全程仅编译 prefill + decode 两张图,之后逐 token 复用。"""
+
+    def __call__(self, input_ids, scores):
+        if _XLA:
+            xm.mark_step()
+        return scores
+
 
 def shard_records(records, spec):
     """'i/n' → 第 i 片(0 起)。大规模推理按分片多进程/多机并行,
@@ -49,7 +72,9 @@ def generate_predictions(model, processor, records, cfg, out_path,
                 do_sample_frames=False).to(model.device)
             # XLA: 动态 KV cache 每个解码位置都触发重编译(几十张图);
             # static cache 只编 prefill + decode 两张图(真机确认项)
-            gen = dict(max_new_tokens=max_new_tokens, do_sample=False)
+            from transformers import LogitsProcessorList
+            gen = dict(max_new_tokens=max_new_tokens, do_sample=False,
+                       logits_processor=LogitsProcessorList([_XlaStepMarker()]))
             try:
                 out = model.generate(**inputs,
                                      cache_implementation="static", **gen)

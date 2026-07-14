@@ -414,7 +414,13 @@ def main():
             [bool(r["label"]) for r in kto_records],
             cfg["train"]["per_device_batch_size"],
             kcfg.get("undesirable_per_batch", 2), rng)
-        for bidx in batches[rank::max(world, 1)]:    # 简单跨核 shard
+        # 集合通信要求各 rank 步数一致: batch 总数向下对齐到 world 的
+        # 整数倍,尾部余数丢弃 —— 否则多出 step 的 rank 在
+        # kl_all_reduce / 梯度 all_reduce 里等不齐全员,整场死锁
+        # (真机踩坑: 78 batch 4 rank,20/20/19/19,卡死在 rank0/1 第 20 步)
+        world_n = max(world, 1)
+        n_even = (len(batches) // world_n) * world_n
+        for bidx in batches[:n_even][rank::world_n]:  # 均匀跨核 shard
             batch = collator([ds[i] for i in bidx])
             batch = {k: v.to(device) for k, v in batch.items()}
             loss, logs = kto_step(

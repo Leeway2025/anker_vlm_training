@@ -78,10 +78,12 @@ freeze:
 
 # ---------- 训练 ----------
 train:
-  # v6e-8 真机实测(2026-07-09): bs8/芯 OOM(34.8G/31.25G),bs4 通过
-  # → bs4 × 8 芯 × accum8 = 全局 256,与方案等效
-  per_device_batch_size: 4
-  gradient_accumulation: 8
+  # 2026-07-14 v6e-1 逐档实测(31.25G/芯,与 v6e-8 每芯同构):
+  #   bs2+L1536+W384: 微步图通过,优化器步图差 1.8G → 不可用
+  #   bs1+L1536+W384: 默认档(bs1 × 8芯 × accum32 = 全局 256,与方案等效)
+  # accum 不占显存,OOM 只能降 bs、升 accum 补全局,勿动全局 256
+  per_device_batch_size: 1
+  gradient_accumulation: 32
   warmup_steps: 300
   weight_decay: 0.0
   max_grad_norm: 1.0
@@ -96,7 +98,13 @@ train:
   load_best_at_end: true       # final 取验证集最优 checkpoint,非最后一个
   # --- XLA 关键: 动态 shape 会触发反复编译,必须固定 padding ---
   pad_to_fixed_length: true
-  max_seq_len: 2048         # 视觉 1120(70×16 固定) + prompt ~200 + 目标 ~200 + 余量
+  max_seq_len: 1536         # 视觉1120+prompt~210+目标~120+余量(生产模式够用)
+                            # ⚠️ 5d think 模式目标更长: 改 1792 并把
+                            # logits_window 同步改为 640(两者必须联动)
+  # 只算序列尾部 K 位的 lm_head(答案区固定在尾部;全序列 logits 是
+  # v6e OOM 首要来源,2026-07-14 bs2 实测 dump)。0 = 关闭(全序列)。
+  # 需覆盖最长目标+1: 生产模式 desc ≤ ~120 tok;5d think 模式 ~350 tok
+  logits_window: 384
 
 # ---------- 数据 ----------
 data:

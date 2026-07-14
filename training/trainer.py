@@ -35,14 +35,28 @@ class WeightedSFTTrainer(Trainer):
         labels = inputs.pop("labels")
 
         need_hidden = self.ks_head is not None
-        outputs = model(**inputs, output_hidden_states=need_hidden)
-        logits = outputs.logits
+        # logits_window: 只对序列尾部 K 个位置计算 lm_head。
+        # 依据: 生产 prompt 固定 + 视觉 1120 token 固定 → 所有样本的答案
+        # 只出现在尾部固定窗口内。全序列 logits (B,L,262144) bf16 每份
+        # 1.5~2G,梯度检查点重算下同时存活 ~12 份(v6e-1 bs2 实测 OOM
+        # dump),窗口化后降为 (B,K,262144)。collator 已断言窗口外无标签。
+        K = int(self.run_cfg["train"].get("logits_window", 0) or 0)
+        if K:
+            outputs = model(**inputs, output_hidden_states=need_hidden,
+                            logits_to_keep=K)
+            logits = outputs.logits            # (B, K, V) = 序列最后 K 位
+            s_logits = logits[:, :-1]          # 预测位置 [L-K+1, L)
+            s_labels = labels[:, labels.shape[1] - K + 1:]
+            s_weights = weights[:, weights.shape[1] - K + 1:]
+        else:
+            outputs = model(**inputs, output_hidden_states=need_hidden)
+            logits = outputs.logits
 
-        # shift(保持 bf16,分块内再升 fp32 —— 整段 .float() 会物化
-        # (B,L,V) fp32: bs8×L2047×V262k ≈ 17GB,v6e 单芯必 OOM,真机确认)
-        s_logits = logits[:, :-1]
-        s_labels = labels[:, 1:]
-        s_weights = weights[:, 1:]
+            # shift(保持 bf16,分块内再升 fp32 —— 整段 .float() 会物化
+            # (B,L,V) fp32: bs8×L2047×V262k ≈ 17GB,v6e 单芯必 OOM,真机确认)
+            s_logits = logits[:, :-1]
+            s_labels = labels[:, 1:]
+            s_weights = weights[:, 1:]
 
         ls = self.run_cfg["loss"]["label_smoothing"]
         V = s_logits.size(-1)

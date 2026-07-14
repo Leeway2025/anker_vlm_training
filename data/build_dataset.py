@@ -234,6 +234,20 @@ class AnkerCollator:
         def _pad(seqs, value):
             return pad_fixed(seqs, value, self.cfg)
 
+        # logits_window 前置断言: 窗口必须覆盖所有监督位置(labels 是
+        # prompt(-100)+target 右填充布局,监督区从 prompt 末尾开始)。
+        # 不满足时报出实测位置,提示调大 train.logits_window。
+        K = int(self.cfg["train"].get("logits_window", 0) or 0)
+        if K:
+            L = int(self.cfg["train"]["max_seq_len"])
+            first_lab = min(
+                next(i for i, v in enumerate(lab.tolist()) if v != -100)
+                for lab in labels_l)
+            if first_lab < L - K + 1:
+                raise ValueError(
+                    f"logits_window={K} 不足: 首个监督位置在 {first_lab},"
+                    f"需 window ≥ {L - first_lab + 1}(= max_seq_len({L}) - "
+                    f"prompt长度 + 1)。请调大 configs 里 train.logits_window")
         out = {
             "input_ids": _pad(input_ids_l, pad),
             "labels": _pad(labels_l, -100),

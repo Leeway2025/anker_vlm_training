@@ -37,7 +37,21 @@ def main():
     ap.add_argument("--eval-every", type=int, default=5)
     ap.add_argument("--val-n", type=int, default=8)
     ap.add_argument("--out", default="/dev/shm/out_jax_sft")
+    ap.add_argument("--stage", choices=["a", "b"], default="b",
+                    help="a=仅 projector 预热(LoRA 全冻结)")
+    ap.add_argument("--sample-weights", help="hard-mining sw.json")
+    ap.add_argument("--aux-file", help="资产 A attributes.jsonl → 7 属性头")
+    ap.add_argument("--aux-coef", type=float, default=0.3)
+    ap.add_argument("--ks-head", action="store_true", help="KS 父类头(6 类)")
+    ap.add_argument("--ks-coef", type=float, default=0.2)
+    ap.add_argument("--cot-file", help="资产 C reasoning.jsonl → 隐式 CoT")
+    ap.add_argument("--cot-ratio", type=float, default=0.6)
+    ap.add_argument("--cot-anneal", type=float, default=0.5,
+                    help="最后该比例的步数切纯生产模式")
+    ap.add_argument("--init-npz", help="从 train_params.npz 续训(或 import_hf 产物)")
     a = ap.parse_args()
+    if a.stage == "a":
+        a.train_projector = True     # stage a 语义: 只训 projector
 
     import jax
     import jax.numpy as jnp
@@ -104,8 +118,14 @@ def main():
     model = gm.nn.LoRA(rank=a.rank,
                        model=gm.nn.Gemma4_E2B(text_only=False, config=cfg64))
 
+    from jax_impl.data import load_jsonl_map
     tok = gm.text.Gemma4Tokenizer()
-    full = SftDataset(a.labels, a.layout, tok)
+    sw = json.load(open(a.sample_weights)) if a.sample_weights else None
+    full = SftDataset(
+        a.labels, a.layout, tok, sample_weights=sw,
+        reasoning=load_jsonl_map(a.cot_file) if a.cot_file else None,
+        cot_ratio=a.cot_ratio,
+        attributes=load_jsonl_map(a.aux_file) if a.aux_file else None)
     val_idx = list(range(len(full)))[-a.val_n:]
     train_idx = [i for i in range(len(full)) if i not in set(val_idx)]
     print(f"[data] train={len(train_idx)} val={len(val_idx)} "
@@ -127,6 +147,8 @@ def main():
         return "/".join(getattr(k, "key", str(k)) for k in path)
 
     def _is_trainable(pstr):
+        if a.stage == "a":
+            return False                     # stage a: LoRA 全冻结
         if pstr.startswith("layer_") or "/layer_" in pstr:
             return True                      # LLM attn+mlp(v1 同范围)
         if a.train_vision and "vision_encoder" in pstr:
@@ -153,14 +175,42 @@ def main():
         proj0 = {}
     base = jax.tree.map(lambda x: jnp.asarray(x, jnp.bfloat16), base)
 
-    train0 = {"lora": lora0, "proj": proj0}
+    # ---- 辅助头(7 属性)与 KS 父类头: 独立 fp32 小参数树 ----
+    from data.taxonomy import AUX_VOCABS, AUX_HEAD_ORDER, KS_CLASSES
+    D_MODEL = 1536
+    aux0 = {}
+    if a.aux_file:
+        for h in AUX_HEAD_ORDER:
+            n_cls = len(AUX_VOCABS[h])
+            aux0[h] = {"w": jnp.asarray(
+                rng.normal(0, 0.02, (D_MODEL, n_cls)), jnp.float32),
+                "b": jnp.zeros((n_cls,), jnp.float32)}
+    if a.ks_head:
+        aux0["ks"] = {"w": jnp.asarray(
+            rng.normal(0, 0.02, (D_MODEL, len(KS_CLASSES))), jnp.float32),
+            "b": jnp.zeros((len(KS_CLASSES),), jnp.float32)}
+
+    train0 = {"lora": lora0, "proj": proj0, "aux": aux0}
+    if a.init_npz:                        # 续训: 覆盖同名叶(形状须一致)
+        z = np.load(a.init_npz)
+        flat = dict(z)
+        def restore(path, leaf):
+            k = _path_str(path)
+            if k in flat and flat[k].shape == leaf.shape:
+                return jnp.asarray(flat[k], leaf.dtype)
+            return leaf
+        train0 = jax.tree_util.tree_map_with_path(restore, train0)
+        n_hit = sum(1 for p, v in
+                    jax.tree_util.tree_flatten_with_path(train0)[0]
+                    if _path_str(p) in flat)
+        print(f"[init-npz] 恢复 {n_hit} 叶 from {a.init_npz}")
     tx = optax.chain(
         optax.clip_by_global_norm(1.0),         # 对齐 torch max_grad_norm
         optax.multi_transform(
             {"lora": optax.adamw(a.lr), "proj": optax.adamw(a.proj_lr)},
             param_labels=lambda tree: jax.tree_util.tree_map_with_path(
                 lambda p, _: "proj" if _path_str(p).startswith("proj")
-                else "lora", tree)))
+                else "lora", tree)))   # aux 头归入 lora 组 lr
     optim = optax.MultiSteps(tx, every_k_schedule=a.accum)
     opt_state = optim.init(train0)
 
@@ -168,7 +218,8 @@ def main():
     T = len(full.template)
     mesh = Mesh(np.asarray(devs[:DP]), ("dp",))
 
-    def loss_fn(train, base_p, tokens, labels, weights, patches, pos_xy):
+    def loss_fn(train, base_p, tokens, labels, weights, patches, pos_xy,
+                aux_labels, ks_label):
         # v1 坑 5: fp32 参与会把激活链提升 fp32 → 前向统一 bf16;
         # 冻结 lora 叶 stop_gradient(v1 坑 6: 切断未训练子树反向)
         lora_h = jax.tree_util.tree_map_with_path(
@@ -187,7 +238,9 @@ def main():
         params = gpeft.merge_params(base_h, lora_h)
         pvi = PreprocessedVisionInput(
             patches=patches, positions_xy=pos_xy, soft_token_counts=counts)
-        out = model.apply({"params": params}, tokens=tokens, images=pvi)
+        need_hidden = bool(train["aux"])
+        out = model.apply({"params": params}, tokens=tokens, images=pvi,
+                          return_hidden_states=need_hidden or None)
         logits = out.logits if hasattr(out, "logits") else out
         lg = logits[:, T - 1:-1].astype(jnp.float32)   # 尾窗(v1 坑 2)
         lb = labels[:, T:]
@@ -198,33 +251,66 @@ def main():
             lg, jnp.clip(lb, 0)[..., None], axis=-1)[..., 0]
         ce = (1 - ls) * (lse - tgt) + ls * (lse - lg.mean(-1))
         ce = jnp.where(valid > 0, ce, 0.0)      # PAD 行 NaN×0 防护
-        return (ce * wt).sum() / jnp.clip((wt * valid).sum(), 1.0)
+        loss = (ce * wt).sum() / jnp.clip((wt * valid).sum(), 1.0)
 
-    def grad_local(train, base_p, tokens, labels, weights, patches, pos_xy):
+        if need_hidden:
+            hs = out.hidden_states
+            hs = hs[-1] if isinstance(hs, (tuple, list)) else hs
+            # 视觉位池化(哨兵 -2 位置): 属性/KS 都是视觉判断
+            vmask = (tokens == -2).astype(jnp.float32)[..., None]
+            pooled = ((hs.astype(jnp.float32) * vmask).sum(1)
+                      / jnp.clip(vmask.sum(1), 1.0))            # [B, D]
+            def head_ce(w, b, y):
+                lgt = pooled @ w + b
+                lp = jax.nn.log_softmax(lgt)
+                ok = (y >= 0).astype(jnp.float32)
+                pick = jnp.take_along_axis(
+                    lp, jnp.clip(y, 0)[:, None], axis=-1)[:, 0]
+                return -(pick * ok).sum() / jnp.clip(ok.sum(), 1.0)
+            aux_l = 0.0
+            n_heads = 0
+            from data.taxonomy import AUX_HEAD_ORDER as _AHO
+            for j, h in enumerate(_AHO):
+                if h in train["aux"]:
+                    aux_l += head_ce(train["aux"][h]["w"],
+                                     train["aux"][h]["b"], aux_labels[:, j])
+                    n_heads += 1
+            if n_heads:
+                loss = loss + a.aux_coef * aux_l / n_heads
+            if "ks" in train["aux"]:
+                loss = loss + a.ks_coef * head_ce(
+                    train["aux"]["ks"]["w"], train["aux"]["ks"]["b"], ks_label)
+        return loss
+
+    def grad_local(train, base_p, tokens, labels, weights, patches, pos_xy,
+                   aux_labels, ks_label):
         loss, grads = jax.value_and_grad(loss_fn)(
-            train, base_p, tokens, labels, weights, patches, pos_xy)
+            train, base_p, tokens, labels, weights, patches, pos_xy,
+            aux_labels, ks_label)
         return (jax.lax.pmean(loss, "dp"),
                 jax.tree.map(lambda g: jax.lax.pmean(g, "dp"), grads))
 
     grad_sharded = shard_map(
         grad_local, mesh=mesh,
-        in_specs=(P(), P(), P("dp"), P("dp"), P("dp"), P("dp"), P("dp")),
+        in_specs=(P(), P(), P("dp"), P("dp"), P("dp"), P("dp"), P("dp"),
+                  P("dp"), P("dp")),
         out_specs=(P(), P()), check_rep=False)
 
     @functools.partial(jax.jit, donate_argnums=(0, 1))
     def train_step(train, opt_state, base_p, tokens, labels, weights,
-                   patches, pos_xy):
+                   patches, pos_xy, aux_labels, ks_label):
         loss, grads = grad_sharded(train, base_p, tokens, labels, weights,
-                                   patches, pos_xy)
+                                   patches, pos_xy, aux_labels, ks_label)
         updates, opt_state = optim.update(grads, opt_state, train)
         train = optax.apply_updates(train, updates)
         return train, opt_state, loss
 
     eval_local = shard_map(
-        lambda tr, bp, t, l, w, p, x: jax.lax.pmean(
-            loss_fn(tr, bp, t, l, w, p, x), "dp"),
+        lambda tr, bp, t, l, w, p, x, al, kl: jax.lax.pmean(
+            loss_fn(tr, bp, t, l, w, p, x, al, kl), "dp"),
         mesh=mesh,
-        in_specs=(P(), P(), P("dp"), P("dp"), P("dp"), P("dp"), P("dp")),
+        in_specs=(P(), P(), P("dp"), P("dp"), P("dp"), P("dp"), P("dp"),
+                  P("dp"), P("dp")),
         out_specs=P(), check_rep=False)
     eval_loss_j = jax.jit(eval_local)
 
@@ -237,14 +323,21 @@ def main():
         return (jnp.asarray(np.stack([e["tokens"] for e in exs])),
                 jnp.asarray(np.stack([e["labels"] for e in exs])),
                 jnp.asarray(np.stack([e["weights"] for e in exs])),
-                jnp.asarray(np.stack(pt)), jnp.asarray(np.stack(px)))
+                jnp.asarray(np.stack(pt)), jnp.asarray(np.stack(px)),
+                jnp.asarray(np.stack([e["aux_labels"] for e in exs])),
+                jnp.asarray(np.stack([e["ks_label"] for e in exs])))
 
     train = train0
     os.makedirs(a.out, exist_ok=True)
     hist, best = [], (1e9, -1)
     cursor = 0
     t0 = time.time()
-    for micro in range(a.steps * a.accum):
+    total_micro = a.steps * a.accum
+    switch_at = int(total_micro * (1 - a.cot_anneal)) if a.cot_file else -1
+    for micro in range(total_micro):
+        if switch_at >= 0 and micro == switch_at and not full.anneal:
+            full.set_anneal(True)
+            print(f"[anneal] micro {micro}: 切换纯生产模式", flush=True)
         idxs = [train_idx[(cursor + j) % len(train_idx)] for j in range(DP)]
         cursor += DP
         batch = collect(idxs)

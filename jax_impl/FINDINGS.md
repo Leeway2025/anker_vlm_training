@@ -131,3 +131,32 @@ v2 新增经验:
   `...vision_tower.encoder.layers.N.*.linear.lora_X`);
 - projector npz → HF `multi_modal_projector` 状态字典转换脚本;
 - 8 卡真机吞吐对拍(需客户机或第二台 v6e);真实数据 loss 曲线对拍。
+
+
+## v3 完成: 全流水线各阶段 JAX 化(2026-07-15)
+
+| 阶段 | 文件 | 验证(v6e 真机,假数据短跑) |
+|---|---|---|
+| stage a(projector 预热) | train_sft.py --stage a | ✅ 3 步 loss 8.60→8.33,LoRA 全冻结分支正确 |
+| aux 头(7 属性)+KS 头+隐式 CoT | train_sft.py --aux-file/--ks-head/--cot-file | ✅ 4 步 9.84→6.85,退火切换日志正确 |
+| 推理生成 | infer.py | ✅ 2.5s/样本;固定步贪心+单张静态图,规避 generate 逐 token 重编译 |
+| hard_mining | hard_mining.py(+--sample-weights 续训) | ✅ 14 错例/类膨胀上限/64→83 复制/续训 3.25→2.93 |
+| KTO | kto.py | ✅ 3 步 loss 0.16~0.49,kl/logratio 正常,0.25s/micro;ref≡base 免 adapter 切换 |
+| SWA | swa.py | ✅ 507 张量;异构树共有键平均 |
+| **torch ckpt 导入** | import_hf.py | ✅ **真实 R1 adapter 前向对拍 PASS**(top-5 全同,lp<0.02) |
+
+v3 关键经验:
+- **torch adapter 实为差异化 rank(全局层 512/滑动层 256)+ rsLoRA +
+  alpha_pattern(全局层 alpha=1024)**——import 必须逐张量取 r、逐模块
+  算 alpha;alpha_pattern 正则形如 `.*\.layers\.4\..*\.q_proj`,匹配串
+  必须带前导段与 self_attn/mlp 段,否则静默全漏(踩坑实录);
+- 融合模块(kv/gate-up)跨框架导入用 rank 拼接精确表示,容器 R=2×max_r
+  =1024;矩阵级 delta 对照(纯 numpy)是最锋利的映射验证手段;
+- KTO 的 lora 树里"值为零"≠"不可导"——非训练子树必须 stop_gradient,
+  否则视觉反向 62G OOM(与 SFT v1 坑 6 同根);
+- KTO ref≡base(torch 的"初始 adapter 副本" B=0 数学上就是 base),
+  JAX 免去 set_adapter 切换,每 micro 仅 0.25s。
+
+**至此 torch 管线的全部阶段(a/b/hm/aux/cot/kto/swa/推理/导入导出)
+均有 JAX 实现且通过机制验证;与 torch 的互操作双向打通
+(export_hf 出 / import_hf 进),支持跨框架续训与混合管线。**

@@ -75,3 +75,32 @@ lax.scan 累积/selective remat,~1-2 周)→ 与 torch 路线指标对拍。
 - 我方 bench:bs5×ckpt_on 可跑(无 HBM OOM);bs4/bs2 × ckpt_off 均
   HBM OOM(36.45G / 33.02G > 31.25G)→ torch 路线重算税只能靠 JAX
   的细粒度 remat 省回来,这正是 JAX 路线预期 1.3~1.8× 提速的主要来源
+
+
+## 训练循环 v1 打通(2026-07-15,train_sft.py)
+
+**结果**:假数据 64 样本、bs1、accum4、10 个优化器步 —— exit 0,
+loss 8.91 → 3.79(多模态视频输入下 LoRA 真实收敛),HBM 峰值
+28.72/31.25G,**稳态 micro-step ≈1.9~2.1s(torch 路线同场景 ≈5.5s),
+编译仅 77s(torch_xla 需 15~30 分钟)**。
+
+范围:LLM 层(attn+mlp)LoRA 训练(与 torch adapter 同范围);
+视觉/embedder LoRA 冻结 + stop_gradient(v2 项)。
+
+**移植攻坚记录(7 个坑,全部已修,代码内有注释)**:
+1. `model.init` 在 TPU 物化 5B fp32 → eval_shape 结构化初始化;
+2. one_hot 平滑 CE 物化 [L,262k] fp32 → gather 式 lse/tgt 改写 + 尾窗切片;
+3. gm 库无内置逐层重算,bs1 反向 HLO 临时 66.7G → nn.remat 包 Block;
+4. Block 的 bool 参数被 remat 提升成 traced array → 闭包在边界外固化;
+5. fp32 LoRA 把激活链提升 fp32 → 前向 bf16(fp32 master 在优化器侧);
+6. 视觉塔反向吃 ~32G(ViT 未 remat)→ v1 冻结视觉 LoRA 切断反向;
+7. **gm 训练路径 remove_mm_logits 压缩视觉位 logits**(gm 生态假设
+   模型自插软 token),尾部垃圾正盖住 label 窗口,表现为"末 670 位
+   NaN" → 恒等旁路(我们按 HF 语义自行对齐)。
+
+## 下一步(v2,按优先级)
+
+1. 多芯数据并行(shard_map/pmap,4→8 卡),对拍 torch 8 卡吞吐;
+2. 视觉塔 remat(vision/_modules 同款补丁)→ 放开视觉 LoRA + projector;
+3. 完整导出映射表(q/kv/o/mlp 融合拆分 + 视觉塔;Gate D 已证 q_proj 链);
+4. eval 循环 + 早停;真实数据对拍 torch 指标(同数据同步数 loss 曲线)。

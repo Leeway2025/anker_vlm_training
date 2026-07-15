@@ -20,7 +20,7 @@ def run_hf(out):
     from transformers import AutoModelForCausalLM, AutoProcessor
     import yaml
     cfg = yaml.safe_load(open("configs/base.yaml", encoding="utf-8"))
-    name = cfg["model"]["name"]
+    name = cfg["model"]["name_or_path"]
     proc = AutoProcessor.from_pretrained(name)
     model = AutoModelForCausalLM.from_pretrained(
         name, torch_dtype=torch.float32)          # 对拍用 fp32,排除精度噪声

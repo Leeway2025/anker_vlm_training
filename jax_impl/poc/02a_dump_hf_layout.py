@@ -38,7 +38,7 @@ def main():
     from data.build_dataset import AnkerCollator
 
     cfg = yaml.safe_load(open("configs/base.yaml", encoding="utf-8"))
-    processor = AutoProcessor.from_pretrained(cfg["model"]["name"])
+    processor = AutoProcessor.from_pretrained(cfg["model"]["name_or_path"])
     col = AnkerCollator(processor, cfg)
 
     nf = cfg["sampling"]["num_frames"]

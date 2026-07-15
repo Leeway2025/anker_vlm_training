@@ -28,11 +28,14 @@ JAX 侧已确认对齐的部分:
 - 视觉预处理 patch16 + 3×3 池化 + max_soft_tokens=1120 → 384² 帧同样出
   64 token,**与 HF 逐帧数学一致**
 
-剩余一项(Gate B 收尾):
-- JAX 库预处理是图像语义(占位符 258880),HF 视频用 258884。输入序列
-  我们可以手工拼装(ids 全对齐没问题),关键是 **gemma4/_transformer.py
-  里视觉 embedding 替换逻辑按哪个 id 找位置**——若只认 258880,要么改一
-  行替换 id,要么确认模型本身支持视频占位。读源码 + 单帧前向即可关闭。
+Gate B 设计疑问已关闭(源码实证):
+- `gemma4/_transformer.py:532`:视觉合并用 `tokens == TOKEN_PLACEHOLDER`
+  (`vision/_encoder.py:32`,**哨兵值 -2**,非词表 id)做 mask 替换 →
+  HF(258884)与 JAX(258880)的占位 id 差异在模型侧不存在。
+  拼装配方:与 HF 完全相同的文本/哨兵 ids(255999/258882 原样),
+  仅把每帧 64 个视频占位换成 -2,帧图像走 PreprocessedVisionInput。
+- 剩余为机械工作:拼装 + 位置逐位 diff(并入 Gate C 前向对拍验证
+  position/双向注意力语义)。
 
 ## Gate C/D: 未开始(等 B 关闭)
 

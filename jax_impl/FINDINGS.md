@@ -104,3 +104,30 @@ loss 8.91 → 3.79(多模态视频输入下 LoRA 真实收敛),HBM 峰值
 2. 视觉塔 remat(vision/_modules 同款补丁)→ 放开视觉 LoRA + projector;
 3. 完整导出映射表(q/kv/o/mlp 融合拆分 + 视觉塔;Gate D 已证 q_proj 链);
 4. eval 循环 + 早停;真实数据对拍 torch 指标(同数据同步数 loss 曲线)。
+
+
+## v2 完成(2026-07-15,commit 见 git)
+
+| 项 | 结果 |
+|---|---|
+| ① shard_map 4 芯数据并行 | ✅ 10/10 步,train 8.59→3.36,HBM 28.7G/卡 |
+| ② 视觉训练解锁 | ✅ VisionBlock remat + 视觉 LoRA + projector 全参(mm_input_projection),显存持平 |
+| ③ 完整导出映射(export_hf.py) | ✅ q/k/v/o/gate/up/down ×35 层(490 张量)全模块 HF 对拍 PASS |
+| ④ eval 循环 | ✅ val_loss 4.38→3.13,best 追踪 |
+
+v2 新增经验:
+- kv/gating 融合权重的拆分映射经**权重级对照**验证(w[0]≡gate_proj、
+  w[1]≡up_proj、linear.T≡down_proj,bf16 舍入 1e-3 级);
+- **自检必须 fp32 + 小扰动**:bf16 base 的精度差在 6144 大扇面模块的
+  大随机扰动下被混沌放大成完全不同的 top-5,曾误判映射有错;
+- checkpoint 的 projector 仅 mm_input_projection 一项(与 torch 侧
+  "projector tensors=1" 观察一致);
+- optax.multi_transform 分组 lr(lora 1e-4 / projector 5e-4)+
+  clip_by_global_norm(1.0) 对齐 torch 超参。
+
+## v3 残留
+
+- 视觉塔 LoRA 的 HF 键名映射(训练已通,导出待做;torch 侧键式
+  `...vision_tower.encoder.layers.N.*.linear.lora_X`);
+- projector npz → HF `multi_modal_projector` 状态字典转换脚本;
+- 8 卡真机吞吐对拍(需客户机或第二台 v6e);真实数据 loss 曲线对拍。

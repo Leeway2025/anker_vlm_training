@@ -1,19 +1,21 @@
-"""JAX SFT 训练循环 v1(LoRA-only,单设备,验证机制与吞吐)。
+"""JAX SFT 训练循环 v2(多芯数据并行 + 视觉 LoRA + projector 全参)。
 
   /dev/shm/venv_jax/bin/python jax_impl/train_sft.py \
-      --labels /dev/shm/fakedata/labels.jsonl \
-      --layout /dev/shm/hf_layout.json --steps 10 --accum 4 --lr 1e-4
+      --labels /dev/shm/fakedata/labels.jsonl --layout /dev/shm/hf_layout.json \
+      --steps 10 --accum 2 --dp 4 --train-vision --train-projector
 
-设计(与 torch 路线的差异见 jax_impl/FINDINGS.md):
-  - gm.nn.LoRA 整模包装(LLM einsum + 视觉塔全部注入;base 冻结,
-    只训 lora 参数 —— 天然满足 RK1828 base 不动的红线)
-  - 加权 CE: 分类 token ×4 + label_smoothing 0.1(对齐 torch loss)
-  - 梯度累积: optax.MultiSteps(设备上累积,无 host 同步)
-  - v1 无 remat(JAX 显存管理 + bs1 直测;不足再加 selective remat)
-  - checkpoint: lora 参数树 npz;→ HF peft 导出走 export_hf.py(Gate D 链)
+v1→v2:
+  - shard_map 数据并行: 每设备沿用已验证的 bs1 路径,梯度 pmean;
+  - --train-vision: VisionBlock nn.remat(纯数组签名,免闭包技巧)
+    + 视觉 LoRA 解冻(v1 消融: 无 remat 的视觉反向吃 ~32G);
+  - --train-projector: embedder/mm_input_projection(+norm)全参训练
+    (对齐 torch 路线: projector 不在 adapter 内、单独训练);
+  - 梯度裁剪 1.0(对齐 torch max_grad_norm)+ 每 K 步验证集 loss。
+v1 的七个坑及修复见 FINDINGS.md;本文件保留全部关键注释。
 """
 import argparse
 import dataclasses
+import functools
 import json
 import os
 import time
@@ -24,10 +26,16 @@ def main():
     ap.add_argument("--labels", required=True)
     ap.add_argument("--layout", required=True)
     ap.add_argument("--steps", type=int, default=10)
-    ap.add_argument("--accum", type=int, default=4)
+    ap.add_argument("--accum", type=int, default=2)
+    ap.add_argument("--dp", type=int, default=0, help="数据并行设备数,0=全部")
     ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--proj-lr", type=float, default=5e-4)
     ap.add_argument("--rank", type=int, default=16)
     ap.add_argument("--label-smoothing", type=float, default=0.1)
+    ap.add_argument("--train-vision", action="store_true")
+    ap.add_argument("--train-projector", action="store_true")
+    ap.add_argument("--eval-every", type=int, default=5)
+    ap.add_argument("--val-n", type=int, default=8)
     ap.add_argument("--out", default="/dev/shm/out_jax_sft")
     a = ap.parse_args()
 
@@ -35,23 +43,25 @@ def main():
     import jax.numpy as jnp
     import numpy as np
     import optax
+    import flax.linen as nn
+    from jax.sharding import Mesh, PartitionSpec as P
+    from jax.experimental.shard_map import shard_map
     from gemma import gm
     from gemma import peft as gpeft
+    from gemma.gm.nn.gemma4 import _modules as g4_modules
+    from gemma.gm.nn.gemma4 import _transformer as g4_tr
     from gemma.gm.nn.gemma4.vision import _encoder as gemma_vision
+    from gemma.gm.nn.gemma4.vision import _transformer as gv_tr
     from gemma.gm.nn.gemma4._transformer import PreprocessedVisionInput
 
     from jax_impl.data import SftDataset, make_vision_input
 
-    print(f"[env] devices={jax.devices()}")
+    devs = jax.devices()
+    DP = a.dp or len(devs)
+    print(f"[env] devices={len(devs)} dp={DP}")
 
-    # ---- 逐层重算: gm 无内置 remat,动态把 Block 包成 nn.remat ----
-    # (只影响本进程,不改库;policy 可换 dots_saveable 做选择性重算)
-    import flax.linen as nn
-    from gemma.gm.nn.gemma4 import _modules as g4_modules
+    # ---- 逐层重算(gm 无内置 remat;v1 坑 3/4)----
     if not getattr(g4_modules, "_REMAT_PATCHED", False):
-        # 整 Block 逐层重算。skip_sliding_mask 是 python bool,直接进
-        # nn.remat 会被提升成 traced array 报错 → 在 remat 边界外按其值
-        # 选择两个"值已固化在闭包里"的 remat 核,布尔不再进入 trace。
         _orig_call = g4_modules.Block.__call__
         _POL = jax.checkpoint_policies.nothing_saveable
 
@@ -72,155 +82,210 @@ def main():
 
         g4_modules.Block.__call__ = patched
         g4_modules._REMAT_PATCHED = True
-        print("[remat] Block 已包装(闭包固化 bool, nothing_saveable)")
 
-    # HF 语义对齐(勿删): gm 训练路径会 remove_mm_logits 把视觉位 logits
-    # 压缩移除(gm 生态假设模型自己插入软 token,输出对齐回未插入序列),
-    # 压缩后尾部是垃圾值,正好盖住我们的 label 窗口(实测尾部 670 位
-    # "NaN")。我们按 HF 语义自行预插入/自行对齐 labels → 恒等旁路。
-    from gemma.gm.nn.gemma4 import _transformer as g4_tr
+    if a.train_vision and not getattr(gv_tr, "_REMAT_PATCHED", False):
+        # 视觉塔反向无 remat 时吃 ~32G(v1 消融);VisionBlock 纯数组签名
+        gv_tr.VisionBlock = nn.remat(
+            gv_tr.VisionBlock,
+            policy=jax.checkpoint_policies.nothing_saveable)
+        gv_tr._REMAT_PATCHED = True
+        print("[remat] VisionBlock 已包装")
+
+    # HF 语义对齐(v1 坑 7,勿删): gm 训练路径 remove_mm_logits 会压缩
+    # 视觉位 logits,尾部垃圾盖住 label 窗口 → 恒等旁路
     g4_tr._token_utils.remove_mm_logits = \
         lambda logits, tokens, num_tokens_per_image: logits
-    print("[patch] remove_mm_logits 旁路(保持 HF 位置对齐)")
 
     # ---- 模型(视频语义: output_length=64,Gate C 配方)----
-    TEXT_ONLY = bool(os.environ.get("REPRO_TEXT_ONLY"))   # 显存消融开关
     cfg64 = dataclasses.replace(
         gm.nn.Gemma4_E2B.config,
         vision_encoder=gemma_vision.VisionEncoder(
             use_clipped_linears=True, output_length=64))
-    inner = gm.nn.Gemma4_E2B() if TEXT_ONLY else \
-        gm.nn.Gemma4_E2B(text_only=False, config=cfg64)
-    model = gm.nn.LoRA(rank=a.rank, model=inner)
-    if TEXT_ONLY:
-        print("[ablate] TEXT_ONLY: 无视觉塔,哨兵→0,images=None")
+    model = gm.nn.LoRA(rank=a.rank,
+                       model=gm.nn.Gemma4_E2B(text_only=False, config=cfg64))
 
     tok = gm.text.Gemma4Tokenizer()
-    ds = SftDataset(a.labels, a.layout, tok)
-    print(f"[data] {len(ds)} samples, max_len={ds.max_len}")
+    full = SftDataset(a.labels, a.layout, tok)
+    val_idx = list(range(len(full)))[-a.val_n:]
+    train_idx = [i for i in range(len(full)) if i not in set(val_idx)]
+    print(f"[data] train={len(train_idx)} val={len(val_idx)} "
+          f"max_len={full.max_len}")
 
-    # ---- 参数: base 冻结加载 + lora 结构初始化 ----
-    ex = ds[0]
-    patches, pos_xy, counts = make_vision_input([ex["frames"]])
-    dummy_tokens = jnp.asarray(ex["tokens"][None])
+    # ---- lora 结构初始化(v1 坑 1: eval_shape 免物化)----
+    ex = full[0]
+    p0, x0, counts = make_vision_input([ex["frames"]])
     dummy_pvi = PreprocessedVisionInput(
-        patches=jnp.asarray(patches), positions_xy=jnp.asarray(pos_xy),
+        patches=jnp.asarray(p0), positions_xy=jnp.asarray(x0),
         soft_token_counts=counts)
-
-    t0 = time.time()
-    # eval_shape: 只拿结构不分配内存(直接 init 会在 TPU 物化 5B fp32 爆 HBM)
-    if TEXT_ONLY:
-        struct = jax.eval_shape(lambda: model.init(
-            jax.random.PRNGKey(0), tokens=jnp.maximum(dummy_tokens, 0)))
-    else:
-        struct = jax.eval_shape(lambda: model.init(
-            jax.random.PRNGKey(0), tokens=dummy_tokens, images=dummy_pvi))
+    struct = jax.eval_shape(lambda: model.init(
+        jax.random.PRNGKey(0),
+        tokens=jnp.asarray(ex["tokens"][None]), images=dummy_pvi))
     _, lora_struct = gpeft.split_params(struct["params"])
     rng = np.random.RandomState(0)
+
+    def _path_str(path):
+        return "/".join(getattr(k, "key", str(k)) for k in path)
+
+    def _is_trainable(pstr):
+        if pstr.startswith("layer_") or "/layer_" in pstr:
+            return True                      # LLM attn+mlp(v1 同范围)
+        if a.train_vision and "vision_encoder" in pstr:
+            return True
+        return False
+
     def init_leaf(path, leaf):
-        name = "/".join(getattr(k, "key", str(k)) for k in path)
-        if name.endswith("/a"):        # A 随机、B 置零(peft 同款约定)
+        pstr = _path_str(path)
+        if pstr.endswith("/a") and _is_trainable(pstr):
             return jnp.asarray(rng.normal(0, 0.02, leaf.shape), jnp.float32)
-        return jnp.zeros(leaf.shape, jnp.float32)
+        return jnp.zeros(leaf.shape, jnp.float32)   # B 零 + 冻结项零
     lora0 = jax.tree_util.tree_map_with_path(init_leaf, lora_struct)
-    n_lora = sum(x.size for x in jax.tree.leaves(lora0))
-    print(f"[init] lora params {n_lora/1e6:.1f}M ({time.time()-t0:.0f}s)")
 
     base = gm.ckpts.load_params(gm.ckpts.CheckpointPath.GEMMA4_E2B_IT)
+
+    # ---- projector 全参(从 base 抽出作为可训练树)----
+    PROJ_KEYS = ("mm_input_projection",)   # checkpoint 实测仅此一项(与 torch projector tensors=1 一致)
+    if a.train_projector:
+        proj0 = {k: jax.tree.map(lambda x: jnp.asarray(x, jnp.float32),
+                                 base["embedder"][k]) for k in PROJ_KEYS}
+        print(f"[proj] 全参训练: {list(proj0)} "
+              f"({sum(x.size for x in jax.tree.leaves(proj0))/1e6:.1f}M)")
+    else:
+        proj0 = {}
     base = jax.tree.map(lambda x: jnp.asarray(x, jnp.bfloat16), base)
-    print(f"[init] base loaded ({time.time()-t0:.0f}s)")
 
-    optim = optax.MultiSteps(optax.adamw(a.lr), every_k_schedule=a.accum)
-    opt_state = optim.init(lora0)
+    train0 = {"lora": lora0, "proj": proj0}
+    tx = optax.chain(
+        optax.clip_by_global_norm(1.0),         # 对齐 torch max_grad_norm
+        optax.multi_transform(
+            {"lora": optax.adamw(a.lr), "proj": optax.adamw(a.proj_lr)},
+            param_labels=lambda tree: jax.tree_util.tree_map_with_path(
+                lambda p, _: "proj" if _path_str(p).startswith("proj")
+                else "lora", tree)))
+    optim = optax.MultiSteps(tx, every_k_schedule=a.accum)
+    opt_state = optim.init(train0)
 
-    V = 262144
     ls = a.label_smoothing
-    T = len(ds.template)               # label 只在尾窗 → 只算尾窗 CE
+    T = len(full.template)
+    mesh = Mesh(np.asarray(devs[:DP]), ("dp",))
 
-    def _is_trainable(path):
-        # v1 与 torch adapter 同范围: 仅 LLM 层(attn+mlp)。视觉/embedder
-        # LoRA 冻结 + stop_gradient —— 切断视觉塔反向(消融实测它吃 ~32G;
-        # 视觉训练留给 v2: 给 vision/_modules 加同款 remat 后再放开)
-        name = "/".join(getattr(k, "key", str(k)) for k in path)
-        return name.startswith("layer_") or "/layer_" in name
-
-    def loss_fn(lora, base_p, tokens, labels, weights, pvi):
-        # LoRA 前向用 bf16(fp32 参与会把整条激活链提升成 fp32,HBM 翻倍);
-        # fp32 master 权重仍在优化器侧(lora/opt_state 本体)
+    def loss_fn(train, base_p, tokens, labels, weights, patches, pos_xy):
+        # v1 坑 5: fp32 参与会把激活链提升 fp32 → 前向统一 bf16;
+        # 冻结 lora 叶 stop_gradient(v1 坑 6: 切断未训练子树反向)
         lora_h = jax.tree_util.tree_map_with_path(
-            lambda p, x: x.astype(jnp.bfloat16) if _is_trainable(p)
-            else jax.lax.stop_gradient(x.astype(jnp.bfloat16)), lora)
-        params = gpeft.merge_params(base_p, lora_h)
-        if TEXT_ONLY:
-            out = model.apply({"params": params},
-                              tokens=jnp.maximum(tokens, 0))
-        else:
-            out = model.apply({"params": params}, tokens=tokens, images=pvi)
+            lambda p, x: x.astype(jnp.bfloat16)
+            if _is_trainable(_path_str(p))
+            else jax.lax.stop_gradient(x.astype(jnp.bfloat16)),
+            train["lora"])
+        base_h = base_p
+        if a.train_projector:
+            emb = dict(base_p["embedder"])
+            for k in PROJ_KEYS:
+                emb[k] = jax.tree.map(
+                    lambda x: x.astype(jnp.bfloat16), train["proj"][k])
+            base_h = dict(base_p)
+            base_h["embedder"] = emb
+        params = gpeft.merge_params(base_h, lora_h)
+        pvi = PreprocessedVisionInput(
+            patches=patches, positions_xy=pos_xy, soft_token_counts=counts)
+        out = model.apply({"params": params}, tokens=tokens, images=pvi)
         logits = out.logits if hasattr(out, "logits") else out
-        # shift + 尾窗: 位置 t 预测 t+1;label 区 [T, L)
-        lg = logits[:, T - 1:-1].astype(jnp.float32)   # [B, K, V]
+        lg = logits[:, T - 1:-1].astype(jnp.float32)   # 尾窗(v1 坑 2)
         lb = labels[:, T:]
         wt = weights[:, T:]
         valid = (lb != -100).astype(jnp.float32)
-        lse = jax.nn.logsumexp(lg, axis=-1)             # [B, K]
+        lse = jax.nn.logsumexp(lg, axis=-1)
         tgt = jnp.take_along_axis(
             lg, jnp.clip(lb, 0)[..., None], axis=-1)[..., 0]
-        # 平滑 CE = (1-ls)(lse - lg_t) + ls·(lse - mean(lg)) —— 免 one-hot
         ce = (1 - ls) * (lse - tgt) + ls * (lse - lg.mean(-1))
-        # PAD 位置的 logits 可为 NaN(全掩码行),而 NaN×0 仍是 NaN
-        # → 必须先 where 归零再求和,不能靠 valid 乘法屏蔽
-        ce = jnp.where(valid > 0, ce, 0.0)
-        num = (ce * wt).sum()
-        den = jnp.clip((wt * valid).sum(), 1.0)
-        return num / den
+        ce = jnp.where(valid > 0, ce, 0.0)      # PAD 行 NaN×0 防护
+        return (ce * wt).sum() / jnp.clip((wt * valid).sum(), 1.0)
 
-    @__import__("functools").partial(jax.jit, donate_argnums=(0, 1))
-    def train_step(lora, opt_state, base_p, tokens, labels, weights, pvi):
+    def grad_local(train, base_p, tokens, labels, weights, patches, pos_xy):
         loss, grads = jax.value_and_grad(loss_fn)(
-            lora, base_p, tokens, labels, weights, pvi)
-        updates, opt_state = optim.update(grads, opt_state, lora)
-        lora = optax.apply_updates(lora, updates)
-        return lora, opt_state, loss
+            train, base_p, tokens, labels, weights, patches, pos_xy)
+        return (jax.lax.pmean(loss, "dp"),
+                jax.tree.map(lambda g: jax.lax.pmean(g, "dp"), grads))
 
-    lora = lora0
+    grad_sharded = shard_map(
+        grad_local, mesh=mesh,
+        in_specs=(P(), P(), P("dp"), P("dp"), P("dp"), P("dp"), P("dp")),
+        out_specs=(P(), P()), check_rep=False)
+
+    @functools.partial(jax.jit, donate_argnums=(0, 1))
+    def train_step(train, opt_state, base_p, tokens, labels, weights,
+                   patches, pos_xy):
+        loss, grads = grad_sharded(train, base_p, tokens, labels, weights,
+                                   patches, pos_xy)
+        updates, opt_state = optim.update(grads, opt_state, train)
+        train = optax.apply_updates(train, updates)
+        return train, opt_state, loss
+
+    eval_local = shard_map(
+        lambda tr, bp, t, l, w, p, x: jax.lax.pmean(
+            loss_fn(tr, bp, t, l, w, p, x), "dp"),
+        mesh=mesh,
+        in_specs=(P(), P(), P("dp"), P("dp"), P("dp"), P("dp"), P("dp")),
+        out_specs=P(), check_rep=False)
+    eval_loss_j = jax.jit(eval_local)
+
+    def collect(idxs):
+        exs = [full[i] for i in idxs]
+        pt, px = [], []
+        for e in exs:
+            pp, xx, _ = make_vision_input([e["frames"]])
+            pt.append(pp[0]); px.append(xx[0])
+        return (jnp.asarray(np.stack([e["tokens"] for e in exs])),
+                jnp.asarray(np.stack([e["labels"] for e in exs])),
+                jnp.asarray(np.stack([e["weights"] for e in exs])),
+                jnp.asarray(np.stack(pt)), jnp.asarray(np.stack(px)))
+
+    train = train0
     os.makedirs(a.out, exist_ok=True)
-    hist = []
+    hist, best = [], (1e9, -1)
+    cursor = 0
     t0 = time.time()
-    for step in range(a.steps * a.accum):        # steps = 优化器步
-        exi = ds[step % len(ds)]
-        patches, pos_xy, counts = make_vision_input([exi["frames"]])
-        pvi = PreprocessedVisionInput(
-            patches=jnp.asarray(patches), positions_xy=jnp.asarray(pos_xy),
-            soft_token_counts=counts)
-        lora, opt_state, loss = train_step(
-            lora, opt_state, base,
-            jnp.asarray(exi["tokens"][None]),
-            jnp.asarray(exi["labels"][None]),
-            jnp.asarray(exi["weights"][None]), pvi)
-        if step == 0:
-            print(f"[compile+step0] {time.time()-t0:.0f}s")
+    for micro in range(a.steps * a.accum):
+        idxs = [train_idx[(cursor + j) % len(train_idx)] for j in range(DP)]
+        cursor += DP
+        batch = collect(idxs)
+        train, opt_state, loss = train_step(train, opt_state, base, *batch)
+        if micro == 0:
+            print(f"[compile+step0] {time.time()-t0:.0f}s", flush=True)
             t0 = time.time()
-        if (step + 1) % a.accum == 0:
+        if (micro + 1) % a.accum == 0:
+            opt_step = (micro + 1) // a.accum
             l = float(loss)
             hist.append(l)
-            opt_step = (step + 1) // a.accum
-            dt = (time.time() - t0) / max(opt_step * a.accum - 1, 1)
+            n_micro = max(opt_step * a.accum - 1, 1)
+            dt = (time.time() - t0) / n_micro
             print(f"[sft] opt_step {opt_step}/{a.steps} loss={l:.4f} "
-                  f"micro_s/it={dt:.2f}", flush=True)
+                  f"micro_s/it={dt:.2f} samples/s={DP/dt:.2f}", flush=True)
+            if a.eval_every and opt_step % a.eval_every == 0:
+                vl = []
+                for k in range(0, len(val_idx) - DP + 1, DP):
+                    vb = collect(val_idx[k:k + DP])
+                    vl.append(float(eval_loss_j(train, base, *vb)))
+                v = sum(vl) / max(len(vl), 1)
+                tag = ""
+                if v < best[0]:
+                    best = (v, opt_step); tag = " *best"
+                print(f"[eval] opt_step {opt_step} val_loss={v:.4f}{tag}",
+                      flush=True)
+
     try:
         ms = jax.local_devices()[0].memory_stats()
-        print(f"[hbm] peak={ms.get('peak_bytes_in_use', 0)/2**30:.2f}G "
+        print(f"[hbm] dev0 peak={ms.get('peak_bytes_in_use', 0)/2**30:.2f}G "
               f"limit={ms.get('bytes_limit', 0)/2**30:.2f}G")
     except Exception:  # noqa: BLE001
         pass
-
-    flat = jax.tree_util.tree_flatten_with_path(lora)[0]
-    np.savez(os.path.join(a.out, "lora_params.npz"),
-             **{"/".join(getattr(k, "key", str(k)) for k in p):
-                np.asarray(v) for p, v in flat})
-    json.dump({"loss_history": hist, "rank": a.rank},
+    flat = jax.tree_util.tree_flatten_with_path(train)[0]
+    np.savez(os.path.join(a.out, "train_params.npz"),
+             **{_path_str(p): np.asarray(v) for p, v in flat})
+    json.dump({"loss_history": hist, "rank": a.rank, "dp": DP,
+               "best_val": list(best)},
               open(os.path.join(a.out, "train_meta.json"), "w"))
-    print(f"[save] {a.out} (loss {hist[0]:.3f} -> {hist[-1]:.3f})")
+    print(f"[save] {a.out} (loss {hist[0]:.3f} -> {hist[-1]:.3f}, "
+          f"best_val={best[0]:.4f}@{best[1]})")
 
 
 if __name__ == "__main__":

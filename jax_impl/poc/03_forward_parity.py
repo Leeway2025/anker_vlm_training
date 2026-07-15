@@ -17,14 +17,27 @@ TOPK = 5
 
 def run_hf(out):
     import torch
-    from transformers import AutoModelForCausalLM, AutoProcessor
+    from transformers import AutoProcessor
     import yaml
     cfg = yaml.safe_load(open("configs/base.yaml", encoding="utf-8"))
     name = cfg["model"]["name_or_path"]
     proc = AutoProcessor.from_pretrained(name)
-    model = AutoModelForCausalLM.from_pretrained(
-        name, torch_dtype=torch.float32)          # 对拍用 fp32,排除精度噪声
-    ids = proc.tokenizer(PROMPT, return_tensors="pt")
+    # gemma-4-e2b-it 是多模态 checkpoint,按条件生成类加载(与训练代码同路)
+    model = None
+    for cls_name in ("AutoModelForImageTextToText", "AutoModelForCausalLM"):
+        try:
+            import transformers
+            model = getattr(transformers, cls_name).from_pretrained(
+                name, torch_dtype=torch.float32)   # 对拍用 fp32,排除精度噪声
+            print(f"[hf] loaded via {cls_name}")
+            break
+        except Exception as e:  # noqa: BLE001
+            print(f"[hf] {cls_name} 失败: {str(e)[:100]}")
+    raw = proc.tokenizer(PROMPT, add_special_tokens=False)["input_ids"]
+    bos = proc.tokenizer.bos_token_id or 2
+    ids_list = [bos] + raw                     # 双侧统一: 显式 BOS 开头
+    ids = {"input_ids": torch.tensor([ids_list]),
+           "attention_mask": torch.ones(1, len(ids_list), dtype=torch.long)}
     with torch.no_grad():
         logits = model(**ids).logits[0, -1]
     lp = torch.log_softmax(logits, -1)
@@ -47,9 +60,11 @@ def run_jax(ref_path):
     params = gm.ckpts.load_params(gm.ckpts.CheckpointPath.GEMMA4_E2B_IT)
     tok_cls = getattr(gm.text, "Gemma4Tokenizer", None) or gm.text.Gemma3Tokenizer
     tok = tok_cls()
-    ids = tok.encode(ref["prompt"], add_bos=True)
-    print(f"[check] token ids  HF={ref['ids']}  JAX={ids}"
-          f"  {'一致' if list(ids) == ref['ids'] else '⚠️ 不一致(先解决再看数值)'}")
+    # 直接使用 HF 侧 ids,保证输入逐位一致;JAX 自编码仅作参考打印
+    ids = [int(x) for x in ref["ids"]]
+    own = [int(x) for x in tok.encode(ref["prompt"], add_bos=True)]
+    print(f"[check] 输入取 HF ids={ids};JAX 自编码={own}"
+          f"({'一致' if own == ids else '不同,忽略,以 HF 为准'})")
     out = model.apply({"params": params}, tokens=jnp.asarray([ids]),
                       return_last_only=True)
     logits = out.logits[0] if hasattr(out, "logits") else out[0]

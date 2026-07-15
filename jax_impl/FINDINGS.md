@@ -37,7 +37,36 @@ Gate B 设计疑问已关闭(源码实证):
 - 剩余为机械工作:拼装 + 位置逐位 diff(并入 Gate C 前向对拍验证
   position/双向注意力语义)。
 
-## Gate C/D: 未开始(等 B 关闭)
+## Gate C: PASS ✅✅(纯文本 + 多模态,v6e 机器实测)
+
+- 纯文本:同输入(显式 BOS 对齐)top-5 id 完全一致,logprob 差 <0.07
+- **多模态(决定性)**:16 帧随机像素 + 生产 prompt,**top-5 id 完全一致
+  且同序**,top-1 lp 差 0.0000,深尾差 <0.11 —— 像素依赖全链路
+  (归一化/patchify/ViT/3×3 池化/mask 合并/位置)HF 与 JAX 数值等价
+
+多模态拼装配方(最终版,03b_mm_parity.py 可跑通):
+1. `gm.nn.Gemma4_E2B(text_only=False, config=<覆盖>)` —— 默认剥视觉塔
+2. config 覆盖 `VisionEncoder(use_clipped_linears=True, output_length=64)`
+   —— 默认 280 是图像语义,视频帧是 64
+3. `preprocess_and_patchify(frames, max_soft_tokens=64)` —— 预算是
+   "每图",默认 1120 会把 384² 放大到 1089 token
+4. patches/positions 拼成 `[1, n_images*576, ·]`(模型内部按
+   soft_token_counts 拆回)
+5. tokens = HF input_ids,把 mm_token_type==2 的 1024 个位置换成哨兵 -2
+
+## Gate D: API 面确认,映射表工程未做 🟡
+
+- `gm.nn.LoRA(rank=…)` 整模包装器 + `gm.peft.LoRADense/Einsum/DenseGeneral`
+  + `gm.ckpts.SkipLoRA`(加载底座跳过 LoRA)—— 注入机制齐全
+- 剩余:JAX LoRA 参数树 → HF peft safetensors 名称映射 + 数值回读验证
+  (04_lora_export.py 骨架已备,纯工程,无未知风险)
+
+## 迁移决策摘要(截至 2026-07-15)
+
+3/4 门槛实测通过,**零 NO-GO 信号**。剩余工作量(全部为已知工程):
+Gate D 映射表(~1-2 天)→ 训练循环移植(加权 CE/LoRA 分层 rank/
+lax.scan 累积/selective remat,~1-2 周)→ 与 torch 路线指标对拍。
+预期收益:步速 1.3~1.8×(epoch 7~10h → 4~6h)+ 摆脱惰性执行 bug 类。
 
 ## 对照信息
 

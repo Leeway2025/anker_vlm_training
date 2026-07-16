@@ -210,12 +210,20 @@ python jax_impl/train_sft.py <公共参数> \
 3. 续训完导出用**默认** `export_hf.py`(不带 --scheme prod);
    rank=1024 的 adapter 是否超 RKLLM 的 LoRA 内存预算需确认。
 
-### §B. torch stage a 的 projector.pt
+### §B. torch stage a 的 projector.pt(转换器已提供 ✅)
 
-转换器暂缺(排期中)。projector 仅 1.2M 参数、S1 重跑分钟级,
-**建议直接 JAX 重跑 stage a**;或者保持 torch 跑完 a+b 后按 §A 衔接。
-反方向同理:JAX 训过 projector 又要回 torch 时,过渡期先冻结
-projector(S2 去掉 `--train-projector`),沿用 torch stage a 的成果。
+```bash
+# torch stage a 成果 → JAX(喂给 5b 的 --init-npz):
+<torch_venv>/bin/python jax_impl/convert_projector.py \
+  --torch-pt outputs/phase5_sft_a/final/projector.pt --out outputs/proj_a.npz
+# 5b 命令加: --init-npz outputs/proj_a.npz(--train-projector 保持开)
+
+# 反方向 JAX → torch(交回 torch/RKLLM 生态):
+<torch_venv>/bin/python jax_impl/convert_projector.py \
+  --npz outputs/jax_5b/train_params.npz --out projector.pt
+```
+方向经 base 权重逐位证明(w_jax = W_torchᵀ,bf16 舍入级),
+每次转换内置回环自检;需在 torch venv 运行(读写 .pt)。
 
 ### §C. 混合管线(迁移风险最小的推荐形态)
 

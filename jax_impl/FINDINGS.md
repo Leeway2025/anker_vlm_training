@@ -252,3 +252,17 @@ v3 关键经验:
   gemma@09e7b48,构建期自检导入),镜像 5.19GB,推送
   europe-west4-docker.pkg.dev/leeway-main/anker/jax:{v1,<git sha>}
   (AR 同区,团队授 artifactregistry.reader 即可 pull)。
+
+
+## P0c: projector 双向转换器(2026-07-16)
+
+- convert_projector.py: torch projector.pt ↔ JAX npz。方向用 base 权重
+  逐位证明: JAX mm_input_projection/w (768,1536) = HF
+  embed_vision.embedding_projection.weight (1536,768) 的转置
+  (maxdiff 0.0014 = bf16 舍入)。
+- 验证: R1 真实产物 torch→jax→torch 回环 maxdiff=0.0、键名一致;
+  prod 训练产物 J2T 正确;纯 LoRA npz 正确拒绝。
+- 踩坑: 泛匹配 "mm_input_projection" 会误抓 embedder 的 LoRA 键
+  (lora/embedder/.../lora/a)→ 必须锁 proj/ 子树 + 形状断言。
+- 至此 torch stage a/b 成果均可完整接入 JAX(§A adapter + §B projector),
+  跨框架互操作缺口仅剩视觉塔 LoRA 的导出映射(JAX 训视觉→回 torch)。

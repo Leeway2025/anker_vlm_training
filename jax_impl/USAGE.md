@@ -2,8 +2,9 @@
 
 面向已在用 torch 路线的用户。JAX 路线与 torch 路线**互操作**(adapter 在
 HF peft 格式层双向互换),可整体迁移,也可只把最耗时的主训搬过来。
-实测吞吐:v6e 8 芯 100k 样本 **≈1.9h/epoch**(torch 现状 6~8h);
-编译 ~2 分钟(torch_xla 15~30 分钟)。
+实测吞吐(v6e,prod 超参+视觉全训,含数据预取):**9.7 样本/s@4 芯**,
+8 芯外推 **100k≈1.4h / 45 万≈6.5h / 100 万≈14.3h**(torch 实测口径
+100 万≈27.5h);编译 ~2 分钟(torch_xla 15~30 分钟)。
 
 阶段顺序与 torch 版 `training/pipeline.py` 一致,逐阶段手动执行、
 每阶段跑完看验收标准再决定 继续/重跑/跳过:
@@ -216,6 +217,7 @@ JAX(1.9h/epoch): S1→S2(→S3 续训段)   torch(已全流程验证):
 |---|---|
 | gemma 库版本 | 已 pin `09e7b48`(jax_impl 对库内部有补丁);**勿擅自升级**,升级须重跑 `poc/` 验证电池 |
 | batch | 每芯 bs=1 已打满 v6e(实测 bs2 无增益),`--per-device-bs` 保持默认 |
+| 数据预取 | **默认开启**(`--prefetch-workers 8`,并行解码+双缓冲,+30% 吞吐,loss 轨迹与同步版逐位一致);排查数据问题时用 `--prefetch-workers 0` 退回同步路径 |
 | HBM | prod+视觉全训峰值 ~30.7/31.25G;OOM 时先去掉 `--train-vision` |
 | 首步耗时 | 编译 2~3 分钟属正常,勿当 hang |
 | 吞吐口径 | 看日志 `marginal_micro_s`;epoch ≈ marginal × 总 micro 数 |

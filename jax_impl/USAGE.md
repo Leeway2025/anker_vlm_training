@@ -202,7 +202,7 @@ projector(S2 去掉 `--train-projector`),沿用 torch stage a 的成果。
 ### §C. 混合管线(迁移风险最小的推荐形态)
 
 ```
-JAX(1.9h/epoch): S1→S2(→S3 续训段)   torch(已全流程验证):
+JAX(1M≈14.3h/epoch): S1→S2(→S3 续训段)   torch(已全流程验证):
         └── S9 导出 adapter ────────▶  infer_sharded 推理 / 评测 /
                                         build_kto_data / RKLLM 部署
 ```

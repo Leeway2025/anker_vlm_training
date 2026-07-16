@@ -31,6 +31,7 @@ S0 环境 → S1 stage a → S2 stage b → S3 hard_mining → S4 aux_heads
 docker pull europe-west4-docker.pkg.dev/leeway-main/anker/jax:v1.2   # ⚠️ v1/v1.1 缺 projector 转换器等,用最新
 # TPU VM 上运行(--privileged + /dev 使容器可见 TPU;GCS 凭据走 VM metadata):
 docker run --rm --privileged --net=host \
+  --ulimit nofile=1048576:1048576 --ulimit memlock=-1 \
   -v /dev:/dev -v $PWD:/workspace -v /path/DATA:/data -w /workspace \
   europe-west4-docker.pkg.dev/leeway-main/anker/jax:v1.2 \
   python jax_impl/train_sft.py --labels /data/labels.jsonl ...

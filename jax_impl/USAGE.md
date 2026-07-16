@@ -34,6 +34,8 @@ docker run --rm --privileged --net=host \
   europe-west4-docker.pkg.dev/leeway-main/anker/jax:v1.1 \
   python jax_impl/train_sft.py --labels /data/labels.jsonl ...
 # 镜像内已烘入代码与全 pin 依赖(jax 0.10.2 + gemma@09e7b48);
+# 镜像 tag 与 git commit 一一对应(另有同内容的 git-sha tag 供精确指认);
+# 发布新镜像一律走 jax_impl/release_image.sh(强制代码=镜像=文档同步);
 # 挂 -w /workspace 用宿主机代码,不挂则用镜像内固化版(严格对齐)
 ```
 

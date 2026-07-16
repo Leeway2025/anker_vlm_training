@@ -28,6 +28,7 @@ def main():
     ap.add_argument("--steps", type=int, default=10)
     ap.add_argument("--accum", type=int, default=2)
     ap.add_argument("--dp", type=int, default=0, help="数据并行设备数,0=全部")
+    ap.add_argument("--per-device-bs", type=int, default=1)
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--proj-lr", type=float, default=5e-4)
     ap.add_argument("--rank", type=int, default=16)
@@ -68,11 +69,16 @@ def main():
     from gemma.gm.nn.gemma4.vision import _transformer as gv_tr
     from gemma.gm.nn.gemma4._transformer import PreprocessedVisionInput
 
-    from jax_impl.data import SftDataset, make_vision_input
+    from jax_impl.data import (SftDataset, make_vision_input,
+                               install_batched_encode_vision)
 
     devs = jax.devices()
     DP = a.dp or len(devs)
-    print(f"[env] devices={len(devs)} dp={DP}")
+    BS = a.per_device_bs
+    print(f"[env] devices={len(devs)} dp={DP} per_device_bs={BS} "
+          f"global_micro={DP*BS}")
+    if BS > 1:
+        install_batched_encode_vision()
 
     # ---- 逐层重算(gm 无内置 remat;v1 坑 3/4)----
     if not getattr(g4_modules, "_REMAT_PATCHED", False):
@@ -316,10 +322,8 @@ def main():
 
     def collect(idxs):
         exs = [full[i] for i in idxs]
-        pt, px = [], []
-        for e in exs:
-            pp, xx, _ = make_vision_input([e["frames"]])
-            pt.append(pp[0]); px.append(xx[0])
+        pt_all, px_all, _ = make_vision_input([e["frames"] for e in exs])
+        pt, px = list(pt_all), list(px_all)
         return (jnp.asarray(np.stack([e["tokens"] for e in exs])),
                 jnp.asarray(np.stack([e["labels"] for e in exs])),
                 jnp.asarray(np.stack([e["weights"] for e in exs])),
@@ -338,8 +342,9 @@ def main():
         if switch_at >= 0 and micro == switch_at and not full.anneal:
             full.set_anneal(True)
             print(f"[anneal] micro {micro}: 切换纯生产模式", flush=True)
-        idxs = [train_idx[(cursor + j) % len(train_idx)] for j in range(DP)]
-        cursor += DP
+        idxs = [train_idx[(cursor + j) % len(train_idx)]
+                for j in range(DP * BS)]
+        cursor += DP * BS
         batch = collect(idxs)
         train, opt_state, loss = train_step(train, opt_state, base, *batch)
         if micro == 0:
@@ -347,16 +352,18 @@ def main():
             t0 = time.time()
         if (micro + 1) % a.accum == 0:
             opt_step = (micro + 1) // a.accum
-            l = float(loss)
+            l = float(loss)              # 强制同步 → 边际耗时是真实的
             hist.append(l)
-            n_micro = max(opt_step * a.accum - 1, 1)
-            dt = (time.time() - t0) / n_micro
+            now = time.time()
+            dt = (now - getattr(main, "_tprev", t0)) / a.accum
+            main._tprev = now
             print(f"[sft] opt_step {opt_step}/{a.steps} loss={l:.4f} "
-                  f"micro_s/it={dt:.2f} samples/s={DP/dt:.2f}", flush=True)
+                  f"marginal_micro_s={dt:.3f} "
+                  f"samples/s={DP*BS/max(dt,1e-9):.1f}", flush=True)
             if a.eval_every and opt_step % a.eval_every == 0:
                 vl = []
-                for k in range(0, len(val_idx) - DP + 1, DP):
-                    vb = collect(val_idx[k:k + DP])
+                for k in range(0, len(val_idx) - DP * BS + 1, DP * BS):
+                    vb = collect(val_idx[k:k + DP * BS])
                     vl.append(float(eval_loss_j(train, base, *vb)))
                 v = sum(vl) / max(len(vl), 1)
                 tag = ""

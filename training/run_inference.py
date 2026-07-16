@@ -4,6 +4,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def main():
+    from data.log_filter import install as _ilf
+    _ilf()   # 屏蔽 processor_kwargs/fps 刷屏
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--labels", required=True)

@@ -27,6 +27,8 @@ import sys
 import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from data.log_filter import install as _install_log_filter  # noqa: E402
+_install_log_filter()   # 屏蔽 processor_kwargs/fps 刷屏(纯噪音)
 from data.build_dataset import (AnkerVideoDataset, AnkerCollator,   # noqa: E402
                                 load_jsonl, split_by_camera)
 from training.common import (load_model_and_processor, freeze_base,  # noqa: E402

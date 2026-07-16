@@ -125,11 +125,47 @@ class SftDataset:
 
 
 def make_vision_input(frames_list):
-    """B 个样本(各 16 帧)→ 模型入参。v1 限 bs=1(见 FINDINGS)。"""
+    """B 个样本(各 16 帧)→ 模型入参 [B, n*p, ·]。
+    B>1 需先 install_batched_encode_vision()(poc/05 等价测试 PASS)。"""
     from gemma.gm.nn.gemma4.vision._preprocessing import preprocess_and_patchify
-    assert len(frames_list) == 1, "v1 每设备 bs=1;多样本拼接语义待确认"
-    patches, pos, counts = preprocess_and_patchify(
-        frames_list[0], max_soft_tokens=64)
-    n, p, d = patches.shape
-    return (patches.reshape(1, n * p, d), pos.reshape(1, n * p, 2),
-            tuple(int(c) for c in counts))
+    pas, poss, counts0 = [], [], None
+    for frames in frames_list:
+        patches, pos, counts = preprocess_and_patchify(
+            frames, max_soft_tokens=64)
+        n, p, d = patches.shape
+        pas.append(patches.reshape(n * p, d))
+        poss.append(pos.reshape(n * p, 2))
+        counts = tuple(int(c) for c in counts)
+        assert counts0 in (None, counts), "batch 内 counts 必须一致"
+        counts0 = counts
+    return (np.stack(pas), np.stack(poss), counts0)
+
+
+def install_batched_encode_vision():
+    """gm 官方 _encode_vision 写死 B=1(reshape 忽略 batch 维);merge 侧
+    vmap 天然支持 [B,T,D]。此补丁 B=1 走原路径,B>1 批量展开编码后折回。
+    语义经 poc/05 等价测试钉死: batch=2 ≡ 2×bs1,max|Δ|<1e-4。"""
+    import jax.numpy as jnp
+    from gemma.gm.nn.gemma4 import _transformer as g4_tr
+    if getattr(g4_tr, "_BATCH_EV_PATCHED", False):
+        return
+    _orig = g4_tr.Transformer._encode_vision
+
+    def _batched(self, vision_input):
+        patches = vision_input.patches
+        B = patches.shape[0]
+        if B == 1:
+            return _orig(self, vision_input)
+        counts = vision_input.soft_token_counts
+        n, cnt = len(counts), counts[0]
+        assert all(c == cnt for c in counts), "非均匀 counts 需回退 bs=1"
+        p, d = patches.shape[1] // n, patches.shape[2]
+        pa = jnp.reshape(patches, (B * n, p, d))
+        px = jnp.reshape(vision_input.positions_xy, (B * n, p, 2))
+        emb, _mask = self.vision_encoder(pa, px)[0]
+        toks = emb[:, :cnt, :]                # 均匀正方形帧无 pad → 前 cnt 即真
+        toks = jnp.reshape(toks, (B, n * cnt, toks.shape[-1]))
+        return self.embedder.encode_vision(toks[:, None])[:, 0]
+
+    g4_tr.Transformer._encode_vision = _batched
+    g4_tr._BATCH_EV_PATCHED = True

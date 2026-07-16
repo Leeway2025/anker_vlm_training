@@ -160,3 +160,31 @@ v3 关键经验:
 **至此 torch 管线的全部阶段(a/b/hm/aux/cot/kto/swa/推理/导入导出)
 均有 JAX 实现且通过机制验证;与 torch 的互操作双向打通
 (export_hf 出 / import_hf 进),支持跨框架续训与混合管线。**
+
+
+## v4: 每芯 bs>1 解锁 + 干净吞吐基准(2026-07-16)
+
+- 官方源码结论: merge 侧 vmap 原生支持 batch;`_encode_vision` 写死
+  B=1 → 打 batch 化补丁(data.install_batched_encode_vision),
+  poc/05 等价测试 PASS(batch=2 ≡ 2×bs1,max|Δ|=9e-5)。
+- **干净基准(边际计时,排除编译污染)**:
+  | 配置(dp4,视觉+projector 全训) | micro 边际 | 吞吐 |
+  |---|---|---|
+  | bs1×4 芯 | 0.54s/4 样本 | **7.4 样本/s** |
+  | bs2×4 芯 | 1.12s/8 样本 | 7.15 样本/s |
+  | bs4×4 芯 | HBM 差 4.4G(35.6>31.25)| 需尾窗解码解锁,已不急 |
+- **重要修正: 此前 1.9~2.1s/样本的口径是累计均值被编译污染的高估**;
+  真实稳态 0.54s/样本/芯。**JAX 在 bs1 已把 v6e 打满,加大 batch 无增益**
+  (与 torch 截然不同——torch bs1 饿死 MXU 才需要 bs4)。
+- **epoch 推算(100k 样本)**: 4 芯 3.75h;8 芯 ≈ **1.9h**——
+  相对 torch 现状(6~8h)约 3~4×,且无需再做 bs4/尾窗解码。
+- 剩余吞吐杠杆重排: 选择性 remat(nothing_saveable→dots 类,+15~25%)
+  与数据预取为辅;bs4/尾窗解码降级为显存优化项。
+
+## torch 侧现场支持(同日)
+
+- data/log_filter.py: 精确屏蔽 processor_kwargs 与 fps=24 两类刷屏
+  (客户实测 50MB 日志几乎全是它),train/run_inference 入口已接;
+- scripts/infer_sharded.sh: 多芯并行推理——客户现场单进程推理只有
+  一张芯在算(10 万集 10+ 小时),按 TPU_VISIBLE_CHIPS 每芯一进程
+  × --shard i/n 分片 → 8 芯 ≈ 8×(约 2.5h),分片可独立断点续跑。

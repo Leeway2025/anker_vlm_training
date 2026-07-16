@@ -29,6 +29,8 @@ def main():
     ap.add_argument("--accum", type=int, default=2)
     ap.add_argument("--dp", type=int, default=0, help="数据并行设备数,0=全部")
     ap.add_argument("--per-device-bs", type=int, default=1)
+    ap.add_argument("--prefetch-workers", type=int, default=8,
+                    help="0=关闭预取(同步取数,调试用)")
     ap.add_argument("--rank-scheme", choices=["uniform", "prod"],
                     default="uniform",
                     help="prod=生产方案: 差异化 rank 512/256 + rsLoRA α=2r")
@@ -344,14 +346,28 @@ def main():
     t0 = time.time()
     total_micro = a.steps * a.accum
     switch_at = int(total_micro * (1 - a.cot_anneal)) if a.cot_file else -1
+    pf = None
+    if a.prefetch_workers > 0:
+        from jax_impl.prefetch import BatchPrefetcher
+        pf = BatchPrefetcher(full,
+                             lambda k: train_idx[k % len(train_idx)],
+                             DP * BS, workers=a.prefetch_workers)
+        print(f"[prefetch] workers={a.prefetch_workers} depth=2")
     for micro in range(total_micro):
         if switch_at >= 0 and micro == switch_at and not full.anneal:
             full.set_anneal(True)
+            if pf:                      # 清掉队列里旧模式 batch,边界零滞后
+                pf.flush(restart_at=micro * DP * BS)
             print(f"[anneal] micro {micro}: 切换纯生产模式", flush=True)
-        idxs = [train_idx[(cursor + j) % len(train_idx)]
-                for j in range(DP * BS)]
-        cursor += DP * BS
-        batch = collect(idxs)
+        if pf:
+            t_, l_, w_, p_, x_, al_, kl_, _ = pf.next()
+            batch = tuple(jnp.asarray(v)
+                          for v in (t_, l_, w_, p_, x_, al_, kl_))
+        else:
+            idxs = [train_idx[(cursor + j) % len(train_idx)]
+                    for j in range(DP * BS)]
+            cursor += DP * BS
+            batch = collect(idxs)
         train, opt_state, loss = train_step(train, opt_state, base, *batch)
         if micro == 0:
             print(f"[compile+step0] {time.time()-t0:.0f}s", flush=True)
@@ -384,6 +400,8 @@ def main():
               f"limit={ms.get('bytes_limit', 0)/2**30:.2f}G")
     except Exception:  # noqa: BLE001
         pass
+    if pf:
+        pf.close()
     flat = jax.tree_util.tree_flatten_with_path(train)[0]
     np.savez(os.path.join(a.out, "train_params.npz"),
              **{_path_str(p): np.asarray(v) for p, v in flat})

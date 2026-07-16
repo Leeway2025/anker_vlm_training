@@ -29,6 +29,9 @@ def main():
     ap.add_argument("--accum", type=int, default=2)
     ap.add_argument("--dp", type=int, default=0, help="数据并行设备数,0=全部")
     ap.add_argument("--per-device-bs", type=int, default=1)
+    ap.add_argument("--rank-scheme", choices=["uniform", "prod"],
+                    default="uniform",
+                    help="prod=生产方案: 差异化 rank 512/256 + rsLoRA α=2r")
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--proj-lr", type=float, default=5e-4)
     ap.add_argument("--rank", type=int, default=16)
@@ -79,6 +82,9 @@ def main():
           f"global_micro={DP*BS}")
     if BS > 1:
         install_batched_encode_vision()
+    if a.rank_scheme == "prod":
+        from jax_impl.prod_lora import install_prod_lora
+        install_prod_lora()      # 必须在模型构造前(patch 参数创建路径)
 
     # ---- 逐层重算(gm 无内置 remat;v1 坑 3/4)----
     if not getattr(g4_modules, "_REMAT_PATCHED", False):

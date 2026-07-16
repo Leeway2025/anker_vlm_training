@@ -16,6 +16,9 @@
 import argparse
 import json
 import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 PROMPT_IDS = [2, 818, 5279, 529, 7001, 563]
 TOPK = 5
@@ -90,12 +93,27 @@ def write_adapter(sd, rank, out_dir):
     print(f"[export] {len(sd)} tensors -> {out_dir}")
 
 
-def run_export(npz_path, out_dir):
+def run_export(npz_path, out_dir, scheme="uniform"):
     import numpy as np
     z = np.load(npz_path)
     flat = {k.removeprefix("lora/"): z[k] for k in z.files
             if "/lora/" in k or k.startswith("lora/")}
     sd = map_llm_loras(flat)
+    if scheme == "prod":
+        # prod 前向已带 peft 同款缩放 → 张量原样导出,配置声明
+        # rank/alpha_pattern + rsLoRA(与 torch 生产 adapter 同款)
+        from jax_impl.prod_lora import prod_adapter_config
+        import json as _json
+        os.makedirs(out_dir, exist_ok=True)
+        from safetensors.numpy import save_file
+        save_file(sd, os.path.join(out_dir, "adapter_model.safetensors"))
+        _json.dump(prod_adapter_config(),
+                   open(os.path.join(out_dir, "adapter_config.json"), "w"))
+        print(f"[export/prod] {len(sd)} tensors -> {out_dir}")
+        proj = {k: z[k] for k in z.files if "mm_input_projection" in k}
+        if proj:
+            np.savez(os.path.join(out_dir, "projector_params.npz"), **proj)
+        return
     rank = next(v.shape[0] for k, v in sd.items() if k.endswith("lora_A.weight"))
     write_adapter(sd, rank, out_dir)
     proj = {k: z[k] for k in z.files if "mm_input_projection" in k}
@@ -105,7 +123,7 @@ def run_export(npz_path, out_dir):
               f"(HF 侧加载映射见 FINDINGS TODO)")
 
 
-def run_selftest_jax(out_dir, rank=8):
+def run_selftest_jax(out_dir, rank=8, scheme="uniform"):
     os.environ.setdefault("JAX_PLATFORMS", "cpu")
     import numpy as np
     import jax
@@ -113,6 +131,10 @@ def run_selftest_jax(out_dir, rank=8):
     from gemma import gm
     from gemma import peft as gpeft
 
+    if scheme == "prod":
+        from jax_impl.prod_lora import install_prod_lora
+        install_prod_lora()
+        rank = 256                     # 占位;真实 rank 由 prod patch 按层定
     model = gm.nn.LoRA(rank=rank, model=gm.nn.Gemma4_E2B())
     struct = jax.eval_shape(lambda: model.init(
         jax.random.PRNGKey(0), tokens=jnp.zeros((1, 8), jnp.int32)))
@@ -120,12 +142,15 @@ def run_selftest_jax(out_dir, rank=8):
     rng = np.random.RandomState(7)
 
     only = os.environ.get("ONLY", "")     # 逐模块消融: kv/o/gating/linear…
+    # prod 方案前向自带 32~45× 缩放,行为对拍的扰动须等比缩小,
+    # 否则模型被推进近平局混沌区,实现级噪声即可重排 top-5(踩坑 ×3)
+    std = 0.0003 if scheme == "prod" else 0.02   # ΔW≪权重,保持线性区
     def fill(path, leaf):
         p = "/".join(getattr(k, "key", str(k)) for k in path)
         llm = p.startswith("layer_") or "/layer_" in p
         if only and only not in p:
             llm = False
-        return jnp.asarray(rng.normal(0, 0.02, leaf.shape), jnp.float32) \
+        return jnp.asarray(rng.normal(0, std, leaf.shape), jnp.float32) \
             if llm else jnp.zeros(leaf.shape, jnp.float32)
     lora_vals = jax.tree_util.tree_map_with_path(fill, lora_struct)
 
@@ -146,7 +171,55 @@ def run_selftest_jax(out_dir, rank=8):
     flat = {"/".join(getattr(k, "key", str(k)) for k in p): np.asarray(v)
             for p, v in jax.tree_util.tree_flatten_with_path(lora_vals)[0]}
     sd = map_llm_loras(flat)
-    write_adapter(sd, rank, out_dir)
+    if scheme == "prod":
+        from jax_impl.prod_lora import prod_adapter_config, E2B_GLOBAL_LAYERS
+        from safetensors.numpy import save_file
+        os.makedirs(out_dir, exist_ok=True)
+        save_file(sd, os.path.join(out_dir, "adapter_model.safetensors"))
+        json.dump(prod_adapter_config(),
+                  open(os.path.join(out_dir, "adapter_config.json"), "w"))
+        print(f"[export/prod] {len(sd)} tensors -> {out_dir}")
+        # ---- 跨侧矩阵级对拍(确定性,免疫混沌):
+        #      JAX 原始 a/b 按 JAX 前向公式 vs 导出 A/B 按 peft 公式 ----
+        import math
+        pre = "base_model.model.model.language_model.layers"
+        rng2 = np.random.RandomState(9)
+        worst = 0.0
+        for i in (0, 4):                      # 滑动层 + 全局层
+            r = 512 if i in E2B_GLOBAL_LAYERS else 256
+            s_j = (2 * r) / math.sqrt(r)      # JAX 前向缩放(prod patch)
+            x = rng2.normal(0, 1, 1536).astype(np.float32)
+            # q: jax einsum '...F,Fr,rNH'
+            a = np.asarray(flat[f"layer_{i}/attn/q_einsum/_LoRAEinsum_0/lora/a"])
+            b = np.asarray(flat[f"layer_{i}/attn/q_einsum/_LoRAEinsum_0/lora/b"])
+            yj = s_j * ((x @ a) @ b.reshape(b.shape[0], -1))
+            A = sd[f"{pre}.{i}.self_attn.q_proj.lora_A.weight"]
+            B = sd[f"{pre}.{i}.self_attn.q_proj.lora_B.weight"]
+            yh = s_j * (B @ (A @ x))          # peft 同层同公式(config 已核)
+            worst = max(worst, float(np.abs(yj - yh).max()
+                                     / max(np.abs(yj).max(), 1e-9)))
+            # kv → k
+            a = np.asarray(flat[f"layer_{i}/attn/kv_einsum/_LoRAEinsum_0/lora/a"])
+            b = np.asarray(flat[f"layer_{i}/attn/kv_einsum/_LoRAEinsum_0/lora/b"])
+            yj = s_j * np.einsum("r,rkh->kh", x @ a, b[:, 0])[0]
+            A = sd[f"{pre}.{i}.self_attn.k_proj.lora_A.weight"]
+            B = sd[f"{pre}.{i}.self_attn.k_proj.lora_B.weight"]
+            yh = s_j * (B @ (A @ x))
+            worst = max(worst, float(np.abs(yj - yh).max()
+                                     / max(np.abs(yj).max(), 1e-9)))
+            # gating → gate
+            a = np.asarray(flat[f"layer_{i}/mlp/_LoRAEinsum_gating_einsum/lora/a"])
+            b = np.asarray(flat[f"layer_{i}/mlp/_LoRAEinsum_gating_einsum/lora/b"])
+            yj = s_j * np.einsum("r,rh->h", x @ a, b[:, 0])
+            A = sd[f"{pre}.{i}.mlp.gate_proj.lora_A.weight"]
+            B = sd[f"{pre}.{i}.mlp.gate_proj.lora_B.weight"]
+            yh = s_j * (B @ (A @ x))
+            worst = max(worst, float(np.abs(yj - yh).max()
+                                     / max(np.abs(yj).max(), 1e-9)))
+        print(f"[matrix-check] 跨侧相对误差 worst={worst:.2e} "
+              f"{'PASS' if worst < 1e-5 else 'NO-GO'}")
+    else:
+        write_adapter(sd, rank, out_dir)
     json.dump(res, open(os.path.join(out_dir, "jax_result.json"), "w"))
 
 
@@ -178,8 +251,12 @@ if __name__ == "__main__":
     ap.add_argument("--out", required=True)
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--side", choices=["jax", "hf"], default="jax")
+    ap.add_argument("--scheme", choices=["uniform", "prod"], default="uniform")
     a = ap.parse_args()
     if a.selftest:
-        run_selftest_jax(a.out) if a.side == "jax" else run_selftest_hf(a.out)
+        if a.side == "jax":
+            run_selftest_jax(a.out, scheme=a.scheme)
+        else:
+            run_selftest_hf(a.out)
     else:
-        run_export(a.npz, a.out)
+        run_export(a.npz, a.out, scheme=a.scheme)

@@ -188,3 +188,29 @@ v3 关键经验:
 - scripts/infer_sharded.sh: 多芯并行推理——客户现场单进程推理只有
   一张芯在算(10 万集 10+ 小时),按 TPU_VISIBLE_CHIPS 每芯一进程
   × --shard i/n 分片 → 8 芯 ≈ 8×(约 2.5h),分片可独立断点续跑。
+
+
+## v5: 生产超参对齐 + eval 指标 + 健壮性(2026-07-16)
+
+- **prod LoRA 方案落地**(prod_lora.py,`--rank-scheme prod`):
+  差异化 rank(全局层 4/9/14/19/24/29/34 → 512,其余 256,视觉 256)
+  + rsLoRA(α=2r → scale 32/45.25),按 scope.path 注入 gm 的
+  LoRAEinsum/LoRADense Adapter。真机 4 步验证: rank 落位正确、
+  loss 下降、HBM 30.72/31.25G(**很满** —— 长跑若 OOM,首选把
+  lora 的 adam 状态降 bf16 或收 r_vision)。
+- **prod 导出链对拍 PASS**: export --scheme prod 产出与 torch 生产
+  adapter 同款配置(rank_pattern/alpha_pattern/use_rslora);
+  线性区扰动下 HF/JAX top-5 完全同序。
+- **对拍方法论最终版(三次踩坑换来的)**:
+  1) 行为对拍必须在线性区: 扰动幅度按前向缩放反除
+     (ΔW ≪ 权重,否则近平局混沌重排 top-5 出假 NO-GO);
+  2) 金标准是跨侧矩阵级对照(JAX 张量按 JAX 公式 vs 导出张量按
+     peft 公式,纯 numpy);已内嵌 selftest;
+  3) 观察到"两侧不对称漂移"才是真 bug 信号(一侧≈base 一侧大偏)。
+- eval_metrics.py: RT/SubKS/双对/KS 父类 acc + 安全关键召回 +
+  格式合规率(客户口径,零 torch 依赖),假 preds 验证通过。
+- 健壮性: gemma pin @09e7b48(setup_jax_env.sh,升级须重跑验证电池);
+  测试资产已备份 gs://leeway-main-ml-tmp/jax_assets_20260716.tgz
+  (注: 4 卡机 VM scope 只读,备份走本地跳板上传)。
+- 约定重申: torch ckpt 续训走 import_hf 的 legacy 容器方案;
+  JAX 原生训练/导出走 prod 方案;二者不得混用。

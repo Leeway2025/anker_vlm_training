@@ -6,10 +6,11 @@
 与 torch 版的结构差异(简化而语义等价):
   - reference = base(冻结底座)。torch 用"初始 adapter 副本"作 ref,
     而初始 adapter B=0 ⇒ ref ≡ base,JAX 直接省掉 set_adapter 切换;
-  - 单设备 bs=1 × 梯度累积(多芯 DP 留待需要时加 shard_map,
-    分片须对齐 world 整数倍 —— torch 侧 all_reduce 死锁的教训);
-  - 错配 KL: batch 内滚动;bs=1 时用「上一样本的 completion」做错配对
-    (等价于 roll,静态形状)。
+  - 多芯数据并行(--dp,0=全部): shard_map 每设备一对样本,梯度
+    pmean;主循环固定步数,各设备程序一致 → 无 all_reduce 不齐风险
+    (torch 侧分片不齐死锁的教训);
+  - 错配 KL: batch 维滚动(与 torch roll_completions 同语义)——
+    kl 对 i = (video_i, completion_{i-1 mod DP})。
 """
 import argparse
 import dataclasses
@@ -37,6 +38,7 @@ def main():
     ap.add_argument("--w-undesirable", type=float, default=1.5)
     ap.add_argument("--rank", type=int, default=16)
     ap.add_argument("--completion-budget", type=int, default=64)
+    ap.add_argument("--dp", type=int, default=0, help="数据并行设备数,0=全部")
     ap.add_argument("--out", default="/dev/shm/out_jax_kto")
     a = ap.parse_args()
 
@@ -155,20 +157,20 @@ def main():
         k = "/".join(getattr(x, "key", str(x)) for x in path)
         return k.startswith("layer_") or "/layer_" in k
 
-    def kto_loss_fn(lora, tokens, labels, kl_tokens, kl_labels,
+    def kto_loss_fn(lora, base_p, tokens, labels, kl_tokens, kl_labels,
                     patches, pos_xy, is_des):
         # 非 LLM(视觉/embedder)lora 叶必须 stop_gradient —— zeros 仍可导,
         # 不切断则视觉塔反向 ~32G ×2 前向 = 62G OOM(电池实测)
         lora_h = jax.tree_util.tree_map_with_path(
             lambda p, x: x.astype(jnp.bfloat16) if _is_llm(p)
             else jax.lax.stop_gradient(x.astype(jnp.bfloat16)), lora)
-        pol = gpeft.merge_params(base, lora_h)
+        pol = gpeft.merge_params(base_p, lora_h)
         pvi = PreprocessedVisionInput(
             patches=patches, positions_xy=pos_xy, soft_token_counts=counts)
         lp_pol = sum_logprob_fn(pol, tokens, labels, pvi)
         kl_pol = sum_logprob_fn(pol, kl_tokens, kl_labels, pvi)
         ref = gpeft.merge_params(
-            base, jax.tree.map(jnp.zeros_like, lora_h))   # ref ≡ base
+            base_p, jax.tree.map(jnp.zeros_like, lora_h))   # ref ≡ base
         lp_ref = jax.lax.stop_gradient(
             sum_logprob_fn(ref, tokens, labels, pvi))
         kl_ref = jax.lax.stop_gradient(
@@ -183,33 +185,53 @@ def main():
         return loss.mean(), (kl, jnp.abs(logratio).mean())
 
     import functools
+    from jax.sharding import Mesh, PartitionSpec as P
+    from jax.experimental.shard_map import shard_map
+
+    devs = jax.devices()
+    DP = a.dp or len(devs)
+    mesh = Mesh(np.asarray(devs[:DP]), ("dp",))
+    print(f"[kto] dp={DP}(每设备 1 对/micro,错配 KL 为 batch 维滚动)")
+
+    def grad_local(lora, *b):
+        (loss, m), grads = jax.value_and_grad(
+            kto_loss_fn, has_aux=True)(lora, *b)
+        pm = lambda x: jax.lax.pmean(x, "dp")
+        return pm(loss), tuple(pm(x) for x in m), jax.tree.map(pm, grads)
+
+    grad_sharded = shard_map(
+        grad_local, mesh=mesh,
+        in_specs=(P(), P()) + (P("dp"),) * 7,   # base 显式复制进 Manual ctx
+        out_specs=(P(), (P(), P()), P()), check_rep=False)
 
     @functools.partial(jax.jit, donate_argnums=(0, 1))
     def step(lora, opt_state, *b):
-        (loss, m), grads = jax.value_and_grad(
-            kto_loss_fn, has_aux=True)(lora, *b)
+        loss, m, grads = grad_sharded(lora, base, *b)
         updates, opt_state = optim.update(grads, opt_state, lora)
         return optax.apply_updates(lora, updates), opt_state, loss, m
 
     lora = lora0
     os.makedirs(a.out, exist_ok=True)
-    prev = None
     t0 = time.time()
     n_micro = a.steps * a.accum
+    cursor = 0
     for micro in range(n_micro):
-        pair = pairs[micro % len(pairs)]
-        toks, labs, pt, px, is_des = build(pair)
-        if prev is None:
-            prev = (toks, labs)
-        kl_toks = np.concatenate([toks[:T], prev[0][T:]])   # 错配: 上一 completion
-        kl_labs = np.concatenate([labs[:T], prev[1][T:]])
-        prev = (toks, labs)
+        built = [build(pairs[(cursor + j) % len(pairs)]) for j in range(DP)]
+        cursor += DP
+        toks = np.stack([b[0] for b in built])       # [DP, L]
+        labs = np.stack([b[1] for b in built])
+        pt = np.stack([b[2] for b in built])
+        px = np.stack([b[3] for b in built])
+        is_des = np.asarray([b[4] for b in built], np.float32)
+        # 错配 KL: batch 维滚动 —— (video_i, completion_{i-1 mod DP})
+        roll = np.roll(np.arange(DP), 1)
+        kl_toks = np.concatenate([toks[:, :T], toks[roll][:, T:]], axis=1)
+        kl_labs = np.concatenate([labs[:, :T], labs[roll][:, T:]], axis=1)
         lora, opt_state, loss, (kl, lr_abs) = step(
             lora, opt_state,
-            jnp.asarray(toks[None]), jnp.asarray(labs[None]),
-            jnp.asarray(kl_toks[None]), jnp.asarray(kl_labs[None]),
-            jnp.asarray(pt[None]), jnp.asarray(px[None]),
-            jnp.asarray([is_des]))
+            jnp.asarray(toks), jnp.asarray(labs),
+            jnp.asarray(kl_toks), jnp.asarray(kl_labs),
+            jnp.asarray(pt), jnp.asarray(px), jnp.asarray(is_des))
         if micro == 0:
             print(f"[compile+step0] {time.time()-t0:.0f}s", flush=True)
             t0 = time.time()

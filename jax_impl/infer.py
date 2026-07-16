@@ -26,6 +26,8 @@ def main():
     ap.add_argument("--layout", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--shard", default=None,
+                    help="'i/n' 隔行分片(0 起),配 infer_sharded.sh 多芯并行")
     ap.add_argument("--max-new", type=int, default=40)
     ap.add_argument("--init-npz", help="载入训练产物 lora(缺省纯 base)")
     a = ap.parse_args()
@@ -83,11 +85,24 @@ def main():
         lg = out.logits if hasattr(out, "logits") else out
         return jnp.argmax(lg[0, pos - 1])
 
-    recs = ds.recs[: a.limit] if a.limit else ds.recs
-    fout = open(a.out, "w", encoding="utf-8")
+    recs = ds.recs
+    if a.shard:
+        i, n = (int(x) for x in a.shard.split("/"))
+        recs = recs[i::n]                    # 隔行取样,与 torch 版同语义
+    if a.limit:
+        recs = recs[: a.limit]
+    done = set()
+    if os.path.exists(a.out):                # 断点续跑: 跳过已完成
+        done = {json.loads(l)["video_id"] for l in open(a.out, encoding="utf-8")}
+        if done:
+            print(f"[resume] 跳过已完成 {len(done)} 条")
+    fout = open(a.out, "a", encoding="utf-8")
     import time
+    idx_of = {r["video_id"]: k for k, r in enumerate(ds.recs)}
     for n, rec in enumerate(recs):
-        ex = ds[n]
+        if rec["video_id"] in done:
+            continue
+        ex = ds[idx_of[rec["video_id"]]]
         patches, pos_xy, counts = make_vision_input([ex["frames"]])
         pvi = PreprocessedVisionInput(
             patches=jnp.asarray(patches), positions_xy=jnp.asarray(pos_xy),

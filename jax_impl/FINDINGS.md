@@ -232,3 +232,23 @@ v3 关键经验:
   (torch 实测口径 100 万 ≈27.5h;注: torch 客户实测 25.4s/it 好于
   此前估计,两路线差距修正为 ~1.9×)。
 - P1(尾窗解码+选择性 remat)按用户指示押后。
+
+
+## P0b + Docker(2026-07-16)
+
+- infer.py 增 --shard i/n + 断点续跑;jax_impl/infer_sharded.sh 全芯并行
+  (自动检测芯数)。**并发单芯进程隔离配方(实测)**: 仅
+  TPU_VISIBLE_CHIPS 会撞 libtpu 锁("TPU already in use"),须加
+  TPU_PROCESS_BOUNDS=1,1,1 + TPU_CHIPS_PER_PROCESS_BOUNDS=1,1,1 +
+  每进程独立 TPU_PROCESS_ADDRESSES/PORT + CLOUD_TPU_TASK_ID=0
+  —— libtpu 层配方,torch 版 scripts/infer_sharded.sh 已同步加上。
+  验证: 2 进程并发 merged=4 ✓ 续跑跳过 ✓。
+- kto.py 多芯数据并行(--dp,默认全部): shard_map + batch 维滚动
+  错配对 + 梯度 pmean;验证 4 芯 3/3 步 ✓。
+  **坑: 闭包捕获的 gm 加载参数带全局分片标注('devices' Auto mesh),
+  与 shard_map Manual mesh 冲突 → 参数必须显式作为 shard_map 入参**
+  (train_sft 一直如此故无恙)。
+- Docker: jax_impl/Dockerfile(python3.12-slim,全 pin jax 0.10.2 +
+  gemma@09e7b48,构建期自检导入),镜像 5.19GB,推送
+  europe-west4-docker.pkg.dev/leeway-main/anker/jax:{v1,<git sha>}
+  (AR 同区,团队授 artifactregistry.reader 即可 pull)。

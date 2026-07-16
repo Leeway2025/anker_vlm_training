@@ -28,7 +28,12 @@ N=${4:-$(detect_chips)}
 echo "[infer_sharded] 使用 $N 张芯并行(ckpt=$CKPT)"
 
 for i in $(seq 0 $((N - 1))); do
+  # 并发单芯进程隔离(JAX 侧实测同款问题): 仅 TPU_VISIBLE_CHIPS 会撞
+  # libtpu 锁("TPU already in use"),须补进程边界与独立端口
   PJRT_DEVICE=TPU TPU_VISIBLE_CHIPS=$i \
+  TPU_PROCESS_BOUNDS=1,1,1 TPU_CHIPS_PER_PROCESS_BOUNDS=1,1,1 \
+  TPU_PROCESS_ADDRESSES=localhost:$((8476 + i)) \
+  TPU_PROCESS_PORT=$((8476 + i)) CLOUD_TPU_TASK_ID=0 \
   python3 training/run_inference.py --ckpt "$CKPT" --labels "$LABELS" \
     --shard "$i/$N" --out "${OUT}_shard${i}.jsonl" \
     > "${OUT}_shard${i}.log" 2>&1 &

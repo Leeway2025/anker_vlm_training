@@ -24,6 +24,20 @@ S0 环境 → S1 stage a → S2 stage b → S3 hard_mining → S4 aux_heads
 
 ## S0. 一次性准备
 
+**方式一(推荐,团队对齐):Docker 镜像**
+```bash
+gcloud auth configure-docker europe-west4-docker.pkg.dev   # 一次性
+docker pull europe-west4-docker.pkg.dev/leeway-main/anker/jax:v1
+# TPU VM 上运行(--privileged + /dev 使容器可见 TPU;GCS 凭据走 VM metadata):
+docker run --rm --privileged --net=host \
+  -v /dev:/dev -v $PWD:/workspace -v /path/DATA:/data -w /workspace \
+  europe-west4-docker.pkg.dev/leeway-main/anker/jax:v1 \
+  python jax_impl/train_sft.py --labels /data/labels.jsonl ...
+# 镜像内已烘入代码与全 pin 依赖(jax 0.10.2 + gemma@09e7b48);
+# 挂 -w /workspace 用宿主机代码,不挂则用镜像内固化版(严格对齐)
+```
+
+**方式二:裸机 venv**
 ```bash
 # ① 独立环境(python>=3.12;与 torch venv 完全隔离)
 bash jax_impl/setup_jax_env.sh /path/to/venv_jax
@@ -84,10 +98,11 @@ bash jax_impl/setup_jax_env.sh /path/to/venv_jax
 - **前置**:S2 产物。三步:推理 → 挖掘 → 加权续训。
 - **命令**:
   ```bash
-  # ① 全训练集推理(小规模用 JAX;10 万级建议先按 S9 导出,
-  #    用 torch 侧 scripts/infer_sharded.sh 全芯并行,~2.5h)
-  python jax_impl/infer.py <公共参数> \
-    --init-npz outputs/jax_b/train_params.npz --out outputs/preds.jsonl
+  # ① 全训练集推理 —— 全芯并行(每芯一进程 × --shard 分片,断点续跑):
+  bash jax_impl/infer_sharded.sh <venv_jax>/bin/python \
+    DATA/labels.jsonl hf_layout.json outputs/preds \
+    outputs/jax_b/train_params.npz
+  # (单进程调试: python jax_impl/infer.py <公共参数> --shard 0/8 ...)
   # ② 挖掘(错例加权,带按类膨胀上限)
   python jax_impl/hard_mining.py --preds outputs/preds.jsonl \
     --labels DATA/labels.jsonl --out outputs/sw.json
@@ -133,7 +148,7 @@ bash jax_impl/setup_jax_env.sh /path/to/venv_jax
   ```bash
   python jax_impl/kto.py --kto-data outputs/kto_data.jsonl <公共参数> \
     --init-npz outputs/jax_cot/train_params.npz --steps <N> \
-    --out outputs/jax_kto
+    --out outputs/jax_kto        # 默认全芯数据并行(--dp 0=全部)
   ```
 - **验收**:日志 `|logratio|` 稳步增大(policy 在离开 ref);
   监控集分类不降(任一降 >0.5 即停,同 torch 刹车口径)。

@@ -246,6 +246,7 @@ JAX(1M≈14.3h/epoch): S1→S2(→S3 续训段)   torch(已全流程验证):
 | 数据预取 | **默认开启**(`--prefetch-workers 8`,并行解码+双缓冲,+30% 吞吐,loss 轨迹与同步版逐位一致);排查数据问题时用 `--prefetch-workers 0` 退回同步路径 |
 | HBM | prod+视觉全训峰值 ~30.7/31.25G;OOM 时先去掉 `--train-vision` |
 | 首步耗时 | 编译 2~3 分钟属正常,勿当 hang |
+| 容器跑 TPU | `docker run` 必须带 `--ulimit nofile=1048576:1048576 --ulimit memlock=-1`(libtpu 需大量 fd,默认限制下报 "Too many open files" 崩溃,真机踩坑);TPU 被其它进程占用时报 vfio busy,先 `scripts/stop_train.sh` 清场 |
 | 吞吐口径 | 看日志 `marginal_micro_s`;epoch ≈ marginal × 总 micro 数 |
 | 改 prompt | 必须重新生成 hf_layout.json,并与端侧部署同步 |
 | 细节档案 | 设计/验证/踩坑全记录见 `jax_impl/FINDINGS.md` |

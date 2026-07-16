@@ -27,11 +27,11 @@ S0 环境 → S1 stage a → S2 stage b → S3 hard_mining → S4 aux_heads
 **方式一(推荐,团队对齐):Docker 镜像**
 ```bash
 gcloud auth configure-docker europe-west4-docker.pkg.dev   # 一次性
-docker pull europe-west4-docker.pkg.dev/leeway-main/anker/jax:v1
+docker pull europe-west4-docker.pkg.dev/leeway-main/anker/jax:v1.1   # ⚠️ v1 含已修复的 kto 旧 bug,勿用
 # TPU VM 上运行(--privileged + /dev 使容器可见 TPU;GCS 凭据走 VM metadata):
 docker run --rm --privileged --net=host \
   -v /dev:/dev -v $PWD:/workspace -v /path/DATA:/data -w /workspace \
-  europe-west4-docker.pkg.dev/leeway-main/anker/jax:v1 \
+  europe-west4-docker.pkg.dev/leeway-main/anker/jax:v1.1 \
   python jax_impl/train_sft.py --labels /data/labels.jsonl ...
 # 镜像内已烘入代码与全 pin 依赖(jax 0.10.2 + gemma@09e7b48);
 # 挂 -w /workspace 用宿主机代码,不挂则用镜像内固化版(严格对齐)

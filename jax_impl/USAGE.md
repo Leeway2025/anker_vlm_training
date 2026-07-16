@@ -26,7 +26,8 @@ S0 环境 → S1 stage a → S2 stage b → S3 hard_mining → S4 aux_heads
 
 **方式一(推荐,团队对齐):Docker 镜像**
 ```bash
-gcloud auth configure-docker europe-west4-docker.pkg.dev   # 一次性
+# 仓库已公开只读,免认证直接拉(注意 leeway-main 全小写;
+# 报 docker.sock permission denied 时用 sudo 或把用户加进 docker 组)
 docker pull europe-west4-docker.pkg.dev/leeway-main/anker/jax:v1.1   # ⚠️ v1 含已修复的 kto 旧 bug,勿用
 # TPU VM 上运行(--privileged + /dev 使容器可见 TPU;GCS 凭据走 VM metadata):
 docker run --rm --privileged --net=host \

@@ -32,7 +32,7 @@ docker pull europe-west4-docker.pkg.dev/leeway-main/anker/jax:v1.2   # ⚠️ v1
 # TPU VM 上运行(--privileged + /dev 使容器可见 TPU;GCS 凭据走 VM metadata):
 docker run --rm --privileged --net=host \
   -v /dev:/dev -v $PWD:/workspace -v /path/DATA:/data -w /workspace \
-  europe-west4-docker.pkg.dev/leeway-main/anker/jax:v1.1 \
+  europe-west4-docker.pkg.dev/leeway-main/anker/jax:v1.2 \
   python jax_impl/train_sft.py --labels /data/labels.jsonl ...
 # 镜像内已烘入代码与全 pin 依赖(jax 0.10.2 + gemma@09e7b48);
 # 镜像 tag 与 git commit 一一对应(另有同内容的 git-sha tag 供精确指认);

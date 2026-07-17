@@ -28,7 +28,7 @@ S0 环境 → S1 stage a → S2 stage b → S3 hard_mining → S4 aux_heads
 ```bash
 # 仓库已公开只读,免认证直接拉(注意 leeway-main 全小写;
 # 报 docker.sock permission denied 时用 sudo 或把用户加进 docker 组)
-docker pull europe-west4-docker.pkg.dev/leeway-main/anker/jax:v1.5   # 用最新 tag(旧 tag 各有已修缺陷,勿用)
+docker pull europe-west4-docker.pkg.dev/leeway-main/anker/jax:v1.6   # 用最新 tag(旧 tag 各有已修缺陷,勿用)
 
 > **日志落盘**(v1.5+): 训练/推理/KTO 启动后自动把全部输出(含 libtpu C++
 > 报错)追加写入 `<--out 目录>/train.log`;`--out` 在挂载目录下时日志即
@@ -39,7 +39,7 @@ docker pull europe-west4-docker.pkg.dev/leeway-main/anker/jax:v1.5   # 用最新
 docker run --rm --privileged --net=host \
   --ulimit nofile=1048576:1048576 --ulimit memlock=-1 \
   -v /dev:/dev -v $PWD:/workspace -v /path/DATA:/data -w /workspace \
-  europe-west4-docker.pkg.dev/leeway-main/anker/jax:v1.5 \
+  europe-west4-docker.pkg.dev/leeway-main/anker/jax:v1.6 \
   python jax_impl/train_sft.py --labels /data/labels.jsonl ...
 # 镜像内已烘入代码与全 pin 依赖(jax 0.10.2 + gemma@09e7b48);
 # 镜像 tag 与 git commit 一一对应(另有同内容的 git-sha tag 供精确指认);
@@ -82,6 +82,8 @@ bash jax_impl/setup_jax_env.sh /path/to/venv_jax
     --stage a --steps <约1个epoch> --accum 4 --out outputs/jax_a
   ```
 - **产物**:`outputs/jax_a/train_params.npz`(此阶段内只有 projector 有效)。
+  同 rank 方案续接时其全零 LoRA 会被自动跳过(v1.6+,防死鞍点),日志
+  出现 `全零 LoRA a 跳过 N 叶` 属预期。
 - **验收**:loss 平稳下降(与 torch 版验收同口径)。
 - **衔接 S2**:`--init-npz outputs/jax_a/train_params.npz`。
 - **已有 torch stage a 成果?** projector.pt→JAX 的转换器暂缺(排期中)。
@@ -114,6 +116,9 @@ bash jax_impl/setup_jax_env.sh /path/to/venv_jax
 - **命令**:
   ```bash
   # ① 全训练集推理 —— 全芯并行(每芯一进程 × --shard 分片,断点续跑):
+  # v1.6+: infer/kto 从 npz 自动判定 rank 方案(prod 产物自动带 rsLoRA
+  # 缩放),并自动合并训练过的 projector;任何键未命中直接报错。
+  # ⚠️ 评测 prod 产物必须用 ≥v1.6 —— 旧版会静默退化为 base 模型。
   bash jax_impl/infer_sharded.sh <venv_jax>/bin/python \
     DATA/labels.jsonl hf_layout.json outputs/preds \
     outputs/jax_b/train_params.npz

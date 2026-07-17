@@ -25,6 +25,13 @@ def tee_stdio(out_dir, name="train.log"):
     sys.stdout.flush(); sys.stderr.flush()
     os.dup2(p.stdin.fileno(), 1)
     os.dup2(p.stdin.fileno(), 2)
+    # 管道非 tty → python 默认块缓冲,运行中 print 会滞留用户态缓冲区
+    # 数 KB 才落盘;改行缓冲保证 tail -f train.log 实时可读
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except Exception:
+        pass
 
     # 退出排空: 容器内 python 是 PID 1,直接退出会连带杀 tee,管道尾部
     # (往往正是 traceback)丢失 —— 实测 5 行截断。EOF + wait 保证写完。

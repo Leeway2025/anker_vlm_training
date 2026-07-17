@@ -241,9 +241,11 @@ def main():
         in_specs=(P(), P(), P()) + (P("dp"),) * 7,  # base/ref 显式复制进 Manual ctx
         out_specs=(P(), (P(), P()), P()), check_rep=False)
 
+    # base/ref 必须走参数而非闭包 —— jit 会把闭包数组烘成程序常量,
+    # base 10.7G 在设备上多存一份,prod rank 下直接 HBM OOM(v1.6 实测)
     @functools.partial(jax.jit, donate_argnums=(0, 1))
-    def step(lora, opt_state, *b):
-        loss, m, grads = grad_sharded(lora, base, ref_lora, *b)
+    def step(lora, opt_state, base_p, ref_l, *b):
+        loss, m, grads = grad_sharded(lora, base_p, ref_l, *b)
         updates, opt_state = optim.update(grads, opt_state, lora)
         return optax.apply_updates(lora, updates), opt_state, loss, m
 
@@ -265,7 +267,7 @@ def main():
         kl_toks = np.concatenate([toks[:, :T], toks[roll][:, T:]], axis=1)
         kl_labs = np.concatenate([labs[:, :T], labs[roll][:, T:]], axis=1)
         lora, opt_state, loss, (kl, lr_abs) = step(
-            lora, opt_state,
+            lora, opt_state, base, ref_lora,
             jnp.asarray(toks), jnp.asarray(labs),
             jnp.asarray(kl_toks), jnp.asarray(kl_labs),
             jnp.asarray(pt), jnp.asarray(px), jnp.asarray(is_des))

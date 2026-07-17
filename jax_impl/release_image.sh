@@ -27,6 +27,8 @@ docker run --rm "anker-jax:$VER" sh -c '
   grep -q base_p /app/jax_impl/kto.py
   grep -q TPU_PROCESS_ADDRESSES /app/jax_impl/infer_sharded.sh
   grep -q _disable_ktyping /app/jax_impl/prefetch.py
+  grep -q load_lora_strict /app/jax_impl/npz_io.py
+  grep -q rank-scheme /app/jax_impl/infer.py
   echo content-check OK'
 
 docker tag "anker-jax:$VER" "$AR:$VER"

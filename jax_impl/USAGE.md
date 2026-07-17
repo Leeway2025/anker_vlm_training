@@ -28,12 +28,12 @@ S0 环境 → S1 stage a → S2 stage b → S3 hard_mining → S4 aux_heads
 ```bash
 # 仓库已公开只读,免认证直接拉(注意 leeway-main 全小写;
 # 报 docker.sock permission denied 时用 sudo 或把用户加进 docker 组)
-docker pull europe-west4-docker.pkg.dev/leeway-main/anker/jax:v1.3   # 用最新 tag(旧 tag 各有已修缺陷,勿用)
+docker pull europe-west4-docker.pkg.dev/leeway-main/anker/jax:v1.4   # 用最新 tag(旧 tag 各有已修缺陷,勿用)
 # TPU VM 上运行(--privileged + /dev 使容器可见 TPU;GCS 凭据走 VM metadata):
 docker run --rm --privileged --net=host \
   --ulimit nofile=1048576:1048576 --ulimit memlock=-1 \
   -v /dev:/dev -v $PWD:/workspace -v /path/DATA:/data -w /workspace \
-  europe-west4-docker.pkg.dev/leeway-main/anker/jax:v1.3 \
+  europe-west4-docker.pkg.dev/leeway-main/anker/jax:v1.4 \
   python jax_impl/train_sft.py --labels /data/labels.jsonl ...
 # 镜像内已烘入代码与全 pin 依赖(jax 0.10.2 + gemma@09e7b48);
 # 镜像 tag 与 git commit 一一对应(另有同内容的 git-sha tag 供精确指认);

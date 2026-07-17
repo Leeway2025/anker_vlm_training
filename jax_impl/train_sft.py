@@ -58,6 +58,8 @@ def main():
                     help="最后该比例的步数切纯生产模式")
     ap.add_argument("--init-npz", help="从 train_params.npz 续训(或 import_hf 产物)")
     a = ap.parse_args()
+    from jax_impl.logtee import tee_stdio
+    tee_stdio(a.out)
     if a.stage == "a":
         a.train_projector = True     # stage a 语义: 只训 projector
 

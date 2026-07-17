@@ -33,6 +33,8 @@ def main():
     ap.add_argument("--max-new", type=int, default=40)
     ap.add_argument("--init-npz", help="载入训练产物 lora(缺省纯 base)")
     a = ap.parse_args()
+    from jax_impl.logtee import tee_stdio
+    tee_stdio(os.path.dirname(a.out) or ".", name=os.path.basename(a.out) + ".log")
 
     import jax
     import jax.numpy as jnp

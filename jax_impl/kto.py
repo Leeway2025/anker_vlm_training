@@ -43,6 +43,8 @@ def main():
     ap.add_argument("--dp", type=int, default=0, help="数据并行设备数,0=全部")
     ap.add_argument("--out", default="/dev/shm/out_jax_kto")
     a = ap.parse_args()
+    from jax_impl.logtee import tee_stdio
+    tee_stdio(a.out)
 
     import jax
     import jax.numpy as jnp

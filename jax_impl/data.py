@@ -35,7 +35,14 @@ def load_frames(rec, wds_dir):
     base = meta.get("wds_dir") or wds_dir
     shard = os.path.join(base, f"shard-{meta.get('shard', 0):06d}.tar")
     with tarfile.open(shard) as tf:
-        raw = tf.extractfile(f"{rec['video_id']}.pyd").read()
+        # 成员名约定与 torch 侧 euno_wds 一致: video_id 中的 "/" → "__"
+        name = rec["video_id"].replace("/", "__") + ".pyd"
+        try:
+            raw = tf.extractfile(tf.getmember(name)).read()
+        except KeyError:
+            few = [m.name for m in tf.getmembers()[:3]]
+            raise KeyError(f"{shard} 中无成员 {name!r};分片内实际成员形如 "
+                           f"{few} —— 若命名约定不同请反馈")
     frames = pickle.loads(raw)["frames"]
     from PIL import Image
     return [np.asarray(Image.open(io.BytesIO(b)).convert("RGB"))

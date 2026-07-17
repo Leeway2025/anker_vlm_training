@@ -31,7 +31,12 @@ def main():
     ap.add_argument("--shard", default=None,
                     help="'i/n' 隔行分片(0 起),配 infer_sharded.sh 多芯并行")
     ap.add_argument("--max-new", type=int, default=40)
-    ap.add_argument("--init-npz", help="载入训练产物 lora(缺省纯 base)")
+    ap.add_argument("--init-npz", help="载入训练产物 lora+projector(缺省纯 base)")
+    ap.add_argument("--rank-scheme", choices=["auto", "uniform", "prod"],
+                    default="auto",
+                    help="auto=从 npz 自动判定(差异化 rank 即 prod)")
+    ap.add_argument("--no-proj", action="store_true",
+                    help="不合并 npz 中的 projector(默认: npz 无 proj/ 即报错)")
     a = ap.parse_args()
     from jax_impl.logtee import tee_stdio
     tee_stdio(os.path.dirname(a.out) or ".", name=os.path.basename(a.out) + ".log")
@@ -45,6 +50,29 @@ def main():
     from gemma.gm.nn.gemma4._transformer import PreprocessedVisionInput
     from jax_impl.data import SftDataset, make_vision_input
 
+    # ---- rank 方案判定必须先于模型构造(prod 是参数创建路径的 patch)----
+    z, uni_rank, has_lora = None, 16, False
+    if a.init_npz:
+        from jax_impl.npz_io import (detect_rank_scheme, load_lora_strict,
+                                     merge_proj_into_base)
+        z = np.load(a.init_npz)
+        has_lora = any(k.startswith("lora/") for k in z.files)
+        if has_lora:
+            scheme = a.rank_scheme
+            if scheme == "auto":
+                scheme, ranks = detect_rank_scheme(z)
+                print(f"[scheme] 从 npz 判定: {scheme} ranks={ranks}")
+            else:
+                _, ranks = detect_rank_scheme(z)
+            if scheme == "prod":
+                from jax_impl.prod_lora import install_prod_lora
+                install_prod_lora()      # 带 rsLoRA 缩放,与训练前向一致
+            else:
+                uni_rank = ranks[0]
+        else:
+            print("[scheme] npz 无 lora/ 键 → base+projector 推理"
+                  "(stage a 产物口径)")
+
     cfg64 = dataclasses.replace(
         gm.nn.Gemma4_E2B.config,
         vision_encoder=gemma_vision.VisionEncoder(
@@ -55,16 +83,22 @@ def main():
     T = len(ds.template)
     L = T + a.max_new
 
-    if a.init_npz:
-        model = gm.nn.LoRA(rank=int(np.load(a.init_npz)[
-            [k for k in np.load(a.init_npz).files if k.endswith("/a")][0]
-        ].shape[-1]), model=gm.nn.Gemma4_E2B(text_only=False, config=cfg64))
+    if a.init_npz and has_lora:
+        # prod 时 rank 入参仅占位(install_prod_lora 按路径覆盖)
+        model = gm.nn.LoRA(rank=uni_rank,
+                           model=gm.nn.Gemma4_E2B(text_only=False,
+                                                  config=cfg64))
     else:
         model = gm.nn.Gemma4_E2B(text_only=False, config=cfg64)
     params = gm.ckpts.load_params(gm.ckpts.CheckpointPath.GEMMA4_E2B_IT)
     params = jax.tree.map(lambda x: jnp.asarray(x, jnp.bfloat16), params)
     if a.init_npz:
-        z = np.load(a.init_npz)
+        # ② 训练过的 projector 必须跟着 LoRA 一起上车(旧版静默丢弃)
+        params, n_proj = merge_proj_into_base(
+            params, z, jnp, jnp.bfloat16, required=not a.no_proj)
+        if not has_lora:
+            print(f"[init] projector({n_proj}叶) from {a.init_npz}")
+    if a.init_npz and has_lora:
         ex0 = ds[0]
         p0, x0, counts0 = make_vision_input([ex0["frames"]])
         struct = jax.eval_shape(lambda: model.init(
@@ -73,16 +107,10 @@ def main():
                 patches=jnp.asarray(p0), positions_xy=jnp.asarray(x0),
                 soft_token_counts=counts0)))
         lora_struct = gpeft.split_params(struct["params"])[1]
-
-        def fill(path, leaf):
-            k = "/".join(getattr(x, "key", str(x)) for x in path)
-            k = "lora/" + k
-            if k in z.files and z[k].shape == leaf.shape:
-                return jnp.asarray(z[k], jnp.bfloat16)
-            return jnp.zeros(leaf.shape, jnp.bfloat16)
-        lora = jax.tree_util.tree_map_with_path(fill, lora_struct)
+        # ① 严格加载: 未命中/形状不符直接报错,禁止静默填零
+        lora = load_lora_strict(z, lora_struct, jnp, jnp.bfloat16)
         params = gpeft.merge_params(params, lora)
-        print(f"[init] lora from {a.init_npz}")
+        print(f"[init] lora+proj({n_proj}叶) from {a.init_npz}")
 
     @jax.jit
     def step_logits(par, tokens, pvi, pos):

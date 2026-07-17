@@ -210,18 +210,20 @@ def main():
 
     train0 = {"lora": lora0, "proj": proj0, "aux": aux0}
     if a.init_npz:                        # 续训: 覆盖同名叶(形状须一致)
+        from jax_impl.npz_io import restore_train_tree
         z = np.load(a.init_npz)
-        flat = dict(z)
-        def restore(path, leaf):
-            k = _path_str(path)
-            if k in flat and flat[k].shape == leaf.shape:
-                return jnp.asarray(flat[k], leaf.dtype)
-            return leaf
-        train0 = jax.tree_util.tree_map_with_path(restore, train0)
-        n_hit = sum(1 for p, v in
-                    jax.tree_util.tree_flatten_with_path(train0)[0]
-                    if _path_str(p) in flat)
-        print(f"[init-npz] 恢复 {n_hit} 叶 from {a.init_npz}")
+        # ③号致命坑防护: npz 里的全零 LoRA a(如 stage a 产物,LoRA 全程
+        # 冻结为零)不得覆盖新初始化 —— A=0∧B=0 梯度恒零,恢复即杀死适配器
+        train0, st = restore_train_tree(
+            train0, z, jnp, is_zero_skippable=_is_trainable)
+        msg = f"[init-npz] 恢复 {st['hit']} 叶 from {a.init_npz}"
+        if st["shape_skip"]:
+            msg += (f";形状不符跳过 {st['shape_skip']} 叶"
+                    f"(跨 rank 方案衔接时属预期,如 S1 uniform→S2 prod)")
+        if st["zero_a_skip"]:
+            msg += (f";⚠️ 全零 LoRA a 跳过 {st['zero_a_skip']} 叶"
+                    f"(npz 来自未训 LoRA 的阶段,保留本次新初始化)")
+        print(msg)
     tx = optax.chain(
         optax.clip_by_global_norm(1.0),         # 对齐 torch max_grad_norm
         optax.multi_transform(

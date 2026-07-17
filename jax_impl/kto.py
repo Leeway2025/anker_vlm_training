@@ -38,7 +38,13 @@ def main():
     ap.add_argument("--beta", type=float, default=0.1)
     ap.add_argument("--w-desirable", type=float, default=1.0)
     ap.add_argument("--w-undesirable", type=float, default=1.5)
-    ap.add_argument("--rank", type=int, default=16)
+    ap.add_argument("--rank", type=int, default=16,
+                    help="无 --init-npz 时的新建 LoRA rank;有 npz 时自动判定")
+    ap.add_argument("--rank-scheme", choices=["auto", "uniform", "prod"],
+                    default="auto",
+                    help="auto=从 npz 自动判定(差异化 rank 即 prod)")
+    ap.add_argument("--no-proj", action="store_true",
+                    help="不合并 npz 中的 projector(默认: npz 无 proj/ 即报错)")
     ap.add_argument("--completion-budget", type=int, default=64)
     ap.add_argument("--dp", type=int, default=0, help="数据并行设备数,0=全部")
     ap.add_argument("--out", default="/dev/shm/out_jax_kto")
@@ -81,11 +87,28 @@ def main():
     g4_tr._token_utils.remove_mm_logits = \
         lambda logits, tokens, num_tokens_per_image: logits
 
+    # ---- rank 方案判定必须先于模型构造(prod 是参数创建路径的 patch)----
+    z = np.load(a.init_npz) if a.init_npz else None
+    rank = a.rank
+    if z is not None:
+        from jax_impl.npz_io import detect_rank_scheme
+        scheme = a.rank_scheme
+        if scheme == "auto":
+            scheme, ranks = detect_rank_scheme(z)
+            print(f"[scheme] 从 npz 判定: {scheme} ranks={ranks}")
+        else:
+            _, ranks = detect_rank_scheme(z)
+        if scheme == "prod":
+            from jax_impl.prod_lora import install_prod_lora
+            install_prod_lora()          # 带 rsLoRA 缩放,与 SFT 前向一致
+        else:
+            rank = ranks[0]
+
     cfg64 = dataclasses.replace(
         gm.nn.Gemma4_E2B.config,
         vision_encoder=gemma_vision.VisionEncoder(
             use_clipped_linears=True, output_length=64))
-    model = gm.nn.LoRA(rank=a.rank,
+    model = gm.nn.LoRA(rank=rank,
                        model=gm.nn.Gemma4_E2B(text_only=False, config=cfg64))
     tok = gm.text.Gemma4Tokenizer()
     ds = SftDataset(a.labels, a.layout, tok, wds_dir=a.wds_dir,
@@ -111,22 +134,33 @@ def main():
             soft_token_counts=counts)))
     lora_struct = gpeft.split_params(struct["params"])[1]
     rng = np.random.RandomState(0)
-    z = np.load(a.init_npz) if a.init_npz else None
 
-    def init_leaf(path, leaf):
-        k = "/".join(getattr(x, "key", str(x)) for x in path)
-        if z is not None:
-            zk = "lora/" + k
-            if zk in z.files and z[zk].shape == leaf.shape:
-                return jnp.asarray(z[zk], jnp.float32)
-        llm = k.startswith("layer_") or "/layer_" in k
-        if k.endswith("/a") and llm:
-            return jnp.asarray(rng.normal(0, 0.02, leaf.shape), jnp.float32)
-        return jnp.zeros(leaf.shape, jnp.float32)
-    lora0 = jax.tree_util.tree_map_with_path(init_leaf, lora_struct)
+    if z is not None:
+        # ① 严格加载 SFT 产物: 未命中/形状不符/全零 → 硬报错
+        #   (旧版静默回退随机 a/零 b,prod SFT 成果在 KTO 起点被清空)
+        from jax_impl.npz_io import load_lora_strict, merge_proj_into_base
+        lora0 = load_lora_strict(z, lora_struct, jnp, jnp.float32)
+    else:
+        def init_leaf(path, leaf):
+            k = "/".join(getattr(x, "key", str(x)) for x in path)
+            llm = k.startswith("layer_") or "/layer_" in k
+            if k.endswith("/a") and llm:
+                return jnp.asarray(rng.normal(0, 0.02, leaf.shape),
+                                   jnp.float32)
+            return jnp.zeros(leaf.shape, jnp.float32)
+        lora0 = jax.tree_util.tree_map_with_path(init_leaf, lora_struct)
 
     base = gm.ckpts.load_params(gm.ckpts.CheckpointPath.GEMMA4_E2B_IT)
     base = jax.tree.map(lambda x: jnp.asarray(x, jnp.bfloat16), base)
+    if z is not None:
+        # ② SFT 训过的 projector 上车(policy 与 ref 共用 base,合并一次两侧生效)
+        base, n_proj = merge_proj_into_base(
+            base, z, jnp, jnp.bfloat16, required=not a.no_proj)
+        print(f"[init] SFT lora+proj({n_proj}叶) from {a.init_npz}")
+    # ref = KTO 起点(base+SFT lora),TRL 语义;lora0 为随机初始时 b=0
+    # ⇒ ref 等效 base,与旧行为兼容
+    ref_lora = jax.tree.map(
+        lambda x: jax.lax.stop_gradient(x.astype(jnp.bfloat16)), lora0)
 
     optim = optax.MultiSteps(
         optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(a.lr)),
@@ -161,8 +195,8 @@ def main():
         k = "/".join(getattr(x, "key", str(x)) for x in path)
         return k.startswith("layer_") or "/layer_" in k
 
-    def kto_loss_fn(lora, base_p, tokens, labels, kl_tokens, kl_labels,
-                    patches, pos_xy, is_des):
+    def kto_loss_fn(lora, base_p, ref_l, tokens, labels, kl_tokens,
+                    kl_labels, patches, pos_xy, is_des):
         # 非 LLM(视觉/embedder)lora 叶必须 stop_gradient —— zeros 仍可导,
         # 不切断则视觉塔反向 ~32G ×2 前向 = 62G OOM(电池实测)
         lora_h = jax.tree_util.tree_map_with_path(
@@ -173,8 +207,7 @@ def main():
             patches=patches, positions_xy=pos_xy, soft_token_counts=counts)
         lp_pol = sum_logprob_fn(pol, tokens, labels, pvi)
         kl_pol = sum_logprob_fn(pol, kl_tokens, kl_labels, pvi)
-        ref = gpeft.merge_params(
-            base_p, jax.tree.map(jnp.zeros_like, lora_h))   # ref ≡ base
+        ref = gpeft.merge_params(base_p, ref_l)   # ref = KTO 起点(SFT)
         lp_ref = jax.lax.stop_gradient(
             sum_logprob_fn(ref, tokens, labels, pvi))
         kl_ref = jax.lax.stop_gradient(
@@ -205,12 +238,12 @@ def main():
 
     grad_sharded = shard_map(
         grad_local, mesh=mesh,
-        in_specs=(P(), P()) + (P("dp"),) * 7,   # base 显式复制进 Manual ctx
+        in_specs=(P(), P(), P()) + (P("dp"),) * 7,  # base/ref 显式复制进 Manual ctx
         out_specs=(P(), (P(), P()), P()), check_rep=False)
 
     @functools.partial(jax.jit, donate_argnums=(0, 1))
     def step(lora, opt_state, *b):
-        loss, m, grads = grad_sharded(lora, base, *b)
+        loss, m, grads = grad_sharded(lora, base, ref_lora, *b)
         updates, opt_state = optim.update(grads, opt_state, lora)
         return optax.apply_updates(lora, updates), opt_state, loss, m
 

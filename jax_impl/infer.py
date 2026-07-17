@@ -24,6 +24,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--labels", required=True)
     ap.add_argument("--layout", required=True)
+    ap.add_argument("--wds-dir", default=None,
+                    help="显式指定分片目录(覆盖 labels 内 meta.wds_dir)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--shard", default=None,
@@ -46,7 +48,8 @@ def main():
         vision_encoder=gemma_vision.VisionEncoder(
             use_clipped_linears=True, output_length=64))
     tok = gm.text.Gemma4Tokenizer()
-    ds = SftDataset(a.labels, a.layout, tok, max_label_len=a.max_new)
+    ds = SftDataset(a.labels, a.layout, tok, wds_dir=a.wds_dir,
+                    max_label_len=a.max_new)
     T = len(ds.template)
     L = T + a.max_new
 

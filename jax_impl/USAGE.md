@@ -51,6 +51,11 @@ bash jax_impl/setup_jax_env.sh /path/to/venv_jax
 ```
 - 权重自动拉取 `gs://gemma-data/checkpoints/gemma4-e2b-it`,免手动下载;
 - 数据与 torch 完全同源(同一份 labels.jsonl + euno-wds 分片),零转换;
+- **分片(shard-*.tar)定位优先级**: ① 命令行 `--wds-dir`(显式覆盖)
+  ② labels.jsonl 各行的 `meta.wds_dir`(与 torch euno_wds 行为一致,
+  路径由数据方维护,错误如实报错不静默回落) ③ labels.jsonl 所在目录兜底。
+  容器提示: meta.wds_dir 是宿主机路径时,**同名路径挂载最省事**
+  (`-v /真实分片路径:/真实分片路径`),jsonl 零修改;
 - **验收**:`python jax_impl/poc/01_load_model.py` 打印 `Gate A: PASS`。
 
 以下命令均用 `<venv_jax>/bin/python`,工作目录 = 仓库根;

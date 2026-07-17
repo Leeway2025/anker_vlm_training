@@ -27,8 +27,13 @@ SENTINEL = -2        # 视觉哨兵(gemma4 JAX 模型的 TOKEN_PLACEHOLDER)
 
 
 def load_frames(rec, wds_dir):
+    """分片定位优先级: meta.wds_dir(labels.jsonl 内声明,与 torch 侧
+    euno_wds 行为一致)> 调用方传入的 wds_dir(--wds-dir / labels 同目录)。
+    容器场景注意: meta.wds_dir 必须写容器内可见的路径 —— 最省事的做法是
+    把分片目录以同名路径挂载(-v /真实路径:/真实路径),jsonl 零修改。"""
     meta = rec.get("meta") or {}
-    shard = os.path.join(wds_dir, f"shard-{meta.get('shard', 0):06d}.tar")
+    base = meta.get("wds_dir") or wds_dir
+    shard = os.path.join(base, f"shard-{meta.get('shard', 0):06d}.tar")
     with tarfile.open(shard) as tf:
         raw = tf.extractfile(f"{rec['video_id']}.pyd").read()
     frames = pickle.loads(raw)["frames"]
@@ -43,7 +48,7 @@ def load_jsonl_map(path):
 
 
 class SftDataset:
-    def __init__(self, labels_file, layout_file, tokenizer, wds_dir=None,
+    def __init__(self, labels_file, layout_file, tokenizer, wds_dir=None,   # wds_dir 显式传入时覆盖 meta(见 load_frames)
                  max_label_len=64, cls_weight=4.0, sample_weights=None,
                  reasoning=None, cot_ratio=0.6, attributes=None,
                  max_think_len=96, seed=0):
@@ -56,6 +61,7 @@ class SftDataset:
             print(f"[hard-mining] {len(recs)} -> {len(out)} samples")
             recs = out
         self.recs = recs
+        self.wds_override = wds_dir            # 显式指定则最高优先
         self.wds = wds_dir or os.path.dirname(labels_file)
         lay = json.load(open(layout_file, encoding="utf-8"))
         self.template = [(SENTINEL if m == 2 else t) for t, m in
@@ -118,7 +124,13 @@ class SftDataset:
         ks = KS_CLASSES.index(KS_GROUP[lb["sub_keyscene"]]) \
             if lb["sub_keyscene"] in KS_GROUP else -100
 
-        frames = load_frames(rec, self.wds)
+        # 优先级: 显式 wds_dir(--wds-dir)> meta.wds_dir > labels 同目录
+        if self.wds_override:
+            frames = load_frames({**rec, "meta": {**(rec.get("meta") or {}),
+                                                  "wds_dir": self.wds_override}},
+                                 self.wds)
+        else:
+            frames = load_frames(rec, self.wds)
         return {"tokens": tokens, "labels": labels, "weights": weights,
                 "aux_labels": aux, "ks_label": np.int32(ks),
                 "frames": frames, "video_id": vid}

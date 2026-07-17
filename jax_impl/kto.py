@@ -29,6 +29,8 @@ def main():
     ap.add_argument("--kto-data", required=True)
     ap.add_argument("--labels", required=True)
     ap.add_argument("--layout", required=True)
+    ap.add_argument("--wds-dir", default=None,
+                    help="显式指定分片目录(覆盖 labels 内 meta.wds_dir)")
     ap.add_argument("--init-npz", help="SFT 产物 lora(policy 起点)")
     ap.add_argument("--steps", type=int, default=10)
     ap.add_argument("--accum", type=int, default=4)
@@ -84,7 +86,7 @@ def main():
     model = gm.nn.LoRA(rank=a.rank,
                        model=gm.nn.Gemma4_E2B(text_only=False, config=cfg64))
     tok = gm.text.Gemma4Tokenizer()
-    ds = SftDataset(a.labels, a.layout, tok,
+    ds = SftDataset(a.labels, a.layout, tok, wds_dir=a.wds_dir,
                     max_label_len=a.completion_budget)
     T = len(ds.template)
     K = a.completion_budget

@@ -25,6 +25,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--labels", required=True)
     ap.add_argument("--layout", required=True)
+    ap.add_argument("--wds-dir", default=None,
+                    help="显式指定分片目录(覆盖 labels 内 meta.wds_dir)")
     ap.add_argument("--steps", type=int, default=10)
     ap.add_argument("--accum", type=int, default=2)
     ap.add_argument("--dp", type=int, default=0, help="数据并行设备数,0=全部")
@@ -136,7 +138,7 @@ def main():
     tok = gm.text.Gemma4Tokenizer()
     sw = json.load(open(a.sample_weights)) if a.sample_weights else None
     full = SftDataset(
-        a.labels, a.layout, tok, sample_weights=sw,
+        a.labels, a.layout, tok, wds_dir=a.wds_dir, sample_weights=sw,
         reasoning=load_jsonl_map(a.cot_file) if a.cot_file else None,
         cot_ratio=a.cot_ratio,
         attributes=load_jsonl_map(a.aux_file) if a.aux_file else None)

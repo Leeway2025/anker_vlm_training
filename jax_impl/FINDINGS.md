@@ -266,3 +266,22 @@ v3 关键经验:
   (lora/embedder/.../lora/a)→ 必须锁 proj/ 子树 + 形状断言。
 - 至此 torch stage a/b 成果均可完整接入 JAX(§A adapter + §B projector),
   跨框架互操作缺口仅剩视觉塔 LoRA 的导出映射(JAX 训视觉→回 torch)。
+
+## v5(2026-07-20): 视觉塔 LoRA 导出映射(RKLLM 交付链)
+
+- **轴序逐位证明**(金标准: base 权重跨侧对比,HF bf16 vs gm f32 →
+  RNE 舍入后 maxdiff=0,q/k/v/o/gate/up/down × 层 0/7/15;错误轴序
+  对照组 0.70): HF `[h*hd+d, in]` = jax q `w[h,in,d]`;k=kv[0]
+  v=kv[1];o 入侧融合;gate=gating[0] up=gating[1] 且 (F,D) 同序;
+  down 转置。HF 权重免下载技巧: tar 头 range 走读(GNU base-256 大小)
+  + safetensors 头 JSON + 张量字节段 range 读。
+- **映射**: scan 堆叠首维=16 层逐层解开 → vision_tower.encoder.layers
+  .N.*.linear.lora_{A,B}(peft 注入点是 ClippableLinear 的 .linear);
+  数学与 LLM 五类同构;vision r=256 α=512 rsLoRA → scale 32 两侧同值,
+  数值免折叠。矩阵级单测 poc/test_vision_map.py 相对误差 4.9e-8。
+- **可训≡可交付**(附带发现): gm.nn.LoRA 会给 per_layer_input_gate 等
+  PLE 模块注入 LoRA(140 键),torch 生产不适配、无 HF 映射 —— 训了
+  交付不了;已冻结(train_sft/kto 同步)。vision entry/input_projection
+  同理。导出告警只对非零键出声。
+- 已知边界: torch→JAX import 的视觉方向未做(场景=拿 torch 视觉适配
+  续训,有告警);clip 包装内外的 LoRA 挂点差异属二阶效应,未观测。

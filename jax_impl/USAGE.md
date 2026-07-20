@@ -227,6 +227,13 @@ python jax_impl/eval_metrics.py --preds outputs/eval_preds.jsonl \
 
 ## S9. 导出交付 —— 回到 HF/RKLLM 生态
 
+> **视觉塔 LoRA 已可导出**(2026-07-20,commit cb4bbe0 起): export_hf
+> `--scheme prod` 产物含 vision_tower 16 层 × 7 模块(共 714 tensors),
+> RKLLM 合并链路完整;轴序经 base 权重逐位证明。同 commit 起可训集合
+> 与可交付集合严格一致(PLE 门/vision entry 投影冻结)。torch→JAX
+> import 方向的视觉映射暂缺(仅影响"拿 torch 视觉适配来续训",告警
+> 提示,需要时再补)。
+
 ```bash
 python jax_impl/export_hf.py --npz outputs/<最终阶段>/train_params.npz \
   --out outputs/final_adapter_hf --scheme prod

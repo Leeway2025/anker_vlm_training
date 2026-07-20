@@ -193,7 +193,12 @@ def main():
 
     def _is_llm(path):
         k = "/".join(getattr(x, "key", str(x)) for x in path)
-        return k.startswith("layer_") or "/layer_" in k
+        if not (k.startswith("layer_") or "/layer_" in k):
+            return False
+        # 与 train_sft 可训集合一致: 只训可交付模块(PLE 门等冻结)
+        return any(t in k for t in ("q_einsum", "kv_einsum",
+                                    "attn_vec_einsum", "gating_einsum",
+                                    "/mlp/linear"))
 
     def kto_loss_fn(lora, base_p, ref_l, tokens, labels, kl_tokens,
                     kl_labels, patches, pos_xy, is_des):

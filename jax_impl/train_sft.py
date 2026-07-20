@@ -187,14 +187,22 @@ def main():
     def _path_str(path):
         return "/".join(getattr(k, "key", str(k)) for k in path)
 
+    # 可训集合 ≡ 可交付集合(torch prod targets / export_hf 映射):
+    # gm.nn.LoRA 会给 per_layer_input_gate 等 PLE 模块也注入 LoRA,但
+    # torch 生产不适配、HF 无导出映射 —— 训了也交付不了,还造成
+    # JAX 评测与端侧成品的偏差,一律冻结(2026-07-20)
+    EXPORTABLE = ("q_einsum", "kv_einsum", "attn_vec_einsum",
+                  "gating_einsum", "/mlp/linear")
+
     def _is_trainable(pstr):
         if a.stage == "a":
             return False                     # stage a: LoRA 全冻结
-        if pstr.startswith("layer_") or "/layer_" in pstr:
-            return True                      # LLM attn+mlp(v1 同范围)
-        if a.train_vision and "vision_encoder" in pstr:
-            return True
-        return False
+        llm = pstr.startswith("layer_") or "/layer_" in pstr
+        vis = (a.train_vision and "vision_encoder" in pstr
+               and "stacked_layers" in pstr)  # entry 投影无 HF 注入点,不训
+        if not (llm or vis):
+            return False
+        return any(k in pstr for k in EXPORTABLE)
 
     def init_leaf(path, leaf):
         pstr = _path_str(path)

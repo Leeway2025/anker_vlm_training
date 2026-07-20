@@ -40,13 +40,14 @@ def map_llm_loras(flat):
     for p, v in flat.items():
         if not (p.startswith("lora/") or p.startswith("layer_")
                 or "/layer_" in p):
-            if p.startswith("lora/"):
+            if np.abs(np.asarray(v)).max() > 0:
                 skipped.append(p)
             continue
         parts = p.split("/")
         li = next((x for x in parts if x.startswith("layer_")), None)
         if li is None:
-            skipped.append(p)
+            if np.abs(np.asarray(v)).max() > 0:
+                skipped.append(p)
             continue
         i = int(li.split("_")[1])
         kind = ("q" if "q_einsum" in p else
@@ -55,14 +56,15 @@ def map_llm_loras(flat):
                 "gate_up" if "gating_einsum" in p else
                 "down" if "/mlp/" in p else None)
         if kind is None:
-            skipped.append(p)
+            if np.abs(np.asarray(v)).max() > 0:
+                skipped.append(p)
             continue
         ab = "a" if p.endswith("/a") else "b"
         by_mod.setdefault((i, kind), {})[ab] = np.asarray(v, np.float32)
 
     if skipped:
         vis = sum(1 for k in skipped if "vision_encoder" in k)
-        print(f"⚠️ [export] {len(skipped)} 个 LoRA 键无 HF 映射、未导出"
+        print(f"⚠️ [export] {len(skipped)} 个非零 LoRA 键无 HF 映射、未导出"
               f"(vision_encoder {vis} 个)。权重仍完整保留在源 npz,"
               f"不丢失;JAX 侧推理不受影响,仅 torch 交付缺视觉适配。"
               f"示例: {skipped[0]}")
@@ -115,12 +117,13 @@ def map_vision_loras(flat):
                 "gate_up" if "gating_einsum" in p else
                 "down" if "/mlp/linear" in p else None)
         if kind is None or "stacked_layers" not in p:
-            skipped.append(p)
+            if np.abs(np.asarray(v)).max() > 0:
+                skipped.append(p)
             continue
         ab = "a" if p.endswith("/a") else "b"
         by_mod.setdefault(kind, {})[ab] = np.asarray(v, np.float32)
     if skipped:
-        print(f"⚠️ [export/vision] {len(skipped)} 个键无 HF 注入点、未导出"
+        print(f"⚠️ [export/vision] {len(skipped)} 个非零键无 HF 注入点、未导出"
               f"(如 entry/input_projection —— peft 只注入 *_proj.linear)。"
               f"权重留在源 npz;示例: {skipped[0]}")
     n_layers = None

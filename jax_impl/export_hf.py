@@ -10,8 +10,14 @@
   attn_vec      a(N,H,r)  b(r,1536)  → o_proj  A=a.reshape(-1,r)ᵀ, B=bᵀ
   gating_einsum a(1536,r) b(r,2,F)   → gate/up  A=aᵀ(共享), B=b[:,i]ᵀ
   mlp/linear    a(F,r)    b(r,1536)  → down_proj A=aᵀ, B=bᵀ
-缩放: JAX 无 α → adapter_config lora_alpha=r(scaling=1)。
-视觉塔 LoRA 导出与 projector 的 HF 键名映射见 FINDINGS(TODO v3)。
+  视觉塔(16 层,nn.scan 堆叠,首维=层): 同五类模块逐层解堆叠 →
+  vision_tower.encoder.layers.N.*.linear.lora_{A,B}(peft 注入点是
+  ClippableLinear 内部 .linear 子模块)。轴序已用 base 权重逐位证明
+  (2026-07-20,q/k/v/o/gate/up/down × 3 层,bf16 舍入后 maxdiff=0,
+  错误轴序对照组 0.70)。entry/input_projection 的 LoRA 无 HF 注入点,
+  导出时告警跳过(权重留在 npz)。
+缩放: JAX 无 α → adapter_config lora_alpha=r(scaling=1);prod 方案
+vision r=256 α=512 rsLoRA → scale 32,与 JAX 前向一致。
 """
 import argparse
 import json
@@ -89,8 +95,79 @@ def map_llm_loras(flat):
     return out
 
 
+def map_vision_loras(flat):
+    """视觉塔 LoRA: scan 堆叠(首维=16 层)→ 逐层 HF peft 键。
+    只处理 vision_encoder 子树;轴序 base 权重逐位证明(见文件头)。
+      q  a(D,r) b(r,H,h)  → A=aᵀ, B=b.reshape(r,-1)ᵀ(HF out 融合 h*hd+d)
+      kv a(D,r) b(r,2,H,h)→ k/v 共享 A,B=b[:,i].reshape(r,-1)ᵀ
+      o  a(H,h,r) b(r,D)  → A=a.reshape(-1,r)ᵀ(HF in 融合),B=bᵀ
+      gating a(D,r) b(r,2,F) → gate/up 共享 A,B=b[:,i]ᵀ
+      linear a(F,r) b(r,D)   → down  A=aᵀ, B=bᵀ
+    """
+    import numpy as np
+    out, skipped = {}, []
+    pre = "base_model.model.model.vision_tower.encoder.layers"
+    by_mod = {}
+    for p, v in flat.items():
+        kind = ("q" if "q_einsum" in p else
+                "kv" if "kv_einsum" in p else
+                "o" if "attn_vec_einsum" in p else
+                "gate_up" if "gating_einsum" in p else
+                "down" if "/mlp/linear" in p else None)
+        if kind is None or "stacked_layers" not in p:
+            skipped.append(p)
+            continue
+        ab = "a" if p.endswith("/a") else "b"
+        by_mod.setdefault(kind, {})[ab] = np.asarray(v, np.float32)
+    if skipped:
+        print(f"⚠️ [export/vision] {len(skipped)} 个键无 HF 注入点、未导出"
+              f"(如 entry/input_projection —— peft 只注入 *_proj.linear)。"
+              f"权重留在源 npz;示例: {skipped[0]}")
+    n_layers = None
+    for kind, d in sorted(by_mod.items()):
+        a_s, b_s = d.get("a"), d.get("b")
+        if a_s is None or b_s is None:
+            continue
+        n_layers = a_s.shape[0]
+        for i in range(n_layers):
+            a, b = a_s[i], b_s[i]
+            L = f"{pre}.{i}"
+            if kind == "q":
+                out[f"{L}.self_attn.q_proj.linear.lora_A.weight"] = a.T.copy()
+                out[f"{L}.self_attn.q_proj.linear.lora_B.weight"] = \
+                    b.reshape(b.shape[0], -1).T.copy()
+            elif kind == "kv":
+                for j, name in enumerate(("k_proj", "v_proj")):
+                    out[f"{L}.self_attn.{name}.linear.lora_A.weight"] = a.T.copy()
+                    out[f"{L}.self_attn.{name}.linear.lora_B.weight"] = \
+                        b[:, j].reshape(b.shape[0], -1).T.copy()
+            elif kind == "o":
+                out[f"{L}.self_attn.o_proj.linear.lora_A.weight"] = \
+                    a.reshape(-1, a.shape[-1]).T.copy()
+                out[f"{L}.self_attn.o_proj.linear.lora_B.weight"] = b.T.copy()
+            elif kind == "gate_up":
+                for j, name in enumerate(("gate_proj", "up_proj")):
+                    out[f"{L}.mlp.{name}.linear.lora_A.weight"] = a.T.copy()
+                    out[f"{L}.mlp.{name}.linear.lora_B.weight"] = b[:, j].T.copy()
+            elif kind == "down":
+                out[f"{L}.mlp.down_proj.linear.lora_A.weight"] = a.T.copy()
+                out[f"{L}.mlp.down_proj.linear.lora_B.weight"] = b.T.copy()
+    if n_layers:
+        print(f"[export/vision] {n_layers} 层 × 7 模块 → {len(out)} tensors")
+    return out
+
+
+def split_flat(flat):
+    """lora 平铺键 → (llm 子树, vision 子树)。"""
+    vis = {p: v for p, v in flat.items() if "vision_encoder" in p}
+    llm = {p: v for p, v in flat.items() if p not in vis}
+    return llm, vis
+
+
 TARGET_RE = (r".*language_model\.layers\.\d+\."
-             r"(self_attn\.(q|k|v|o)_proj|mlp\.(gate|up|down)_proj)")
+             r"(self_attn\.(q|k|v|o)_proj|mlp\.(gate|up|down)_proj)"
+             r"|.*vision_tower\.encoder\.layers\.\d+\."
+             r"(self_attn\.(q|k|v|o)_proj|mlp\.(gate|up|down)_proj)\.linear")
 
 
 def write_adapter(sd, rank, out_dir):
@@ -110,7 +187,9 @@ def run_export(npz_path, out_dir, scheme="uniform"):
     z = np.load(npz_path)
     flat = {k.removeprefix("lora/"): z[k] for k in z.files
             if "/lora/" in k or k.startswith("lora/")}
-    sd = map_llm_loras(flat)
+    llm_flat, vis_flat = split_flat(flat)
+    sd = map_llm_loras(llm_flat)
+    sd.update(map_vision_loras(vis_flat))
     if scheme == "prod":
         # prod 前向已带 peft 同款缩放 → 张量原样导出,配置声明
         # rank/alpha_pattern + rsLoRA(与 torch 生产 adapter 同款)
@@ -182,7 +261,9 @@ def run_selftest_jax(out_dir, rank=8, scheme="uniform"):
 
     flat = {"/".join(getattr(k, "key", str(k)) for k in p): np.asarray(v)
             for p, v in jax.tree_util.tree_flatten_with_path(lora_vals)[0]}
-    sd = map_llm_loras(flat)
+    llm_flat, vis_flat = split_flat(flat)
+    sd = map_llm_loras(llm_flat)
+    sd.update(map_vision_loras(vis_flat))
     if scheme == "prod":
         from jax_impl.prod_lora import prod_adapter_config, E2B_GLOBAL_LAYERS
         from safetensors.numpy import save_file

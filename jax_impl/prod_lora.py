@@ -100,6 +100,9 @@ def prod_adapter_config(base_model="google/gemma-4-e2b-it",
         "rank_pattern": rank_pattern, "alpha_pattern": alpha_pattern,
         "target_modules": (r".*language_model\.layers\.\d+\."
                            r"(self_attn\.(q|k|v|o)_proj|"
-                           r"mlp\.(gate|up|down)_proj)"),
+                           r"mlp\.(gate|up|down)_proj)"
+                           r"|.*vision_tower\.encoder\.layers\.\d+\."
+                           r"(self_attn\.(q|k|v|o)_proj|"
+                           r"mlp\.(gate|up|down)_proj)\.linear"),
         "task_type": None, "base_model_name_or_path": base_model,
     }

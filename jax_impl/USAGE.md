@@ -28,18 +28,28 @@ S0 环境 → S1 stage a → S2 stage b → S3 hard_mining → S4 aux_heads
 ```bash
 # 仓库已公开只读,免认证直接拉(注意 leeway-main 全小写;
 # 报 docker.sock permission denied 时用 sudo 或把用户加进 docker 组)
-docker pull europe-west4-docker.pkg.dev/leeway-main/anker/jax:v1.6   # 用最新 tag(旧 tag 各有已修缺陷,勿用)
+docker pull europe-west4-docker.pkg.dev/leeway-main/anker/jax:v1.7   # 用最新 tag(旧 tag 各有已修缺陷,勿用)
 
 > **日志落盘**(v1.5+): 训练/推理/KTO 启动后自动把全部输出(含 libtpu C++
 > 报错)追加写入 `<--out 目录>/train.log`;`--out` 在挂载目录下时日志即
 > 持久化在宿主机,`docker rm` 不丢。`docker logs` 照常可用。启动横幅
 > `[logtee] 代码位置:` 显示实际加载的代码路径(/workspace=挂载代码,
 > /app=镜像内代码),排"跑的哪份代码"一眼定位。
+
+> **训练口径对齐 torch 生产(v1.7+,默认开启)**:
+> ① 每 epoch 固定 seed 重洗(`--seed`);② lr 日程 warmup 300 + 线性衰
+> 减到 0(`--warmup/--lr-schedule`),weight_decay=0,vision LoRA 2e-5,
+> LoRA+ B 矩阵 lr×16(`--vision-lr/--loraplus-ratio`);③ val 按
+> camera 整组切分、先切后复制、val 永不注入 CoT,val_n 自动对齐
+> DP×BS;**评测/交付用 `train_params_best.npz`(val 最优),
+> `train_params.npz` 是最后一步**。想还原旧行为: `--lr-schedule
+> constant --warmup 0 --weight-decay 1e-4 --vision-lr 1e-4
+> --loraplus-ratio 1`。
 # TPU VM 上运行(--privileged + /dev 使容器可见 TPU;GCS 凭据走 VM metadata):
 docker run --rm --privileged --net=host \
   --ulimit nofile=1048576:1048576 --ulimit memlock=-1 \
   -v /dev:/dev -v $PWD:/workspace -v /path/DATA:/data -w /workspace \
-  europe-west4-docker.pkg.dev/leeway-main/anker/jax:v1.6 \
+  europe-west4-docker.pkg.dev/leeway-main/anker/jax:v1.7 \
   python jax_impl/train_sft.py --labels /data/labels.jsonl ...
 # 镜像内已烘入代码与全 pin 依赖(jax 0.10.2 + gemma@09e7b48);
 # 镜像 tag 与 git commit 一一对应(另有同内容的 git-sha tag 供精确指认);

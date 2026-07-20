@@ -480,9 +480,11 @@ def main():
     flat = jax.tree_util.tree_flatten_with_path(train)[0]
     np.savez(os.path.join(a.out, "train_params.npz"),
              **{_path_str(p): np.asarray(v) for p, v in flat})
+    from jax_impl.logtee import code_version
     json.dump({"loss_history": hist, "rank": a.rank, "dp": DP,
                "best_val": list(best), "seed": a.seed,
-               "lr_schedule": a.lr_schedule, "warmup": a.warmup},
+               "lr_schedule": a.lr_schedule, "warmup": a.warmup,
+               "code_commit": code_version()},
               open(os.path.join(a.out, "train_meta.json"), "w"))
     has_best = os.path.exists(os.path.join(a.out, "train_params_best.npz"))
     print(f"[save] {a.out} (loss {hist[0]:.3f} -> {hist[-1]:.3f}, "

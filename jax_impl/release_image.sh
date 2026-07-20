@@ -1,43 +1,34 @@
 #!/usr/bin/env bash
-# 镜像发布(唯一入口)—— 强制"代码=镜像=文档"三方同步。
+# 环境镜像发布 —— 仅当**依赖**变化时使用(jax/gemma/pip 包/基础镜像)。
 #
-#   bash jax_impl/release_image.sh v1.2
+#   sudo bash jax_impl/release_image.sh env-v2
 #
-# 铁律(v1 事故的教训: 构建时机早于修复,镜像带已知 bug 上线):
-#   1. 工作区必须 clean —— 镜像内容严格等于当前 commit;
-#   2. 双 tag: 语义版本 + git short-sha,不可变、不复用、永不用 latest;
-#   3. 构建后抽查关键文件在镜像内(防 COPY 漏挂);
-#   4. 结束打印 USAGE.md 待更新提醒(引用版本号)。
+# v1.8 之后代码与镜像分离: 代码改动只需 git push,客户 git pull + 重启
+# 容器即生效,不发新镜像。本脚本只在环境变化时出场,tag 用 env-vN 语义。
+# (注意用 sudo 而非 sudo -E: -E 保留 HOME 会让 docker 读错凭据文件)
 set -e
 cd "$(dirname "$0")/.."
-VER=${1:?用法: release_image.sh <语义版本,如 v1.2>}
+VER=${1:?用法: release_image.sh <环境版本,如 env-v2>}
+case "$VER" in env-v*) ;; *) echo "❌ 环境 tag 须为 env-vN 形式"; exit 1;; esac
 AR=europe-west4-docker.pkg.dev/leeway-main/anker/jax
 
-if [ -n "$(git status --porcelain)" ]; then
-  echo "❌ 工作区不 clean —— 先提交/清理,保证镜像内容≡commit"; exit 1
+if [ -n "$(git status --porcelain jax_impl/Dockerfile)" ]; then
+  echo "❌ Dockerfile 未提交 —— 环境定义必须先进 git"; exit 1
 fi
 SHA=$(git rev-parse --short HEAD)
-echo "[release] commit=$SHA -> $AR:{$VER,$SHA}"
+echo "[release] 环境镜像 $AR:$VER(Dockerfile@$SHA)"
 
 docker build -t "anker-jax:$VER" -f jax_impl/Dockerfile .
 
-# 内容抽查: 近期修复的关键标记必须在镜像内(按需追加)
-docker run --rm "anker-jax:$VER" sh -c '
-  set -e
-  grep -q base_p /app/jax_impl/kto.py
-  grep -q TPU_PROCESS_ADDRESSES /app/jax_impl/infer_sharded.sh
-  grep -q _disable_ktyping /app/jax_impl/prefetch.py
-  grep -q load_lora_strict /app/jax_impl/npz_io.py
-  grep -q rank-scheme /app/jax_impl/infer.py
-  grep -q split_by_camera /app/jax_impl/data.py
-  echo content-check OK'
+# 环境抽查: 依赖版本断言(构建期 selfcheck 已跑,这里防缓存伪影)
+docker run --rm "anker-jax:$VER" python -c "
+import jax; assert jax.__version__ == '0.10.2'
+from gemma import gm; assert hasattr(gm.nn, 'Gemma4_E2B')
+print('env content-check OK')"
 
 docker tag "anker-jax:$VER" "$AR:$VER"
-docker tag "anker-jax:$VER" "$AR:$SHA"
 docker push "$AR:$VER"
-docker push "$AR:$SHA"
 
 echo
-echo "✅ 已发布 $AR:$VER(= commit $SHA)"
-echo "➡️  勿忘: 更新 jax_impl/USAGE.md 中的镜像版本引用为 $VER 并提交"
-grep -n "anker/jax:v" jax_impl/USAGE.md | head -3
+echo "✅ 已发布环境镜像 $AR:$VER"
+echo "➡️  勿忘: 更新 jax_impl/USAGE.md 镜像引用,并通知所有使用者 docker pull"

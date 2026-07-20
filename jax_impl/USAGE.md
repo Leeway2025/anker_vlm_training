@@ -24,17 +24,30 @@ S0 环境 → S1 stage a → S2 stage b → S3 hard_mining → S4 aux_heads
 
 ## S0. 一次性准备
 
-**方式一(推荐,团队对齐):Docker 镜像**
+**方式一(推荐,团队对齐):环境镜像 + git 代码**
+
+> **版本口径(重要,v1.8 起代码与镜像分离)**:
+> | 组件 | 版本载体 | 更新动作 | 频率 |
+> |---|---|---|---|
+> | 代码(jax_impl/…) | git commit | `git pull` + 重启容器 | 每次修复 |
+> | 环境(jax/gemma 依赖) | 镜像 tag `env-vN` | `docker pull` | 仅依赖变化,少见 |
+>
+> 镜像是**纯环境件**(不含代码);代码经 `-v $PWD:/workspace` 挂载进
+> 容器,跑的永远是宿主机 git 仓库的版本。启动横幅 `[logtee] 代码:
+> commit xxxx` 直接显示在跑的代码版本。历史 v1.x tag(含代码快照)
+> 已废弃,勿再使用。
+
 ```bash
 # 仓库已公开只读,免认证直接拉(注意 leeway-main 全小写;
 # 报 docker.sock permission denied 时用 sudo 或把用户加进 docker 组)
-docker pull europe-west4-docker.pkg.dev/leeway-main/anker/jax:v1.8   # 用最新 tag(旧 tag 各有已修缺陷,勿用)
+docker pull europe-west4-docker.pkg.dev/leeway-main/anker/jax:env-v1
+git clone https://github.com/Leeway2025/anker_vlm_training.git && cd anker_vlm_training
 
 > **日志落盘**(v1.5+): 训练/推理/KTO 启动后自动把全部输出(含 libtpu C++
 > 报错)追加写入 `<--out 目录>/train.log`;`--out` 在挂载目录下时日志即
 > 持久化在宿主机,`docker rm` 不丢。`docker logs` 照常可用。启动横幅
-> `[logtee] 代码位置:` 显示实际加载的代码路径(/workspace=挂载代码,
-> /app=镜像内代码),排"跑的哪份代码"一眼定位。
+> `[logtee] 代码: commit xxxx` 显示实际加载的代码版本与路径,
+> 排"跑的哪份代码"一眼定位。
 
 > **训练口径对齐 torch 生产(v1.7+,默认开启)**:
 > ① 每 epoch 固定 seed 重洗(`--seed`);② lr 日程 warmup 300 + 线性衰
@@ -49,21 +62,21 @@ docker pull europe-west4-docker.pkg.dev/leeway-main/anker/jax:v1.8   # 用最新
 > **目标格式改为无空格(v1.8+,与 GT 逐字节一致)**: 训练目标从
 > `"B | i | desc"` 改为 `"B|i|desc"`(torch/客户生产口径)。v1.7 及
 > 之前训的 checkpoint 输出带空格 —— 评测解析两种都认,但交付口径不同,
-> **正式轮请直接用 ≥v1.8 训练**。另: eval_metrics 缺失预测在全部指标
+> **正式轮请 git pull 至最新代码后训练**。另: eval_metrics 缺失预测在全部指标
 > 中记错(旧版安全召回分母漏计);export/import 遇视觉塔 LoRA 无映射
 > 时响亮告警(权重留在源文件,不丢失);aux 标注低置信度整条屏蔽
 > (`--aux-conf-threshold`,默认 0.5,attributes 无 confidence 字段则
 > 视为 1.0 不受影响)。
-# TPU VM 上运行(--privileged + /dev 使容器可见 TPU;GCS 凭据走 VM metadata):
+# TPU VM 上运行(--privileged + /dev 使容器可见 TPU;GCS 凭据走 VM metadata;
+# -v $PWD:/workspace 挂载代码 —— 必挂,忘挂会直接报"找不到 jax_impl"):
 docker run --rm --privileged --net=host \
   --ulimit nofile=1048576:1048576 --ulimit memlock=-1 \
   -v /dev:/dev -v $PWD:/workspace -v /path/DATA:/data -w /workspace \
-  europe-west4-docker.pkg.dev/leeway-main/anker/jax:v1.8 \
+  europe-west4-docker.pkg.dev/leeway-main/anker/jax:env-v1 \
   python jax_impl/train_sft.py --labels /data/labels.jsonl ...
-# 镜像内已烘入代码与全 pin 依赖(jax 0.10.2 + gemma@09e7b48);
-# 镜像 tag 与 git commit 一一对应(另有同内容的 git-sha tag 供精确指认);
-# 发布新镜像一律走 jax_impl/release_image.sh(强制代码=镜像=文档同步);
-# 挂 -w /workspace 用宿主机代码,不挂则用镜像内固化版(严格对齐)
+# 代码更新: git pull && docker rm -f <容器> && 重新 docker run(运行中的
+# 训练不受 git pull 影响 —— 进程用的是启动时加载的版本);
+# 环境镜像发布(仅依赖变化)一律走 jax_impl/release_image.sh env-vN
 ```
 
 **方式二:裸机 venv**

@@ -1,17 +1,14 @@
-# JAX 训练路线容器 —— 团队环境对齐用(与 setup_jax_env.sh 同源,全 pin)。
+# JAX 训练路线 **环境镜像**(纯环境件,不含代码)。
 #
-# 构建(仓库根目录):
-#   docker build -t anker-jax:v1 -f jax_impl/Dockerfile .
-# 运行(TPU VM;--privileged + /dev 挂载让容器看到 TPU 芯):
+# 版本口径(v1.8 之后代码与镜像分离):
+#   - 代码版本 = git commit(运行时经 -v $PWD:/workspace 挂载)
+#   - 环境版本 = 本镜像 tag(env-vN),仅依赖变化时发新版
+# 运行(TPU VM):
 #   docker run --rm --privileged --net=host \
+#     --ulimit nofile=1048576:1048576 --ulimit memlock=-1 \
 #     -v /dev:/dev -v $PWD:/workspace -v /path/to/DATA:/data -w /workspace \
-#     anker-jax:v1 python jax_impl/train_sft.py \
-#       --labels /data/labels.jsonl --layout /data/hf_layout.json ...
-# 说明:
-#   - 镜像已烘入本仓库代码(/app);挂 -w /workspace 用宿主机最新代码,
-#     不挂则用镜像内固化版本(严格对齐场景);
-#   - GCS 凭据经 --net=host 走 VM metadata(gs://gemma-data 权重直读);
-#   - 非标准 GCE 机器(ct6e 等)须额外传 TPU_* 环境变量,见 FINDINGS。
+#     <镜像>:env-v1 python jax_impl/train_sft.py ...
+# 忘挂 /workspace 会直接报"找不到 jax_impl/..."(响亮失败,防静默跑错版本)。
 FROM python:3.12-slim-bookworm
 
 RUN apt-get update \
@@ -28,18 +25,12 @@ RUN pip install \
       "git+https://github.com/google-deepmind/gemma.git@09e7b48ae88720f6236b8266c7213eb51bb62b87" \
       kagglehub pillow numpy safetensors
 
-WORKDIR /app
-# jax_impl 及其依赖的纯 python 模块(已核验零 torch 依赖)
-COPY jax_impl/ /app/jax_impl/
-COPY data/__init__.py data/taxonomy.py data/formatting.py /app/data/
-COPY configs/ /app/configs/
-
-# 自检: 关键导入与 Gemma4 类存在(构建期即发现环境坏)
-RUN python -c "import jax, gemma; from gemma import gm; \
+# 环境自检(构建期即发现环境坏): 只查依赖,不查代码
+RUN python -c "import jax, gemma, PIL, numpy, safetensors; \
+    from gemma import gm; \
+    assert jax.__version__ == '0.10.2', jax.__version__; \
     assert hasattr(gm.nn, 'Gemma4_E2B'); \
-    import sys; sys.path.insert(0, '/app'); \
-    import jax_impl.prod_lora, jax_impl.prefetch; \
-    print('image selfcheck OK: jax', jax.__version__)"
+    print('env selfcheck OK: jax', jax.__version__)"
 
-ENV PYTHONPATH=/app
-CMD ["python", "-c", "print('anker-jax image ready; see jax_impl/USAGE.md')"]
+WORKDIR /workspace
+CMD ["python", "-c", "print('anker-jax env image; 代码请挂载 -v $PWD:/workspace,见 jax_impl/USAGE.md')"]

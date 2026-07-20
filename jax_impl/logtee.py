@@ -16,6 +16,21 @@ import sys
 _KEEP = []          # 防 tee 进程与管道被 GC
 
 
+def code_version():
+    """代码版本 = git commit(代码与镜像分离后,镜像 tag 只代表环境)。
+    容器内挂载目录属主与 root 不同 → safe.directory 豁免。"""
+    import subprocess
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        out = subprocess.run(
+            ["git", "-c", "safe.directory=*", "-C", root,
+             "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5).stdout.strip()
+        return out or "unknown"
+    except Exception:
+        return "unknown"
+
+
 def tee_stdio(out_dir, name="train.log"):
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, name)
@@ -51,6 +66,7 @@ def tee_stdio(out_dir, name="train.log"):
             pass
     atexit.register(_drain)
     print(f"[logtee] 日志同步落盘 -> {path}\n[logtee] argv: {' '.join(sys.argv)}"
-          f"\n[logtee] 代码位置: {os.path.abspath(__file__)}(排障用: 确认跑的是"
-          f"挂载代码还是镜像内代码)")
+          f"\n[logtee] 代码: commit {code_version()} @ "
+          f"{os.path.abspath(__file__)}(版本口径: 代码=git commit,"
+          f"镜像 tag=环境)")
     return path

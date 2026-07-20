@@ -38,6 +38,19 @@ def main():
                     help="prod=生产方案: 差异化 rank 512/256 + rsLoRA α=2r")
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--proj-lr", type=float, default=5e-4)
+    ap.add_argument("--vision-lr", type=float, default=2e-5,
+                    help="视觉塔 LoRA 学习率(torch 生产: 2e-5)")
+    ap.add_argument("--loraplus-ratio", type=float, default=16.0,
+                    help="LoRA+ : B 矩阵 lr 倍率(torch 生产: 16)")
+    ap.add_argument("--warmup", type=int, default=300,
+                    help="warmup 步数(opt step;torch 生产: 300)")
+    ap.add_argument("--lr-schedule", choices=["linear", "constant"],
+                    default="linear",
+                    help="linear=warmup+线性衰减到 0(torch Trainer 默认)")
+    ap.add_argument("--weight-decay", type=float, default=0.0,
+                    help="torch 生产 wd=0;旧版隐含 optax 默认 1e-4")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="shuffle 与 val 切分种子")
     ap.add_argument("--rank", type=int, default=16)
     ap.add_argument("--label-smoothing", type=float, default=0.1)
     ap.add_argument("--train-vision", action="store_true")
@@ -139,14 +152,22 @@ def main():
     from jax_impl.data import load_jsonl_map
     tok = gm.text.Gemma4Tokenizer()
     sw = json.load(open(a.sample_weights)) if a.sample_weights else None
+    # val_n 对齐 DP*BS: 旧版 val_n < DP*BS 时 eval 空转、val_loss 恒 0
+    vn = 0
+    if a.eval_every and a.val_n:
+        g = DP * BS
+        vn = ((a.val_n + g - 1) // g) * g
+        if vn != a.val_n:
+            print(f"[data] val_n {a.val_n} -> {vn}(对齐 DP*BS={g})")
     full = SftDataset(
         a.labels, a.layout, tok, wds_dir=a.wds_dir, sample_weights=sw,
         reasoning=load_jsonl_map(a.cot_file) if a.cot_file else None,
         cot_ratio=a.cot_ratio,
-        attributes=load_jsonl_map(a.aux_file) if a.aux_file else None)
-    val_idx = list(range(len(full)))[-a.val_n:]
-    train_idx = [i for i in range(len(full)) if i not in set(val_idx)]
-    print(f"[data] train={len(train_idx)} val={len(val_idx)} "
+        attributes=load_jsonl_map(a.aux_file) if a.aux_file else None,
+        seed=a.seed, val_n=vn)
+    train_idx, val_idx = full.train_idx, full.val_idx
+    print(f"[data] train={len(train_idx)} val={len(val_idx)}"
+          f"(按 camera 切分, seed={a.seed}, 先切后复制) "
           f"max_len={full.max_len}")
 
     # ---- lora 结构初始化(v1 坑 1: eval_shape 免物化)----
@@ -224,13 +245,43 @@ def main():
             msg += (f";⚠️ 全零 LoRA a 跳过 {st['zero_a_skip']} 叶"
                     f"(npz 来自未训 LoRA 的阶段,保留本次新初始化)")
         print(msg)
+    # lr 日程: warmup + 线性衰减到 0(对齐 torch Trainer 默认;MultiSteps
+    # 只在累积满时调用内层 update → 日程按 opt step 计数,与 torch 同拍)
+    def mk_sched(peak):
+        if a.lr_schedule == "constant":
+            return peak
+        return optax.join_schedules(
+            [optax.linear_schedule(0.0, peak, max(a.warmup, 1)),
+             optax.linear_schedule(peak, 0.0, max(a.steps - a.warmup, 1))],
+            [max(a.warmup, 1)])
+
+    # 分组对齐 torch 生产: vision LoRA 2e-5(旧版错用 1e-4,5×超速);
+    # LoRA+ B 矩阵 lr×16;aux 头随 LLM-A 组;wd 显式 0(optax 默认 1e-4
+    # 是 torch 没有的隐藏收缩力)
+    def _group(p, _):
+        k = _path_str(p)
+        if k.startswith("proj"):
+            return "proj"
+        vis = "vision_encoder" in k
+        b = k.endswith("/b")
+        if vis:
+            return "vis_b" if b else "vis_a"
+        return "llm_b" if b else "llm_a"
+    GROUP_LR = {"proj": a.proj_lr,
+                "llm_a": a.lr, "llm_b": a.lr * a.loraplus_ratio,
+                "vis_a": a.vision_lr,
+                "vis_b": a.vision_lr * a.loraplus_ratio}
     tx = optax.chain(
         optax.clip_by_global_norm(1.0),         # 对齐 torch max_grad_norm
         optax.multi_transform(
-            {"lora": optax.adamw(a.lr), "proj": optax.adamw(a.proj_lr)},
+            {g: optax.adamw(mk_sched(lr), weight_decay=a.weight_decay)
+             for g, lr in GROUP_LR.items()},
             param_labels=lambda tree: jax.tree_util.tree_map_with_path(
-                lambda p, _: "proj" if _path_str(p).startswith("proj")
-                else "lora", tree)))   # aux 头归入 lora 组 lr
+                _group, tree)))
+    print(f"[optim] {a.lr_schedule} warmup={a.warmup} wd={a.weight_decay} "
+          f"lr: llm_a={a.lr:g} llm_b={a.lr*a.loraplus_ratio:g} "
+          f"vis_a={a.vision_lr:g} vis_b={a.vision_lr*a.loraplus_ratio:g} "
+          f"proj={a.proj_lr:g}")
     optim = optax.MultiSteps(tx, every_k_schedule=a.accum)
     opt_state = optim.init(train0)
 
@@ -351,14 +402,26 @@ def main():
     cursor = 0
     t0 = time.time()
     total_micro = a.steps * a.accum
+    # 每 epoch 用固定 seed 重洗(旧版严格顺序循环: 同类样本成段 →
+    # batch 内梯度强相关;hard-mining 副本相邻 → 等效单步 lr×n)。
+    # 全部置换预生成 → 线程安全、prefetch/同步路径逐条一致、可复现
+    ep_len = len(train_idx)
+    _rs = np.random.RandomState(a.seed)
+    _perms = [_rs.permutation(ep_len)
+              for _ in range(total_micro * DP * BS // ep_len + 2)]
+    train_np = np.asarray(train_idx)
+
+    def draw(k):
+        e, i = divmod(k, ep_len)
+        return int(train_np[_perms[e][i]])
     switch_at = int(total_micro * (1 - a.cot_anneal)) if a.cot_file else -1
     pf = None
     if a.prefetch_workers > 0:
         from jax_impl.prefetch import BatchPrefetcher
-        pf = BatchPrefetcher(full,
-                             lambda k: train_idx[k % len(train_idx)],
+        pf = BatchPrefetcher(full, draw,
                              DP * BS, workers=a.prefetch_workers)
-        print(f"[prefetch] workers={a.prefetch_workers} depth=2")
+        print(f"[prefetch] workers={a.prefetch_workers} depth=2 "
+              f"(每 epoch 重洗, seed={a.seed})")
     for micro in range(total_micro):
         if switch_at >= 0 and micro == switch_at and not full.anneal:
             full.set_anneal(True)
@@ -370,8 +433,7 @@ def main():
             batch = tuple(jnp.asarray(v)
                           for v in (t_, l_, w_, p_, x_, al_, kl_))
         else:
-            idxs = [train_idx[(cursor + j) % len(train_idx)]
-                    for j in range(DP * BS)]
+            idxs = [draw(cursor + j) for j in range(DP * BS)]
             cursor += DP * BS
             batch = collect(idxs)
         train, opt_state, loss = train_step(train, opt_state, base, *batch)
@@ -395,8 +457,13 @@ def main():
                     vl.append(float(eval_loss_j(train, base, *vb)))
                 v = sum(vl) / max(len(vl), 1)
                 tag = ""
-                if v < best[0]:
+                if vl and v < best[0]:
                     best = (v, opt_step); tag = " *best"
+                    # best 即时落盘 —— 旧版只记 meta,交付的永远是最后
+                    # 一步(过拟合了也照存)
+                    bf = jax.tree_util.tree_flatten_with_path(train)[0]
+                    np.savez(os.path.join(a.out, "train_params_best.npz"),
+                             **{_path_str(p): np.asarray(x) for p, x in bf})
                 print(f"[eval] opt_step {opt_step} val_loss={v:.4f}{tag}",
                       flush=True)
 
@@ -412,10 +479,15 @@ def main():
     np.savez(os.path.join(a.out, "train_params.npz"),
              **{_path_str(p): np.asarray(v) for p, v in flat})
     json.dump({"loss_history": hist, "rank": a.rank, "dp": DP,
-               "best_val": list(best)},
+               "best_val": list(best), "seed": a.seed,
+               "lr_schedule": a.lr_schedule, "warmup": a.warmup},
               open(os.path.join(a.out, "train_meta.json"), "w"))
+    has_best = os.path.exists(os.path.join(a.out, "train_params_best.npz"))
     print(f"[save] {a.out} (loss {hist[0]:.3f} -> {hist[-1]:.3f}, "
-          f"best_val={best[0]:.4f}@{best[1]})")
+          f"best_val={best[0]:.4f}@{best[1]})"
+          + ("\n[save] 评测/交付请用 train_params_best.npz"
+             f"(val 最优 @step {best[1]});train_params.npz 是最后一步"
+             if has_best else ""))
 
 
 if __name__ == "__main__":

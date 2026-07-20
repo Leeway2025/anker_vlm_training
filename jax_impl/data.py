@@ -54,20 +54,58 @@ def load_jsonl_map(path):
             (json.loads(l) for l in open(path, encoding="utf-8"))}
 
 
+def split_by_camera(recs, val_size, seed=0):
+    """与 torch 侧 build_dataset.split_by_camera 同语义: 按摄像头整组
+    进 val,防"记住这个门廊"式泄漏;无 camera_id / unknown 退化为按
+    video_id。固定 seed → val 集跨运行稳定。"""
+    rng = random.Random(seed)
+    by_cam = {}
+    for r in recs:
+        cam = (r.get("meta") or {}).get("camera_id") or r["video_id"]
+        if cam == "unknown":
+            cam = r["video_id"]
+        by_cam.setdefault(cam, []).append(r)
+    cams = sorted(by_cam)
+    rng.shuffle(cams)
+    val, n = [], 0
+    for c in cams:
+        if n >= val_size:
+            break
+        val += by_cam[c]
+        n += len(by_cam[c])
+    val_ids = {r["video_id"] for r in val}
+    return [r for r in recs if r["video_id"] not in val_ids], val
+
+
 class SftDataset:
     def __init__(self, labels_file, layout_file, tokenizer, wds_dir=None,   # wds_dir 显式传入时覆盖 meta(见 load_frames)
                  max_label_len=64, cls_weight=4.0, sample_weights=None,
                  reasoning=None, cot_ratio=0.6, attributes=None,
-                 max_think_len=96, seed=0):
+                 max_think_len=96, seed=0, val_n=0):
         recs = [json.loads(l) for l in open(labels_file, encoding="utf-8")]
-        if sample_weights:                      # hard-mining 物理复制
-            out = []
-            for r in recs:
-                n = max(1, round(sample_weights.get(r["video_id"], 1.0)))
+        # 顺序铁律: 先切 val、再对 train 做 hard-mining 复制 —— 反过来
+        # 副本会横跨 train/val(泄漏,val loss 虚低)。torch 侧同序。
+        if val_n:
+            train_recs, val_recs = split_by_camera(recs, val_n, seed=seed)
+        else:
+            train_recs, val_recs = recs, []
+        if sample_weights:      # hard-mining 物理复制(流式最大余数法:
+            out = []            # round 会把 1.0<w<1.5 全截成 1,类上限失效)
+            acc = 0.0
+            for r in train_recs:
+                w = max(1.0, float(sample_weights.get(r["video_id"], 1.0)))
+                n = int(w)
+                acc += w - n
+                if acc >= 1.0:
+                    n += 1
+                    acc -= 1.0
                 out.extend([r] * n)
-            print(f"[hard-mining] {len(recs)} -> {len(out)} samples")
-            recs = out
-        self.recs = recs
+            print(f"[hard-mining] train {len(train_recs)} -> {len(out)}")
+            train_recs = out
+        self.recs = train_recs + val_recs
+        self.first_val = len(train_recs)        # ≥此下标 = val(无 CoT 注入)
+        self.train_idx = list(range(len(train_recs)))
+        self.val_idx = list(range(len(train_recs), len(self.recs)))
         self.wds_override = wds_dir            # 显式指定则最高优先
         self.wds = wds_dir or os.path.dirname(labels_file)
         lay = json.load(open(layout_file, encoding="utf-8"))
@@ -99,7 +137,10 @@ class SftDataset:
         desc_ids = self.tok.encode(f" {lb['description']}") + [EOT]
 
         think_ids = []
-        if (self.reasoning.get(vid) and not self.anneal
+        # val 样本(i >= first_val)永不注入 CoT: 保证 val loss 分布固定、
+        # 各次 eval 可比 —— 否则 best checkpoint 选择近似掷骰子
+        if (i < self.first_val and self.reasoning.get(vid)
+                and not self.anneal
                 and self.rng.random() < self.cot_ratio):
             r = self.reasoning[vid]
             txt = r.get("reasoning_chain") or (

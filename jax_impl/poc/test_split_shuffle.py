@@ -19,7 +19,10 @@ from jax_impl.data import SftDataset, split_by_camera
 
 class FakeTok:
     def encode(self, s):
-        return [ord(c) % 200 + 1 for c in s][:20]
+        return [ord(c) for c in s][:20]
+
+    def decode(self, ids):
+        return "".join(chr(t) for t in ids)
 
 
 d = tempfile.mkdtemp()

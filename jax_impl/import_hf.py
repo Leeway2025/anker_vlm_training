@@ -37,11 +37,20 @@ def import_adapter(adapter_dir):
     ten = {}
     pat = re.compile(r"language_model\.layers\.(\d+)\.(self_attn|mlp)"
                      r"\.(\w+_proj)\.lora_(A|B)\.weight$")
+    unmatched = []
     for k in f.keys():
         m = pat.search(k)
         if m:
             i, _, proj, ab = int(m.group(1)), m.group(2), m.group(3), m.group(4)
             ten[(i, proj, ab)] = f.get_tensor(k).astype(np.float32)
+        elif "lora" in k:
+            unmatched.append(k)
+    if unmatched:
+        vis = sum(1 for k in unmatched if "vision_tower" in k)
+        print(f"⚠️ [import] {len(unmatched)} 个 adapter 键无 JAX 映射、被丢弃"
+              f"(vision_tower {vis} 个)。源 adapter 文件不受影响;"
+              f"续训起点缺视觉适配 —— 若 torch 侧训过视觉塔,续训与其"
+              f"不完全等价。示例: {unmatched[0]}")
 
     import math
     r_of = {k: v.shape[0] for k, v in ten.items() if k[2] == "A"}

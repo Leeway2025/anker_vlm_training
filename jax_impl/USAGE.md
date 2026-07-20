@@ -28,7 +28,7 @@ S0 环境 → S1 stage a → S2 stage b → S3 hard_mining → S4 aux_heads
 ```bash
 # 仓库已公开只读,免认证直接拉(注意 leeway-main 全小写;
 # 报 docker.sock permission denied 时用 sudo 或把用户加进 docker 组)
-docker pull europe-west4-docker.pkg.dev/leeway-main/anker/jax:v1.7   # 用最新 tag(旧 tag 各有已修缺陷,勿用)
+docker pull europe-west4-docker.pkg.dev/leeway-main/anker/jax:v1.8   # 用最新 tag(旧 tag 各有已修缺陷,勿用)
 
 > **日志落盘**(v1.5+): 训练/推理/KTO 启动后自动把全部输出(含 libtpu C++
 > 报错)追加写入 `<--out 目录>/train.log`;`--out` 在挂载目录下时日志即
@@ -45,11 +45,20 @@ docker pull europe-west4-docker.pkg.dev/leeway-main/anker/jax:v1.7   # 用最新
 > `train_params.npz` 是最后一步**。想还原旧行为: `--lr-schedule
 > constant --warmup 0 --weight-decay 1e-4 --vision-lr 1e-4
 > --loraplus-ratio 1`。
+
+> **目标格式改为无空格(v1.8+,与 GT 逐字节一致)**: 训练目标从
+> `"B | i | desc"` 改为 `"B|i|desc"`(torch/客户生产口径)。v1.7 及
+> 之前训的 checkpoint 输出带空格 —— 评测解析两种都认,但交付口径不同,
+> **正式轮请直接用 ≥v1.8 训练**。另: eval_metrics 缺失预测在全部指标
+> 中记错(旧版安全召回分母漏计);export/import 遇视觉塔 LoRA 无映射
+> 时响亮告警(权重留在源文件,不丢失);aux 标注低置信度整条屏蔽
+> (`--aux-conf-threshold`,默认 0.5,attributes 无 confidence 字段则
+> 视为 1.0 不受影响)。
 # TPU VM 上运行(--privileged + /dev 使容器可见 TPU;GCS 凭据走 VM metadata):
 docker run --rm --privileged --net=host \
   --ulimit nofile=1048576:1048576 --ulimit memlock=-1 \
   -v /dev:/dev -v $PWD:/workspace -v /path/DATA:/data -w /workspace \
-  europe-west4-docker.pkg.dev/leeway-main/anker/jax:v1.7 \
+  europe-west4-docker.pkg.dev/leeway-main/anker/jax:v1.8 \
   python jax_impl/train_sft.py --labels /data/labels.jsonl ...
 # 镜像内已烘入代码与全 pin 依赖(jax 0.10.2 + gemma@09e7b48);
 # 镜像 tag 与 git commit 一一对应(另有同内容的 git-sha tag 供精确指认);

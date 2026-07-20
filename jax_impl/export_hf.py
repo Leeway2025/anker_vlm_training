@@ -30,13 +30,17 @@ def map_llm_loras(flat):
     out = {}
     pre = "base_model.model.model.language_model.layers"
     by_mod = {}
+    skipped = []          # 有映射盲区必须出声(视觉塔/embedder LoRA)
     for p, v in flat.items():
         if not (p.startswith("lora/") or p.startswith("layer_")
                 or "/layer_" in p):
+            if p.startswith("lora/"):
+                skipped.append(p)
             continue
         parts = p.split("/")
         li = next((x for x in parts if x.startswith("layer_")), None)
         if li is None:
+            skipped.append(p)
             continue
         i = int(li.split("_")[1])
         kind = ("q" if "q_einsum" in p else
@@ -45,9 +49,17 @@ def map_llm_loras(flat):
                 "gate_up" if "gating_einsum" in p else
                 "down" if "/mlp/" in p else None)
         if kind is None:
+            skipped.append(p)
             continue
         ab = "a" if p.endswith("/a") else "b"
         by_mod.setdefault((i, kind), {})[ab] = np.asarray(v, np.float32)
+
+    if skipped:
+        vis = sum(1 for k in skipped if "vision_encoder" in k)
+        print(f"⚠️ [export] {len(skipped)} 个 LoRA 键无 HF 映射、未导出"
+              f"(vision_encoder {vis} 个)。权重仍完整保留在源 npz,"
+              f"不丢失;JAX 侧推理不受影响,仅 torch 交付缺视觉适配。"
+              f"示例: {skipped[0]}")
 
     for (i, kind), d in sorted(by_mod.items()):
         a, b = d.get("a"), d.get("b")

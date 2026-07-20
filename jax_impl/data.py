@@ -3,7 +3,8 @@
 样本 = 模板 ids(HF 基准排布,Gate B 已逐位对齐)+ label ids + 权重:
   - 模板来自 poc/02a 导出的 hf_layout.json(生产 prompt + 16 帧排布),
     视频占位 258884 → 哨兵 -2(Gate C 配方)
-  - label: "{RT} | {SubKS} | {desc}";分类段 ×4,desc ×1,think 段 ×0
+  - label: "{RT}|{SubKS}|{desc}"(无空格,与 GT 逐字节一致);
+    分类段 ×4,desc ×1,think 段 ×0
     (与 torch 侧 loss 设计一致)
   - 固定 padding 到 max_len(XLA 静态形状)
 支持: hard-mining 物理复制 / implicit-CoT(比例混合+退火)/ aux 标签。
@@ -81,7 +82,8 @@ class SftDataset:
     def __init__(self, labels_file, layout_file, tokenizer, wds_dir=None,   # wds_dir 显式传入时覆盖 meta(见 load_frames)
                  max_label_len=64, cls_weight=4.0, sample_weights=None,
                  reasoning=None, cot_ratio=0.6, attributes=None,
-                 max_think_len=96, seed=0, val_n=0):
+                 max_think_len=96, seed=0, val_n=0,
+                 aux_conf_threshold=0.5):
         recs = [json.loads(l) for l in open(labels_file, encoding="utf-8")]
         # 顺序铁律: 先切 val、再对 train 做 hard-mining 复制 —— 反过来
         # 副本会横跨 train/val(泄漏,val loss 虚低)。torch 侧同序。
@@ -119,6 +121,7 @@ class SftDataset:
         self.anneal = False                     # True → 纯生产模式
         self.max_think = max_think_len if self.reasoning else 0
         self.attributes = attributes or {}      # video_id → 资产 A
+        self.aux_conf = aux_conf_threshold
         self.rng = random.Random(seed)
         self.max_len = len(self.template) + self.max_think + max_label_len
 
@@ -132,9 +135,18 @@ class SftDataset:
         rec = self.recs[i]
         lb = rec["labels"]
         vid = rec["video_id"]
-        cls_ids = self.tok.encode(
-            f"{lb['role_type']} | {lb['sub_keyscene']} |")
-        desc_ids = self.tok.encode(f" {lb['description']}") + [EOT]
+        # 目标与 GT 逐字节一致: "{RT}|{SK}|{desc}"(无空格;旧版 " | "
+        # 与客户生产口径不符,跨框架续训 token 序列冲突 —— B4 修复)。
+        # 整串单次分词: 无空格交界会并子词,分段 encode 拼接≠真实序列;
+        # 权重按字符覆盖回填(与 torch offset 语义一致): 与 cls 前缀
+        # 有重叠的 token ×cls_w,其余 ×1
+        cls_txt = f"{lb['role_type']}|{lb['sub_keyscene']}|"
+        tgt_ids = self.tok.encode(cls_txt + str(lb["description"]).strip())
+        tgt_w, start = [], 0
+        for k in range(1, len(tgt_ids) + 1):   # 注意勿用 i(样本下标)
+            end = len(self.tok.decode(tgt_ids[:k]))
+            tgt_w.append(self.cls_w if start < len(cls_txt) else 1.0)
+            start = end
 
         think_ids = []
         # val 样本(i >= first_val)永不注入 CoT: 保证 val loss 分布固定、
@@ -149,9 +161,9 @@ class SftDataset:
                 f"[Conclusion] {r.get('conclusion', '')}")
             think_ids = self.tok.encode(txt)[: self.max_think]
 
-        lab = (list(think_ids) + list(cls_ids) + list(desc_ids))
+        lab = list(think_ids) + list(tgt_ids) + [EOT]
         w = ([0.0] * len(think_ids)             # think 段权重 0(隐式 CoT)
-             + [self.cls_w] * len(cls_ids) + [1.0] * len(desc_ids))
+             + tgt_w + [1.0])
         cap = self.max_think + self.max_label_len
         lab, w = lab[:cap], w[:cap]
 
@@ -167,7 +179,11 @@ class SftDataset:
         # 辅助头标签: 资产 A 的 7 属性 + KS 父类(6 类)
         attrs = self.attributes.get(vid, {})
         av = attrs.get("attributes", attrs)
-        aux = np.array([aux_label_index(h, av.get(h, "")) if av else -100
+        # 置信度门(对齐 torch): 低置信 Gemini 标注整条屏蔽,
+        # 否则辅助头在带噪标签上训练
+        low_conf = float(attrs.get("confidence", 1.0)) < self.aux_conf
+        aux = np.array([aux_label_index(h, av.get(h, ""))
+                        if (av and not low_conf) else -100
                         for h in AUX_HEAD_ORDER], np.int32)
         ks = KS_CLASSES.index(KS_GROUP[lb["sub_keyscene"]]) \
             if lb["sub_keyscene"] in KS_GROUP else -100

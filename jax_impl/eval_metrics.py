@@ -38,12 +38,16 @@ def main():
         vid = j["video_id"]
         rt, sk = j["labels"]["role_type"], j["labels"]["sub_keyscene"]
         n += 1
+        # 口径统一(v1.8 修复): 缺失预测在所有指标中一律记错 ——
+        # 旧版 continue 跳过了安全召回/每类统计的分母,分片推理只完成
+        # 一部分时 acc 偏低而安全召回虚高,两个指标互相矛盾
         if vid not in preds:
             miss += 1
-            continue
-        prt, psk = parse_output(preds[vid])
-        if prt is not None:
-            fmt_ok += 1
+            prt = psk = None
+        else:
+            prt, psk = parse_output(preds[vid])
+            if prt is not None:
+                fmt_ok += 1
         rt_ok += (prt == rt)
         sk_ok += (psk == sk)
         both_ok += (prt == rt and psk == sk)
@@ -60,6 +64,9 @@ def main():
         return f"{100.0 * x / max(d, 1):.2f}%"
 
     print(f"samples={n} missing_pred={miss} 格式合规={pct(fmt_ok, n - miss)}")
+    if miss:
+        print(f"⚠️ {miss} 条无预测,已在全部指标中记错(含安全召回);"
+              f"若为分片未跑完,请先补齐再下结论")
     print(f"RoleType acc   = {pct(rt_ok, n)}")
     print(f"SubKS    acc   = {pct(sk_ok, n)}")
     print(f"RT+SubKS acc   = {pct(both_ok, n)}")

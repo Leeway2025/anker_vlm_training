@@ -294,6 +294,11 @@ def main():
              for g, lr in GROUP_LR.items()},
             param_labels=lambda tree: jax.tree_util.tree_map_with_path(
                 _group, tree)))
+    if a.rank_scheme == "prod" and a.lr * a.loraplus_ratio > 1e-4:
+        print("⚠️ [optim] prod 方案 + 高 lr/LoRA+ 组合: rsLoRA scale(32/45)"
+              "叠加后有效步长过热,实测会把视觉→字母回路训死"
+              "(FINDINGS v7 过拟合消融)。已验证配方: --lr 2e-5 "
+              "--loraplus-ratio 1")
     print(f"[optim] {a.lr_schedule} warmup={a.warmup} wd={a.weight_decay} "
           f"lr: llm_a={a.lr:g} llm_b={a.lr*a.loraplus_ratio:g} "
           f"vis_a={a.vision_lr:g} vis_b={a.vision_lr*a.loraplus_ratio:g} "

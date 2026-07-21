@@ -119,6 +119,10 @@ bash jax_impl/setup_jax_env.sh /path/to/venv_jax
   (4 芯配 64)。`--steps`: 1 epoch = 样本数 ÷ 256,一般跑 3 epoch。
   `--rank-scheme prod` = 与 torch 生产同款:差异化 rank(全局层 512/
   滑动层与视觉 256)+ rsLoRA(α=2r)。
+  **⚠️ prod 必须配冷学习率: `--lr 2e-5 --loraplus-ratio 1`**(2026-07-21
+  过拟合消融定案: rsLoRA scale 32/45 叠加默认 lr 1e-4×LoRA+16 后有效
+  步长过热,视觉→字母回路被训死,模型输出常数字母;冷配方 64 样本
+  过拟合 100% 通过,热配方 0%)。
 - **产物**:`outputs/jax_b/train_params.npz`;日志含 train loss、
   `[eval] val_loss`(带 *best 标记)。
 - **验收**:val_loss 收敛;S8 评测 SubKS/RT 明显高于基线。

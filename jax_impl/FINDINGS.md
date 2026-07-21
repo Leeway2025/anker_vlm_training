@@ -285,3 +285,17 @@ v3 关键经验:
   同理。导出告警只对非零键出声。
 - 已知边界: torch→JAX import 的视觉方向未做(场景=拿 torch 视觉适配
   续训,有告警);clip 包装内外的 LoRA 挂点差异属二阶效应,未观测。
+
+## v6(2026-07-21): infer 空输出根因 —— remove_mm_logits 旁路漏打
+
+- 症状: eval_preds 的 output 全空。根因: gm 前向会压缩视觉位 logits
+  (_transformer.py remove_mm_logits),train_sft/kto 打了恒等旁路而
+  infer.py 漏打 → 读 pos-1 的 logits 全长错位(jnp 越界索引静默 clip
+  到末行,雪上加霜)→ 首 token 恒命中换行/EOT。
+- 真机 A/B(v6e-4,base 模型): 旧码 → 60 个换行/空串;修复 →
+  'D|m|Numbers displayed on screen'(base 即按 prompt 出 GT 无空格格式)。
+- 教训: v1.6 冒烟时 infer 输出全换行曾被误归因"假数据+2 步微调"——
+  **烟测输出是垃圾时必须跑 base 对照组**,base 也垃圾即实现 bug。
+  已加双哨兵: infer 统计空输出条数;infer_sharded 合并后报空占比。
+- 附带: infer_sharded 全分片成功后自动清理中间文件(失败保留续跑,
+  KEEP_SHARDS=1 可保留),日志并入 <OUT>.infer.log。

@@ -106,10 +106,11 @@ sudo docker run --rm -v $PWD:/workspace -w /workspace \
 | Gemini 标注、数据资产 A/C/D、euno-wds 转换 | torch 侧工具(`annotation/`,`data/euno_wds.py`) |
 | hf_layout.json 生成(一次性,改 prompt 才重跑) | torch venv(`jax_impl/poc/02a`) |
 | RKLLM 端侧交付(拆分/合并/onnx/Issue #480) | torch 侧(`export/`,`docs/issue480_workaround.py`) |
-| 回退兜底 | torch 全流程保留可用(下节) |
 
-adapter 在 HF peft 格式层双向互换,任何时刻可整体退回 torch 路线
-(数据、格式、超参三层兼容)。
+**训练/推理/评测只在 JAX 端进行(2026-07-21 定)**;torch 训练代码转为
+归档状态(可用但不再维护演进)。超参以 JAX 端实测为准、独立标定,
+不再以"对齐 torch 配置"为目标(v7 教训: 同款超参在不同实现下动力学
+可以完全不同,照搬≠安全)。
 
 ## 结构
 

@@ -10,12 +10,81 @@
 约 1.4h/epoch),编译 2 分钟(torch_xla 15~30 分钟),全流程已在客户
 v6e-8 投产。
 
+### 全局一图
+
+```
+你准备的数据                    训练(JAX, v6e)                交付
+┌────────────────────┐   ┌──────────────────────────┐   ┌──────────────────┐
+│ labels.jsonl        │   │ S1 projector 预热(分钟级)│   │ S9 export_hf     │
+│ (meta.wds_dir 指向) │ → │ S2 主训 3 epoch (~4.4h)   │ → │ → peft adapter   │
+│ shard-*.tar 视频分片 │   │ [S3~S7 可选增强]          │   │ (含视觉塔 LoRA)  │
+│ hf_layout.json 模板 │   │ 产物: train_params_best   │   │ → RKLLM 端侧链   │
+└────────────────────┘   │ S8 sharded 评测 (~2.5h)   │   └──────────────────┘
+                          └──────────────────────────┘
+```
+
+### 你需要准备的三样东西
+
+| 东西 | 说明 | 没有怎么办 |
+|---|---|---|
+| `labels.jsonl` | 每行一个视频: labels + `meta.wds_dir/shard`(分片定位以它为准) | 用 `data/euno_wds.py` 从标注 json 生成 |
+| `shard-*.tar` | 视频帧分片(每条 16 帧 JPEG 的 .pyd) | 数据方提供;容器内按 meta.wds_dir **同名路径挂载** |
+| `hf_layout.json` | prompt+16 帧的 token 排布模板(一次性) | torch venv 跑 `jax_impl/poc/02a_dump_hf_layout.py`;改 prompt 才需重跑 |
+
+### 第一次上手:端到端最小路径(v6e-8 实测时长)
+
 ```bash
-# 快速开始(TPU VM;镜像=纯环境件,代码=git commit,两者分离)
+# ⓪ 环境(一次性): 拉环境镜像 + 拉代码 —— 以后升级只需 git pull,镜像不动
 docker pull europe-west4-docker.pkg.dev/leeway-main/anker/jax:env-v1
 git clone https://github.com/Leeway2025/anker_vlm_training.git && cd anker_vlm_training
-# 逐阶段照做: jax_impl/USAGE.md(S0 环境 → S1/S2 训练 → … → S8 评测 → S9 导出)
+
+# ① 训练(stage b 主训;~10 万样本 3 epoch ≈ 4.4h)
+sudo docker run -d --name jax5b --privileged --net=host \
+  --ulimit nofile=1048576:1048576 --ulimit memlock=-1 \
+  -v /dev:/dev -v $PWD:/workspace -v /你的数据目录:/data \
+  -v /分片真实路径:/分片真实路径 -w /workspace \
+  europe-west4-docker.pkg.dev/leeway-main/anker/jax:env-v1 \
+  python jax_impl/train_sft.py \
+    --labels /data/labels.jsonl --layout /data/hf_layout.json \
+    --rank-scheme prod --train-vision --train-projector \
+    --accum 32 --steps 1148 --prefetch-workers 24 \
+    --eval-every 100 --val-n 512 --out outputs/jax_5b
+tail -f outputs/jax_5b/train.log        # 日志自动落盘;loss 应 8.x 起步稳降
+
+# ② 评测(8 芯并行 ≈ 2.5h/万条;⚠️ 别用单进程 infer.py,吞吐只有 1 芯)
+sudo docker run -d --name jaxeval --privileged --net=host \
+  --ulimit nofile=1048576:1048576 --ulimit memlock=-1 \
+  -v /dev:/dev -v $PWD:/workspace -v /你的数据目录:/data -w /workspace \
+  europe-west4-docker.pkg.dev/leeway-main/anker/jax:env-v1 \
+  bash jax_impl/infer_sharded.sh python \
+    /data/labels_test.jsonl /data/hf_layout.json \
+    outputs/eval_preds outputs/jax_5b/train_params_best.npz
+sudo docker run --rm -v $PWD:/workspace -w /workspace \
+  europe-west4-docker.pkg.dev/leeway-main/anker/jax:env-v1 \
+  python jax_impl/eval_metrics.py --preds outputs/eval_preds.jsonl \
+    --labels /data/labels_test.jsonl --per-class     # 报错就把 /data 也挂上
+
+# ③ 导出交付(分钟级)
+sudo docker run --rm -v $PWD:/workspace -w /workspace \
+  europe-west4-docker.pkg.dev/leeway-main/anker/jax:env-v1 \
+  python jax_impl/export_hf.py --npz outputs/jax_5b/train_params_best.npz \
+    --out outputs/final_adapter_hf --scheme prod
+# 产物 = 标准 peft adapter(含视觉塔 LoRA),直接进 torch 侧 RKLLM 导出链
 ```
+
+关键产物口径: **评测/续训/交付一律用 `train_params_best.npz`**(val 最优);
+`train_params.npz` 是最后一步权重,只作续跑起点的备选。
+
+### 常见坑速查(全部真机踩过)
+
+| 症状 | 原因与解法 |
+|---|---|
+| 推理巨慢、8 芯利用率都不高 | 用了单进程 `infer.py`(8 芯重复算同一份)→ 换 `infer_sharded.sh` |
+| `FileNotFoundError: shard-*.tar` | 分片路径容器内不可见 → 按 `meta.wds_dir` 同名挂载,或 `--wds-dir` 覆盖 |
+| 拉了新镜像还是旧行为 | 代码在挂载目录,镜像只是环境 → 宿主机 `git pull` + 重启容器 |
+| `Too many open files` / vfio busy | 缺 `--ulimit` 两参数 / TPU 被旧进程占用 → 补参数;`scripts/stop_train.sh` 清场 |
+| 启动 2~3 分钟无输出 | 权重加载+XLA 编译,正常;看 `<out>/train.log` 有 `[logtee]` 横幅即在跑 |
+
 
 | 入口 | 内容 |
 |---|---|

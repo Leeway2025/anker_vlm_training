@@ -4,6 +4,11 @@
 > 我方在代理数据集上完成代码验证(数据不出客户环境)。
 > 方案依据: `../training_plan.md`(定稿版)。
 
+> **JAX/TPU 路线(推荐,吞吐 ≈ torch 的 1.9×)已投产**: 入口
+> [`jax_impl/README.md`](jax_impl/README.md),逐阶段用法
+> [`jax_impl/USAGE.md`](jax_impl/USAGE.md)。与本 torch 路线数据/格式/
+> 超参三层兼容,adapter 可双向互换;本 README 以下内容描述 torch 路线。
+
 ## 结构
 
 ```
@@ -17,6 +22,7 @@ eval/          metrics(P/R/ACC/混淆/热区)/ format_validator / monitor_set
 export/        split_deliverables(LLM adapter + vision merge)/ export_onnx
 docs/          REPRODUCE.md(客户手册)/ issue480_workaround.py
 tests/         纯逻辑单测(python3 tests/test_core.py,无 torch 依赖)
+jax_impl/      JAX/TPU 训练路线(独立实现,零 torch 依赖;见其 README)
 ```
 
 ## 训练流水(推荐: 用编排器,每阶段可选可跳)

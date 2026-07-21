@@ -26,57 +26,39 @@ S0 环境 → S1 stage a → S2 stage b → S3 hard_mining → S4 aux_heads
 
 **方式一(推荐,团队对齐):环境镜像 + git 代码**
 
-> **版本口径(重要,v1.8 起代码与镜像分离)**:
+> **版本口径(重要)**:
 > | 组件 | 版本载体 | 更新动作 | 频率 |
 > |---|---|---|---|
 > | 代码(jax_impl/…) | git commit | `git pull` + 重启容器 | 每次修复 |
 > | 环境(jax/gemma 依赖) | 镜像 tag `env-vN` | `docker pull` | 仅依赖变化,少见 |
 >
-> 镜像是**纯环境件**(不含代码);代码经 `-v $PWD:/workspace` 挂载进
-> 容器,跑的永远是宿主机 git 仓库的版本。启动横幅 `[logtee] 代码:
-> commit xxxx` 直接显示在跑的代码版本。历史 v1.x tag(含代码快照)
-> 已废弃,勿再使用。
+> 镜像是**纯环境件**(不含代码);代码经 `-v $PWD:/workspace` 挂载,
+> 跑的永远是宿主机 git 仓库的版本。历史 v1.x tag 已废弃。
 
 ```bash
 # 仓库已公开只读,免认证直接拉(注意 leeway-main 全小写;
 # 报 docker.sock permission denied 时用 sudo 或把用户加进 docker 组)
 docker pull europe-west4-docker.pkg.dev/leeway-main/anker/jax:env-v1
 git clone https://github.com/Leeway2025/anker_vlm_training.git && cd anker_vlm_training
+```
 
-> **日志落盘**(v1.5+): 训练/推理/KTO 启动后自动把全部输出(含 libtpu C++
-> 报错)追加写入 `<--out 目录>/train.log`;`--out` 在挂载目录下时日志即
-> 持久化在宿主机,`docker rm` 不丢。`docker logs` 照常可用。启动横幅
-> `[logtee] 代码: commit xxxx` 显示实际加载的代码版本与路径,
-> 排"跑的哪份代码"一眼定位。
+**容器运行模板(重要)**:后文各阶段命令均以 `python jax_impl/...` 或
+`bash jax_impl/...` 书写;容器用户在 shell 里定义一次包装函数,然后
+**原样加 `jaxrun` 前缀**即可:
 
-> **训练口径对齐 torch 生产(v1.7+,默认开启)**:
-> ① 每 epoch 固定 seed 重洗(`--seed`);② lr 日程 warmup 300 + 线性衰
-> 减到 0(`--warmup/--lr-schedule`),weight_decay=0,vision LoRA 2e-5,
-> LoRA+ B 矩阵 lr×16(`--vision-lr/--loraplus-ratio`);③ val 按
-> camera 整组切分、先切后复制、val 永不注入 CoT,val_n 自动对齐
-> DP×BS;**评测/交付用 `train_params_best.npz`(val 最优),
-> `train_params.npz` 是最后一步**。想还原旧行为: `--lr-schedule
-> constant --warmup 0 --weight-decay 1e-4 --vision-lr 1e-4
-> --loraplus-ratio 1`。
-
-> **目标格式改为无空格(v1.8+,与 GT 逐字节一致)**: 训练目标从
-> `"B | i | desc"` 改为 `"B|i|desc"`(torch/客户生产口径)。v1.7 及
-> 之前训的 checkpoint 输出带空格 —— 评测解析两种都认,但交付口径不同,
-> **正式轮请 git pull 至最新代码后训练**。另: eval_metrics 缺失预测在全部指标
-> 中记错(旧版安全召回分母漏计);export/import 遇视觉塔 LoRA 无映射
-> 时响亮告警(权重留在源文件,不丢失);aux 标注低置信度整条屏蔽
-> (`--aux-conf-threshold`,默认 0.5,attributes 无 confidence 字段则
-> 视为 1.0 不受影响)。
-# TPU VM 上运行(--privileged + /dev 使容器可见 TPU;GCS 凭据走 VM metadata;
-# -v $PWD:/workspace 挂载代码 —— 必挂,忘挂会直接报"找不到 jax_impl"):
-docker run --rm --privileged --net=host \
-  --ulimit nofile=1048576:1048576 --ulimit memlock=-1 \
-  -v /dev:/dev -v $PWD:/workspace -v /path/DATA:/data -w /workspace \
-  europe-west4-docker.pkg.dev/leeway-main/anker/jax:env-v1 \
-  python jax_impl/train_sft.py --labels /data/labels.jsonl ...
-# 代码更新: git pull && docker rm -f <容器> && 重新 docker run(运行中的
-# 训练不受 git pull 影响 —— 进程用的是启动时加载的版本);
-# 环境镜像发布(仅依赖变化)一律走 jax_impl/release_image.sh env-vN
+```bash
+jaxrun() {                       # <数据目录> 换成 labels/layout 所在真实路径
+  sudo docker run --rm --privileged --net=host \
+    --ulimit nofile=1048576:1048576 --ulimit memlock=-1 \
+    -v /dev:/dev -v $PWD:/workspace -v <数据目录>:/data -w /workspace \
+    europe-west4-docker.pkg.dev/leeway-main/anker/jax:env-v1 "$@"
+}
+# 例:  jaxrun python jax_impl/train_sft.py --labels /data/labels.jsonl ...
+#      jaxrun bash jax_impl/infer_sharded.sh python /data/labels.jsonl ...
+# 长任务(训练/全量推理)用 -d --name <名> 代替 --rm 放后台,
+# 日志看 <--out>/train.log;分片数据目录按 meta.wds_dir 同名挂载(见下)。
+# 代码更新: git pull && sudo docker rm -f <容器> && 重新运行
+# (运行中的任务不受 git pull 影响 —— 进程用的是启动时加载的版本)
 ```
 
 **方式二:裸机 venv**
@@ -118,8 +100,8 @@ bash jax_impl/setup_jax_env.sh /path/to/venv_jax
   出现 `全零 LoRA a 跳过 N 叶` 属预期。
 - **验收**:loss 平稳下降(与 torch 版验收同口径)。
 - **衔接 S2**:`--init-npz outputs/jax_a/train_params.npz`。
-- **已有 torch stage a 成果?** projector.pt→JAX 的转换器暂缺(排期中)。
-  由于本阶段 8 芯只需分钟级,**建议直接在 JAX 重跑**,不必衔接。
+- **已有 torch stage a 成果?** 用文末 §B 的 `convert_projector.py` 转成
+  npz 后 `--init-npz` 接入(客户现网即此路径);或直接在 JAX 重跑(分钟级)。
 
 ## S2. stage b —— 主训(生产超参)
 
@@ -130,9 +112,11 @@ bash jax_impl/setup_jax_env.sh /path/to/venv_jax
   python jax_impl/train_sft.py <公共参数> \
     --rank-scheme prod --train-vision --train-projector \
     --init-npz outputs/jax_a/train_params.npz \
-    --steps <N> --accum 4 --eval-every 50 --val-n 512 \
-    --out outputs/jax_b
+    --steps <N> --accum 32 --prefetch-workers 24 \
+    --eval-every 100 --val-n 512 --out outputs/jax_b
   ```
+  全局 batch = 芯数 × bs(=1) × accum;生产口径 256 → 8 芯配 `--accum 32`
+  (4 芯配 64)。`--steps`: 1 epoch = 样本数 ÷ 256,一般跑 3 epoch。
   `--rank-scheme prod` = 与 torch 生产同款:差异化 rank(全局层 512/
   滑动层与视觉 256)+ rsLoRA(α=2r)。
 - **产物**:`outputs/jax_b/train_params.npz`;日志含 train loss、
@@ -151,10 +135,11 @@ bash jax_impl/setup_jax_env.sh /path/to/venv_jax
   # v1.6+: infer/kto 从 npz 自动判定 rank 方案(prod 产物自动带 rsLoRA
   # 缩放),并自动合并训练过的 projector;任何键未命中直接报错。
   # ⚠️ 评测 prod 产物必须用 ≥v1.6 —— 旧版会静默退化为 base 模型。
-  bash jax_impl/infer_sharded.sh <venv_jax>/bin/python \
+  bash jax_impl/infer_sharded.sh python \
     DATA/labels.jsonl hf_layout.json outputs/preds \
-    outputs/jax_b/train_params.npz
-  # (单进程调试: python jax_impl/infer.py <公共参数> --shard 0/8 ...)
+    outputs/jax_b/train_params_best.npz     # ← 用 best,不是最后一步
+  # 裸机 venv 用户把 python 换成 <venv_jax>/bin/python;容器用户加 jaxrun 前缀
+  # ⚠️ 禁止用单进程 infer.py 跑全量: 8 芯会做重复计算,吞吐=1 芯(踩坑)
   # ② 挖掘(错例加权,带按类膨胀上限)
   python jax_impl/hard_mining.py --preds outputs/preds.jsonl \
     --labels DATA/labels.jsonl --out outputs/sw.json
@@ -217,8 +202,13 @@ python jax_impl/swa.py \
 ## S8. 评测 —— 分类指标(每个阶段跑完都建议做)
 
 ```bash
-python jax_impl/infer.py <公共参数(labels 换测试集)> \
-  --init-npz outputs/<某阶段>/train_params.npz --out outputs/eval_preds.jsonl
+# ① 推理 —— 必须全芯并行(⚠️ 单进程 infer.py 只用于调试: 它会让 8 芯
+#    做同一份重复计算,吞吐=1 芯,1 万条要 20h;sharded 8 芯 ≈ 2.5h):
+bash jax_impl/infer_sharded.sh python \
+  DATA/test_labels.jsonl hf_layout.json outputs/eval_preds \
+  outputs/<某阶段>/train_params_best.npz    # ← 评测用 best,不是最后一步
+# 各分片独立断点续跑: 中断后原命令重跑只补缺失部分
+# ② 指标
 python jax_impl/eval_metrics.py --preds outputs/eval_preds.jsonl \
   --labels DATA/test_labels.jsonl --per-class
 ```
@@ -235,7 +225,7 @@ python jax_impl/eval_metrics.py --preds outputs/eval_preds.jsonl \
 > 提示,需要时再补)。
 
 ```bash
-python jax_impl/export_hf.py --npz outputs/<最终阶段>/train_params.npz \
+python jax_impl/export_hf.py --npz outputs/<最终阶段>/train_params_best.npz \
   --out outputs/final_adapter_hf --scheme prod
 ```
 - 产物 = 标准 peft adapter(adapter_model.safetensors +
@@ -243,7 +233,7 @@ python jax_impl/export_hf.py --npz outputs/<最终阶段>/train_params.npz \
   **与 torch 训练产物同格式**:torch 侧 run_inference、评测、RKLLM
   导出链(含 Issue #480 前缀处理)全部直接可用;
 - projector 若在 JAX 侧训过,随 npz 导出为 projector_params.npz;
-  → torch projector.pt 的转换器在排期,过渡期方案见下§B。
+  转回 torch 的 projector.pt 用文末 §B 的 `convert_projector.py --npz`。
 
 ---
 
@@ -306,3 +296,19 @@ JAX(1M≈14.3h/epoch): S1→S2(→S3 续训段)   torch(已全流程验证):
 | 吞吐口径 | 看日志 `marginal_micro_s`;epoch ≈ marginal × 总 micro 数 |
 | 改 prompt | 必须重新生成 hf_layout.json,并与端侧部署同步 |
 | 细节档案 | 设计/验证/踩坑全记录见 `jax_impl/FINDINGS.md` |
+
+## 附:变更纪要(细节档案见 FINDINGS.md)
+
+- **日志落盘**(2026-07-17 起): 训练/推理/KTO 自动把全部输出(含
+  libtpu C++ 报错)写入 `<--out>/train.log`,容器删了不丢;启动横幅
+  `[logtee] 代码: commit xxxx` 显示在跑的代码版本。
+- **训练口径对齐 torch 生产**(2026-07-20 起,默认开启): ① 每 epoch
+  固定 seed 重洗(`--seed`);② warmup 300 + 线性衰减(`--warmup/
+  --lr-schedule`),weight_decay=0,vision LoRA 2e-5,LoRA+ B 矩阵
+  lr×16;③ val 按 camera 整组切分、先切后复制、永不注入 CoT,
+  val_n 自动对齐 DP×BS。还原旧行为: `--lr-schedule constant
+  --warmup 0 --weight-decay 1e-4 --vision-lr 1e-4 --loraplus-ratio 1`。
+- **目标格式无空格**(2026-07-20 起): 训练目标 `"B|i|desc"` 与 GT
+  逐字节一致;旧 checkpoint 输出带空格(评测两种都认,交付口径不同)。
+  同批: eval_metrics 缺失预测在全部指标记错;export/import 非零键无
+  映射时响亮告警;aux 低置信度标注整条屏蔽(`--aux-conf-threshold`)。

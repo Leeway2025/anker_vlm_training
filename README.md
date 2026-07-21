@@ -47,7 +47,6 @@ sudo docker run -d --name jax5b --privileged --net=host \
   python jax_impl/train_sft.py \
     --labels /data/labels.jsonl --layout /data/hf_layout.json \
     --rank-scheme prod --train-vision --train-projector \
-    --lr 2e-5 --loraplus-ratio 1 \
     --accum 32 --steps 1148 --prefetch-workers 24 \
     --eval-every 100 --val-n 512 --out outputs/jax_5b
 tail -f outputs/jax_5b/train.log        # 日志自动落盘;loss 应 8.x 起步稳降

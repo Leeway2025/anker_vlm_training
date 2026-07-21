@@ -36,12 +36,13 @@ def main():
     ap.add_argument("--rank-scheme", choices=["uniform", "prod"],
                     default="uniform",
                     help="prod=生产方案: 差异化 rank 512/256 + rsLoRA α=2r")
-    ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--lr", type=float, default=None,
+                    help="缺省自动: prod=2e-5(v7 冷配方)/ uniform=1e-4")
     ap.add_argument("--proj-lr", type=float, default=5e-4)
     ap.add_argument("--vision-lr", type=float, default=2e-5,
                     help="视觉塔 LoRA 学习率(torch 生产: 2e-5)")
-    ap.add_argument("--loraplus-ratio", type=float, default=16.0,
-                    help="LoRA+ : B 矩阵 lr 倍率(torch 生产: 16)")
+    ap.add_argument("--loraplus-ratio", type=float, default=None,
+                    help="缺省自动: prod=1(v7 冷配方)/ uniform=16")
     ap.add_argument("--warmup", type=int, default=300,
                     help="warmup 步数(opt step;torch 生产: 300)")
     ap.add_argument("--lr-schedule", choices=["linear", "constant"],
@@ -73,6 +74,13 @@ def main():
                     help="最后该比例的步数切纯生产模式")
     ap.add_argument("--init-npz", help="从 train_params.npz 续训(或 import_hf 产物)")
     a = ap.parse_args()
+    # v7 防过热: prod 的 rsLoRA scale(32/45)叠加热 lr/LoRA+ 会训死
+    # 视觉→字母回路 —— prod 缺省自动用已验证冷配方,显式传参可覆盖
+    # (覆盖越线时下方哨兵会警告)
+    if a.lr is None:
+        a.lr = 2e-5 if a.rank_scheme == "prod" else 1e-4
+    if a.loraplus_ratio is None:
+        a.loraplus_ratio = 1.0 if a.rank_scheme == "prod" else 16.0
     from jax_impl.logtee import tee_stdio
     tee_stdio(a.out)
     if a.stage == "a":

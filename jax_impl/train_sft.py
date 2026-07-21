@@ -207,7 +207,13 @@ def main():
     def init_leaf(path, leaf):
         pstr = _path_str(path)
         if pstr.endswith("/a") and _is_trainable(pstr):
-            return jnp.asarray(rng.normal(0, 0.02, leaf.shape), jnp.float32)
+            # peft gaussian 语义: std=1/r(r=叶末维)。旧值 0.02 偏大
+            # 5-10×,叠加 rsLoRA scale 32/45 与 LoRA+ B×16 后有效步长
+            # 超 torch 一个量级 → 长程视频→字母回路被打饱和,训练收敛
+            # 到常数字母(2026-07-21 过拟合消融实锤: prod 常数/uniform
+            # 100%;修复后 prod 亦 100%,见 FINDINGS v7)
+            std = 1.0 / leaf.shape[-1]
+            return jnp.asarray(rng.normal(0, std, leaf.shape), jnp.float32)
         return jnp.zeros(leaf.shape, jnp.float32)   # B 零 + 冻结项零
     lora0 = jax.tree_util.tree_map_with_path(init_leaf, lora_struct)
 

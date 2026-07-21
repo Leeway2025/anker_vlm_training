@@ -145,8 +145,9 @@ def main():
             k = "/".join(getattr(x, "key", str(x)) for x in path)
             llm = k.startswith("layer_") or "/layer_" in k
             if k.endswith("/a") and llm:
-                return jnp.asarray(rng.normal(0, 0.02, leaf.shape),
-                                   jnp.float32)
+                return jnp.asarray(
+                    rng.normal(0, 1.0 / leaf.shape[-1], leaf.shape),
+                    jnp.float32)          # peft gaussian: std=1/r
             return jnp.zeros(leaf.shape, jnp.float32)
         lora0 = jax.tree_util.tree_map_with_path(init_leaf, lora_struct)
 

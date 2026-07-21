@@ -47,8 +47,16 @@ def main():
     from gemma import gm
     from gemma import peft as gpeft
     from gemma.gm.nn.gemma4.vision import _encoder as gemma_vision
+    from gemma.gm.nn.gemma4 import _transformer as g4_tr
     from gemma.gm.nn.gemma4._transformer import PreprocessedVisionInput
     from jax_impl.data import SftDataset, make_vision_input
+
+    # HF 语义对齐(v1 坑 7,与 train_sft/kto 同款): gm 前向会压缩视觉位
+    # logits(_transformer.py remove_mm_logits),多模态输入下读 pos-1 的
+    # 位置全部错位 → 首 token 常读成 EOT → output 全空。推理侧此前漏打
+    # 此补丁(2026-07-21 客户现场实锤),勿删。
+    g4_tr._token_utils.remove_mm_logits = \
+        lambda logits, tokens, num_tokens_per_image: logits
 
     # ---- rank 方案判定必须先于模型构造(prod 是参数创建路径的 patch)----
     z, uni_rank, has_lora = None, 16, False
@@ -152,12 +160,19 @@ def main():
             if nxt == EOT:
                 break
         txt = tok.decode([t for t in out_ids if t != EOT])
+        if not txt.strip():
+            n_empty = getattr(main, "_n_empty", 0) + 1
+            main._n_empty = n_empty
         fout.write(json.dumps({"video_id": rec["video_id"],
                                "output": txt.strip()},
                               ensure_ascii=False) + "\n")
         fout.flush()
         print(f"[infer] {n+1}/{len(recs)} {rec['video_id']} "
               f"({time.time()-t0:.1f}s): {txt[:60]!r}", flush=True)
+    n_empty = getattr(main, "_n_empty", 0)
+    if n_empty:
+        print(f"⚠️ 本次有 {n_empty} 条空输出 —— 若比例高,疑似 logits 位置"
+              f"错位或模型异常,勿直接拿去评测")
     print(f"[OK] -> {a.out}")
 
 

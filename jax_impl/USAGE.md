@@ -211,6 +211,10 @@ bash jax_impl/infer_sharded.sh python \
 # ② 指标
 python jax_impl/eval_metrics.py --preds outputs/eval_preds.jsonl \
   --labels DATA/test_labels.jsonl --per-class
+# ③ 指标异常时先诊断(字母分布/混淆映射/训练测试分布对照,判读指南见文件头):
+python jax_impl/diagnose_preds.py --preds outputs/eval_preds.jsonl \
+  --labels DATA/test_labels.jsonl --train-labels DATA/labels.jsonl \
+  --meta outputs/<某阶段>/train_meta.json
 ```
 输出:RT / SubKS / 双对 acc、KS 父类 acc、安全关键 SubKS 召回、
 格式合规率(与客户口径一致)。

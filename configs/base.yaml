@@ -56,13 +56,18 @@ lora:
   # 且 peft 的 PISSA→标准 LoRA 转换与 rsLoRA/rank_pattern 互斥(官方警告)。
   # 单 LoRA 场景如需 PISSA,须同时关 rsLoRA 与差异化 rank 并走转换流程。
   init_weights: "gaussian"
-  loraplus_lr_ratio: 16.0   # B 矩阵 LR = A 矩阵 LR × 16
+  loraplus_lr_ratio: 1.0    # 旧值 16.0 —— 与 rsLoRA scale 叠加过热(v7),调冷
   # gemma-4 带 audio_tower(也有 *_proj 模块),LoRA 禁止注入(烟测确认)
   exclude_keywords: ["audio"]
 
 # ---------- 学习率(按模块) ----------
 lr:
-  llm_lora: 1.0e-4
+  # ⚠️ 2026-07-21 v7 定案(jax_impl/FINDINGS.md): rsLoRA scale(32/45)
+  # × lr × LoRA+16 的有效步长过热会把视觉→字母回路训死(loss 曲线
+  # 看似正常)。JAX 端已实测冷配方通过过拟合门禁;torch 端同款乘法链
+  # 同样存在,故默认值同步调冷。如需调回,先过"合成数据过拟合 100%"
+  # 门禁再上真数据。
+  llm_lora: 2.0e-5          # 旧值 1.0e-4(过热,v7)
   vision_lora: 2.0e-5
   projector: 5.0e-4         # Vision Projector 全参
   aux_heads: 1.0e-4

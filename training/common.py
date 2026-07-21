@@ -301,6 +301,15 @@ def build_optimizer(model, cfg, aux_module=None, lr_scale=1.0,
     import torch
     lrs = cfg["lr"]
     ratio = cfg["lora"]["loraplus_lr_ratio"]
+    # v7 过热哨兵(jax_impl/FINDINGS.md): rsLoRA scale × lr × LoRA+
+    # 乘积过大 → 视觉→字母回路训死,loss 曲线无异常。JAX 端实锤,
+    # torch 端同款乘法链未单独验证 —— 越线即警告。
+    if cfg["lora"].get("use_rslora") and lrs["llm_lora"] * ratio > 1e-4:
+        print("⚠️ [optimizer] rsLoRA + lr×LoRA+ 乘积过热"
+              f"(llm_lora={lrs['llm_lora']:g} × ratio={ratio:g}): "
+              "v7 实测该组合训不进分类字母。已验证冷配方: "
+              "llm_lora=2e-5, loraplus_lr_ratio=1;"
+              "调参前先过合成数据过拟合门禁")
     vis_kw = cfg["freeze"]["vision_keywords"]
     proj_kw = cfg["freeze"]["projector_keywords"]
 

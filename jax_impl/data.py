@@ -83,7 +83,7 @@ class SftDataset:
                  max_label_len=64, cls_weight=4.0, sample_weights=None,
                  reasoning=None, cot_ratio=0.6, attributes=None,
                  max_think_len=96, seed=0, val_n=0,
-                 aux_conf_threshold=0.5):
+                 aux_conf_threshold=0.5, augment=False):
         recs = [json.loads(l) for l in open(labels_file, encoding="utf-8")]
         # 顺序铁律: 先切 val、再对 train 做 hard-mining 复制 —— 反过来
         # 副本会横跨 train/val(泄漏,val loss 虚低)。torch 侧同序。
@@ -123,7 +123,27 @@ class SftDataset:
         self.attributes = attributes or {}      # video_id → 资产 A
         self.aux_conf = aux_conf_threshold
         self.rng = random.Random(seed)
+        self.augment = augment                  # 仅 train 样本生效
         self.max_len = len(self.template) + self.max_think + max_label_len
+
+    def _augment(self, frames):
+        """训练增强(语义移植自 torch data/augmentation.py,红线同款):
+        ✓ 全片一致水平翻转 / 亮度缩放 / 帧 dropout(用前一帧顶替,
+          时序保持非递减 —— 结构上不可能发生时序翻转)
+        ✗ 时序翻转/mixup: 不提供任何实现路径(k↔l 等标签会互换)。"""
+        r = self.rng
+        if r.random() < 0.5:                       # 水平翻转(全片一致)
+            frames = [np.ascontiguousarray(f[:, ::-1]) for f in frames]
+        if r.random() < 0.5:                       # 亮度 ±25%
+            k = r.uniform(0.75, 1.25)
+            frames = [np.clip(f.astype(np.float32) * k, 0, 255)
+                      .astype(np.uint8) for f in frames]
+        if r.random() < 0.5:                       # 帧 dropout 10%
+            out = [frames[0]]
+            for f in frames[1:]:
+                out.append(out[-1] if r.random() < 0.1 else f)
+            frames = out
+        return frames
 
     def set_anneal(self, flag):                 # CoT 退火(torch 同款语义)
         self.anneal = flag
@@ -195,6 +215,8 @@ class SftDataset:
                                  self.wds)
         else:
             frames = load_frames(rec, self.wds)
+        if self.augment and i < self.first_val:
+            frames = self._augment(frames)
         return {"tokens": tokens, "labels": labels, "weights": weights,
                 "aux_labels": aux, "ks_label": np.int32(ks),
                 "frames": frames, "video_id": vid}

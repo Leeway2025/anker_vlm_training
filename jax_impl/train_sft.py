@@ -62,6 +62,9 @@ def main():
     ap.add_argument("--stage", choices=["a", "b"], default="b",
                     help="a=仅 projector 预热(LoRA 全冻结)")
     ap.add_argument("--sample-weights", help="hard-mining sw.json")
+    ap.add_argument("--augment", action="store_true",
+                    help="训练增强: 翻转/亮度/帧dropout(val 不增强;"
+                         "时序翻转结构性禁止)")
     ap.add_argument("--aux-file", help="资产 A attributes.jsonl → 7 属性头")
     ap.add_argument("--aux-conf-threshold", type=float, default=0.5,
                     help="低于此置信度的标注整条屏蔽(torch 同款)")
@@ -174,7 +177,8 @@ def main():
         reasoning=load_jsonl_map(a.cot_file) if a.cot_file else None,
         cot_ratio=a.cot_ratio,
         attributes=load_jsonl_map(a.aux_file) if a.aux_file else None,
-        seed=a.seed, val_n=vn, aux_conf_threshold=a.aux_conf_threshold)
+        seed=a.seed, val_n=vn, aux_conf_threshold=a.aux_conf_threshold,
+        augment=a.augment)
     train_idx, val_idx = full.train_idx, full.val_idx
     print(f"[data] train={len(train_idx)} val={len(val_idx)}"
           f"(按 camera 切分, seed={a.seed}, 先切后复制) "

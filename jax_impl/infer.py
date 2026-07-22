@@ -18,6 +18,28 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 EOT = 106
+RT_SET, SK_SET = "ABCDE", "abcdefghijklmnopqrstu"
+
+
+def constrained_pick(row, step, rt_ids, sk_ids, pipe_id):
+    """字母位受限解码: step0=RT 字母集内 argmax,1/3=强制 '|',
+    2=SubKS 字母集内 argmax,其余自由。row: 该位置全词表 logits。"""
+    import numpy as np
+    if step == 0:
+        return rt_ids[int(np.argmax(row[rt_ids]))]
+    if step in (1, 3):
+        return pipe_id
+    if step == 2:
+        return sk_ids[int(np.argmax(row[sk_ids]))]
+    return int(np.argmax(row))
+
+
+def legalize_combo(rt, sk):
+    """RT×SubKS 非法组合矫正(training_plan 14.2 / 生产端 guard 同款):
+    家人(A)不可能"包裹被拿走/未授权进入" → 升级为可疑人员(C)。"""
+    if rt == "A" and sk in "nu":
+        return "C", sk
+    return rt, sk
 
 
 def main():
@@ -37,6 +59,8 @@ def main():
                     help="auto=从 npz 自动判定(差异化 rank 即 prod)")
     ap.add_argument("--no-proj", action="store_true",
                     help="不合并 npz 中的 projector(默认: npz 无 proj/ 即报错)")
+    ap.add_argument("--no-constrain", action="store_true",
+                    help="关闭字母位受限解码与非法组合矫正(默认开启)")
     a = ap.parse_args()
     from jax_impl.logtee import tee_stdio
     tee_stdio(os.path.dirname(a.out) or ".", name=os.path.basename(a.out) + ".log")
@@ -124,7 +148,14 @@ def main():
     def step_logits(par, tokens, pvi, pos):
         out = model.apply({"params": par}, tokens=tokens, images=pvi)
         lg = out.logits if hasattr(out, "logits") else out
-        return jnp.argmax(lg[0, pos - 1])
+        return lg[0, pos - 1].astype(jnp.float32)   # 全词表行(受限解码用)
+
+    RT_IDS = np.asarray([tok.encode(c)[0] for c in RT_SET])
+    SK_IDS = np.asarray([tok.encode(c)[0] for c in SK_SET])
+    PIPE_ID = tok.encode("|")[0]
+    if not a.no_constrain:
+        print(f"[decode] 受限解码开启: RT∈{len(RT_IDS)} SK∈{len(SK_IDS)} "
+              f"+ 非法组合矫正(A|n,A|u → C)")
 
     recs = ds.recs
     if a.shard:
@@ -153,13 +184,19 @@ def main():
         t0 = time.time()
         out_ids = []
         for i in range(a.max_new):
-            nxt = int(step_logits(params, jnp.asarray(toks[None]),
-                                  pvi, T + i))
-            out_ids.append(nxt)
+            row = np.asarray(step_logits(params, jnp.asarray(toks[None]),
+                                         pvi, T + i))
+            nxt = (int(np.argmax(row)) if a.no_constrain
+                   else constrained_pick(row, i, RT_IDS, SK_IDS, PIPE_ID))
+            out_ids.append(int(nxt))
             toks[T + i] = nxt
             if nxt == EOT:
                 break
         txt = tok.decode([t for t in out_ids if t != EOT])
+        if not a.no_constrain and txt.count("|") >= 2:
+            seg = txt.split("|")
+            rt2, sk2 = legalize_combo(seg[0].strip(), seg[1].strip())
+            txt = "|".join([rt2, sk2] + seg[2:])
         if not txt.strip():
             n_empty = getattr(main, "_n_empty", 0) + 1
             main._n_empty = n_empty

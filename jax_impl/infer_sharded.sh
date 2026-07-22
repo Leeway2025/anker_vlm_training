@@ -7,6 +7,8 @@
 #   bash jax_impl/infer_sharded.sh <venv_jax>/bin/python \
 #        DATA/labels.jsonl hf_layout.json outputs/preds \
 #        [lora.npz] [分片数]
+# 可选环境变量: WDS_DIR=<目录>   覆盖分片定位(透传 --wds-dir)
+#              INFER_ARGS='--max-new 8'  追加任意 infer.py 参数
 set -e
 cd "$(dirname "$0")/.."
 PY=${1:?venv_jax 的 python 路径}
@@ -25,6 +27,8 @@ detect_chips() {
 N=${6:-$(detect_chips)}
 NPZ_ARG=""
 [ -n "$NPZ" ] && NPZ_ARG="--init-npz $NPZ"
+[ -n "${WDS_DIR:-}" ] && NPZ_ARG="$NPZ_ARG --wds-dir $WDS_DIR"
+NPZ_ARG="$NPZ_ARG ${INFER_ARGS:-}"
 echo "[jax_infer_sharded] 使用 $N 张芯并行"
 
 pids=()

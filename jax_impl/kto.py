@@ -288,9 +288,13 @@ def main():
                   flush=True)
     flat = jax.tree_util.tree_flatten_with_path(lora)[0]
     import numpy as _np
-    _np.savez(os.path.join(a.out, "lora_params.npz"),
-              **{"lora/" + "/".join(getattr(k, "key", str(k)) for k in p):
-                 _np.asarray(v) for p, v in flat})
+    out_d = {"lora/" + "/".join(getattr(k, "key", str(k)) for k in p):
+             _np.asarray(v) for p, v in flat}
+    if z is not None:      # 起点携带的 projector 原样传递 → 产物自足,
+        for kk in z.files:  # 下游 infer/swa/export 不再依赖上游 npz
+            if kk.startswith("proj/"):
+                out_d[kk] = z[kk]
+    _np.savez(os.path.join(a.out, "lora_params.npz"), **out_d)
     print(f"[save] {a.out}")
 
 

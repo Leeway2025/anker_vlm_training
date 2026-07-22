@@ -21,8 +21,13 @@ def main():
     for z in zs[1:]:
         common &= set(z.files); union |= set(z.files)
     if union - common:
-        print(f"[swa] ⚠️ {len(union-common)} 个非共有键取首个 ckpt 的值"
-              f"(树不同构: 如有无 proj/aux)")
+        frac = len(union - common) / max(len(union), 1)
+        print(f"[swa] ⚠️ {len(union-common)}/{len(union)} 键非共有"
+              f"({frac:.0%}),取首个 ckpt 原值 —— 树不同构。")
+        if frac > 0.3:
+            print("[swa] ⚠️⚠️ 异构检查点平均(如 SFT 全量树 × KTO 纯 LoRA "
+                  "树)不是标准 SWA 用法,实测会掉点(FINDINGS v8 R7);"
+                  "标准用法 = 同一训练轨迹的邻近检查点。三思。")
     avg = {}
     for k in union:
         arrs = [z[k] for z in zs if k in z.files]

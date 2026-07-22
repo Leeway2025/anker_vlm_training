@@ -21,17 +21,35 @@ EOT = 106
 RT_SET, SK_SET = "ABCDE", "abcdefghijklmnopqrstu"
 
 
-def constrained_pick(row, step, rt_ids, sk_ids, pipe_id):
+def constrained_pick(row, step, rt_ids, sk_ids, pipe_id,
+                     rt_delta=None, sk_delta=None):
     """字母位受限解码: step0=RT 字母集内 argmax,1/3=强制 '|',
-    2=SubKS 字母集内 argmax,其余自由。row: 该位置全词表 logits。"""
+    2=SubKS 字母集内 argmax,其余自由。row: 该位置全词表 logits。
+    rt_delta/sk_delta: 先验校正量 log(目标先验/训练先验)(可选)。"""
     import numpy as np
     if step == 0:
-        return rt_ids[int(np.argmax(row[rt_ids]))]
+        lg = row[rt_ids] + (rt_delta if rt_delta is not None else 0.0)
+        return rt_ids[int(np.argmax(lg))]
     if step in (1, 3):
         return pipe_id
     if step == 2:
-        return sk_ids[int(np.argmax(row[sk_ids]))]
+        lg = row[sk_ids] + (sk_delta if sk_delta is not None else 0.0)
+        return sk_ids[int(np.argmax(lg))]
     return int(np.argmax(row))
+
+
+def prior_deltas(target_file, train_file, letters, key, tau=1.0,
+                 exempt=""):
+    """Δ[y] = τ·log(P_target[y]/P_train[y]);exempt 中的字母 Δ=0
+    (如安全类 qrunj,避免自然先验极低把安全召回压没)。"""
+    import json as _json
+    import math
+    tgt = _json.load(open(target_file, encoding="utf-8"))[key]
+    trn = _json.load(open(train_file, encoding="utf-8"))[key]
+    eps = 1e-6
+    return [0.0 if c in exempt else
+            tau * math.log((tgt.get(c, eps) + eps) / (trn.get(c, eps) + eps))
+            for c in letters]
 
 
 def legalize_combo(rt, sk):
@@ -61,6 +79,13 @@ def main():
                     help="不合并 npz 中的 projector(默认: npz 无 proj/ 即报错)")
     ap.add_argument("--no-constrain", action="store_true",
                     help="关闭字母位受限解码与非法组合矫正(默认开启)")
+    ap.add_argument("--prior-target", help="目标(自然)先验 json"
+                    "(dump_priors.py 产物;与 --prior-train 成对启用校正)")
+    ap.add_argument("--prior-train", help="训练集先验 json")
+    ap.add_argument("--prior-tau", type=float, default=1.0,
+                    help="校正温度(1=理论值,0.5~1 网格)")
+    ap.add_argument("--prior-exempt", default="qrunj",
+                    help="豁免字母(默认安全关键类,不下调其倾向)")
     a = ap.parse_args()
     from jax_impl.logtee import tee_stdio
     tee_stdio(os.path.dirname(a.out) or ".", name=os.path.basename(a.out) + ".log")
@@ -153,6 +178,15 @@ def main():
     RT_IDS = np.asarray([tok.encode(c)[0] for c in RT_SET])
     SK_IDS = np.asarray([tok.encode(c)[0] for c in SK_SET])
     PIPE_ID = tok.encode("|")[0]
+    RT_D = SK_D = None
+    if a.prior_target and a.prior_train:
+        RT_D = np.asarray(prior_deltas(a.prior_target, a.prior_train,
+                                       RT_SET, "rt", a.prior_tau))
+        SK_D = np.asarray(prior_deltas(a.prior_target, a.prior_train,
+                                       SK_SET, "sk", a.prior_tau,
+                                       exempt=a.prior_exempt))
+        print(f"[decode] 先验校正开启 τ={a.prior_tau} 豁免={a.prior_exempt!r} "
+              f"Δrt={[f'{x:+.2f}' for x in RT_D]}")
     if not a.no_constrain:
         print(f"[decode] 受限解码开启: RT∈{len(RT_IDS)} SK∈{len(SK_IDS)} "
               f"+ 非法组合矫正(A|n,A|u → C)")
@@ -187,7 +221,8 @@ def main():
             row = np.asarray(step_logits(params, jnp.asarray(toks[None]),
                                          pvi, T + i))
             nxt = (int(np.argmax(row)) if a.no_constrain
-                   else constrained_pick(row, i, RT_IDS, SK_IDS, PIPE_ID))
+                   else constrained_pick(row, i, RT_IDS, SK_IDS, PIPE_ID,
+                                         RT_D, SK_D))
             out_ids.append(int(nxt))
             toks[T + i] = nxt
             if nxt == EOT:

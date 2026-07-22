@@ -57,6 +57,9 @@ def main():
     ap.add_argument("--train-vision", action="store_true")
     ap.add_argument("--train-projector", action="store_true")
     ap.add_argument("--eval-every", type=int, default=5)
+    ap.add_argument("--early-stop-patience", type=int, default=0,
+                    help="连续 N 次 eval 无 val 改善即停(0=关;torch 同款"
+                         "语义 patience=3;best 权重始终已落盘)")
     ap.add_argument("--val-n", type=int, default=8)
     ap.add_argument("--out", default="/dev/shm/out_jax_sft")
     ap.add_argument("--stage", choices=["a", "b"], default="b",
@@ -499,6 +502,16 @@ def main():
                              **{_path_str(p): np.asarray(x) for p, x in bf})
                 print(f"[eval] opt_step {opt_step} val_loss={v:.4f}{tag}",
                       flush=True)
+                if tag:
+                    main._since_best = 0
+                else:
+                    main._since_best = getattr(main, "_since_best", 0) + 1
+                    if (a.early_stop_patience
+                            and main._since_best >= a.early_stop_patience):
+                        print(f"[early-stop] 连续 {main._since_best} 次 eval "
+                              f"无改善(best={best[0]:.4f}@{best[1]}),提前结束",
+                              flush=True)
+                        break
 
     try:
         ms = jax.local_devices()[0].memory_stats()

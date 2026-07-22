@@ -21,8 +21,11 @@ import csv
 import json
 import os
 import random
+import sys
 
-from data.taxonomy import RT_NAMES  # noqa: E402(仓库根运行)
+# 仓库根优先于脚本目录 —— 否则 jax_impl/data.py 会遮蔽根目录 data 包
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from data.taxonomy import RT_NAMES  # noqa: E402
 
 SK_NAMES = {
     "a": "Vehicle Access", "b": "Dog Walking", "c": "Kid Playing",
@@ -131,6 +134,4 @@ def main():
 
 
 if __name__ == "__main__":
-    import sys
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     main()

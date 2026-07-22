@@ -6,8 +6,10 @@
 实现: 固定步数贪心解码,全程静态形状 —— 每步对 [T+max_new] padded 全长
 做一次前向,读位置 T+i-1 的 logits argmax 写回。只编译一张图,逐步复用
 (HF generate 在 XLA 上逐 token 重编译的教训,见 torch 侧 _XlaStepMarker)。
-无 KV cache: 每步全长前向,~0.5s/步 @v6e 单芯;小规模挖掘/评测够用,
-大规模推理用 torch 侧 static-cache 路径或后续接 gm Sampler。
+KV cache(默认开): prefill 一次建缓存 + 单 token 步进(与官方
+sampler 同口径: attention_mask [B,1,cache_length] 按 arange<=pos 推进),
+每样本 ≈ 1 次全长前向 + N 次轻量步;--no-kv-cache 回退旧全长路径
+(每步全长前向 ~0.5s,A/B 对拍用)。
 """
 import argparse
 import dataclasses
@@ -86,6 +88,8 @@ def main():
                     help="校正温度(1=理论值,0.5~1 网格)")
     ap.add_argument("--prior-exempt", default="qrunj",
                     help="豁免字母(默认安全关键类,不下调其倾向)")
+    ap.add_argument("--no-kv-cache", action="store_true",
+                    help="回退无缓存全长前向(逐步 ~0.5s,对拍/排障用)")
     a = ap.parse_args()
     from jax_impl.logtee import tee_stdio
     tee_stdio(os.path.dirname(a.out) or ".", name=os.path.basename(a.out) + ".log")
@@ -175,6 +179,33 @@ def main():
         lg = out.logits if hasattr(out, "logits") else out
         return lg[0, pos - 1].astype(jnp.float32)   # 全词表行(受限解码用)
 
+    # ---- KV cache 路径(默认): prefill + 单 token 步进 ----
+    import functools
+    CL = L
+    tfm = model.model if hasattr(model, "model") else model
+    if not a.no_kv_cache:
+        cache0 = tfm.config.init_cache(batch_size=1, dtype=jnp.bfloat16,
+                                       cache_length=CL)
+        PREF_POS = jnp.arange(T)[None]
+        PREF_MASK = jnp.tril(jnp.ones((1, T, CL), jnp.bool_))
+
+        @jax.jit
+        def prefill_fn(par, toks_t, pvi, cache):
+            out = model.apply({"params": par}, tokens=toks_t, images=pvi,
+                              positions=PREF_POS, attention_mask=PREF_MASK,
+                              cache=cache, return_last_only=True)
+            return out.logits[0].astype(jnp.float32), out.cache
+
+        @functools.partial(jax.jit, donate_argnums=(1,))
+        def step_fn(par, cache, tok, pos):
+            am = (jnp.arange(CL)[None, None, :] <= pos)
+            out = model.apply({"params": par}, tokens=tok.reshape(1, 1),
+                              positions=pos.reshape(1, 1),
+                              attention_mask=am, cache=cache,
+                              return_last_only=True)
+            return out.logits[0].astype(jnp.float32), out.cache
+        print(f"[decode] KV cache 开启: prefill {T} + 步进(cache_len={CL})")
+
     RT_IDS = np.asarray([tok.encode(c)[0] for c in RT_SET])
     SK_IDS = np.asarray([tok.encode(c)[0] for c in SK_SET])
     PIPE_ID = tok.encode("|")[0]
@@ -216,17 +247,35 @@ def main():
         toks = np.zeros(L, np.int32)
         toks[:T] = ds.template
         t0 = time.time()
+
+        def pick(row, i):
+            return (int(np.argmax(row)) if a.no_constrain
+                    else constrained_pick(row, i, RT_IDS, SK_IDS, PIPE_ID,
+                                          RT_D, SK_D))
         out_ids = []
-        for i in range(a.max_new):
-            row = np.asarray(step_logits(params, jnp.asarray(toks[None]),
-                                         pvi, T + i))
-            nxt = (int(np.argmax(row)) if a.no_constrain
-                   else constrained_pick(row, i, RT_IDS, SK_IDS, PIPE_ID,
-                                         RT_D, SK_D))
-            out_ids.append(int(nxt))
-            toks[T + i] = nxt
-            if nxt == EOT:
-                break
+        if not a.no_kv_cache:
+            row, kv = prefill_fn(params, jnp.asarray(toks[None, :T]),
+                                 pvi, cache0)
+            row = np.asarray(row)
+            for i in range(a.max_new):
+                nxt = pick(row, i)
+                out_ids.append(int(nxt))
+                if nxt == EOT:
+                    break
+                if i + 1 < a.max_new:
+                    row, kv = step_fn(params, kv,
+                                      jnp.asarray(nxt, jnp.int32),
+                                      jnp.asarray(T + i, jnp.int32))
+                    row = np.asarray(row)
+        else:
+            for i in range(a.max_new):
+                row = np.asarray(step_logits(params, jnp.asarray(toks[None]),
+                                             pvi, T + i))
+                nxt = pick(row, i)
+                out_ids.append(int(nxt))
+                toks[T + i] = nxt
+                if nxt == EOT:
+                    break
         txt = tok.decode([t for t in out_ids if t != EOT])
         if not a.no_constrain and txt.count("|") >= 2:
             seg = txt.split("|")

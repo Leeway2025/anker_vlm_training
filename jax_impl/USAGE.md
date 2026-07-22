@@ -317,6 +317,10 @@ JAX(1M≈14.3h/epoch): S1→S2(→S3 续训段)   torch(已全流程验证):
   lr×16;③ val 按 camera 整组切分、先切后复制、永不注入 CoT,
   val_n 自动对齐 DP×BS。还原旧行为: `--lr-schedule constant
   --warmup 0 --weight-decay 1e-4 --vision-lr 1e-4 --loraplus-ratio 1`。
+- **推理 KV cache**(2026-07-22 起,默认开): prefill+单 token 步进
+  (官方 sampler 同款缓存协议),每样本 ~0.2-0.6s(原 ~6.6s);
+  `--no-kv-cache` 回退全长路径(对拍用)。真机 A/B: 字母 6/6 逐字
+  一致,速度 10-30×。
 - **目标格式无空格**(2026-07-20 起): 训练目标 `"B|i|desc"` 与 GT
   逐字节一致;旧 checkpoint 输出带空格(评测两种都认,交付口径不同)。
   同批: eval_metrics 缺失预测在全部指标记错;export/import 非零键无

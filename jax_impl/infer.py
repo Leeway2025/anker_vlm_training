@@ -87,7 +87,9 @@ def main():
     ap.add_argument("--prior-tau", type=float, default=1.0,
                     help="校正温度(1=理论值,0.5~1 网格)")
     ap.add_argument("--prior-exempt", default="qrunj",
-                    help="豁免字母(默认安全关键类,不下调其倾向)")
+                    help="SK 豁免字母(Δ=0;默认安全关键类)")
+    ap.add_argument("--prior-exempt-rt", default="",
+                    help="RT 豁免字母(Δ=0;手术版示例: ABCD=只修 E)")
     ap.add_argument("--no-kv-cache", action="store_true",
                     help="回退无缓存全长前向(逐步 ~0.5s,对拍/排障用)")
     a = ap.parse_args()
@@ -212,7 +214,8 @@ def main():
     RT_D = SK_D = None
     if a.prior_target and a.prior_train:
         RT_D = np.asarray(prior_deltas(a.prior_target, a.prior_train,
-                                       RT_SET, "rt", a.prior_tau))
+                                       RT_SET, "rt", a.prior_tau,
+                                       exempt=a.prior_exempt_rt))
         SK_D = np.asarray(prior_deltas(a.prior_target, a.prior_train,
                                        SK_SET, "sk", a.prior_tau,
                                        exempt=a.prior_exempt))

@@ -122,6 +122,15 @@ class SftDataset:
         self.max_think = max_think_len if self.reasoning else 0
         self.attributes = attributes or {}      # video_id → 资产 A
         self.aux_conf = aux_conf_threshold
+        # 资产覆盖率横幅: 开跑即自检喂对了哪份资产(全量≈100%/白名单≈37%)
+        if self.attributes or self.reasoning:
+            tr_ids = {r["video_id"] for r in train_recs}
+            for tag, m in (("aux(资产A)", self.attributes),
+                           ("cot(资产C)", self.reasoning)):
+                if m:
+                    hit = len(tr_ids & set(m))
+                    print(f"[assets] {tag}: 覆盖 train 独立视频 "
+                          f"{hit}/{len(tr_ids)} ({hit/max(len(tr_ids),1):.1%})")
         self.rng = random.Random(seed)
         self.augment = augment                  # 仅 train 样本生效
         self.max_len = len(self.template) + self.max_think + max_label_len

@@ -253,8 +253,8 @@ def main():
         in_specs=(P(), P(), P("dp"), P("dp"), P("dp")),
         out_specs=(P("dp"), P("dp")), check_rep=False))
 
-    def loss_fn(pol, base_p, ref, rt_ids, sk_ids, tokens, patches,
-                pos_xy, idx_rt, idx_sk, behav, adv):
+    def loss_fn(pol, base_p, rt_ids, sk_ids, tokens, patches,
+                pos_xy, idx_rt, idx_sk, behav, adv, ref1, ref2):
         pol_h = jax.tree_util.tree_map_with_path(
             lambda p, x: x.astype(jnp.bfloat16) if _is_trainable(_path_str(p))
             else jax.lax.stop_gradient(x.astype(jnp.bfloat16)), pol)
@@ -272,10 +272,9 @@ def main():
             un = ratio * adv
             cl = jnp.clip(ratio, 1 - a.eps_low, 1 + a.eps_high) * adv
             obj = obj + jnp.minimum(un, cl)
-        # KL 锚: 子集分布对 ref 的精确 KL
-        rr1f, rr2f = _rows(ref, base_p, tokens, patches, pos_xy)
-        rr1 = jnp.take(rr1f, rt_ids, axis=-1)
-        rr2 = jnp.take(rr2f, sk_ids, axis=-1)
+        # KL 锚: ref 行在 rollout 期预计算(冻结策略,logits 恒定;
+        # 在梯度图里做 ref 前向会多一整个前向的 HBM 临时区 → OOM 实锤)
+        rr1, rr2 = ref1, ref2
         kl = 0.0
         for r_, rr in ((r1, rr1), (r2, rr2)):
             p_ = jax.nn.softmax(r_ / a.temp)
@@ -285,24 +284,24 @@ def main():
         loss = (-obj + a.kl_coef * kl).mean()
         return loss
 
-    def grad_local(pol, base_p, ref, rt_ids, sk_ids, tokens, patches,
-                   pos_xy, idx_rt, idx_sk, behav, adv):
-        l, g = jax.value_and_grad(loss_fn)(pol, base_p, ref, rt_ids, sk_ids,
+    def grad_local(pol, base_p, rt_ids, sk_ids, tokens, patches,
+                   pos_xy, idx_rt, idx_sk, behav, adv, ref1, ref2):
+        l, g = jax.value_and_grad(loss_fn)(pol, base_p, rt_ids, sk_ids,
                                            tokens, patches, pos_xy, idx_rt,
-                                           idx_sk, behav, adv)
+                                           idx_sk, behav, adv, ref1, ref2)
         return (jax.lax.pmean(l, "dp"),
                 jax.tree.map(lambda x: jax.lax.pmean(x, "dp"), g))
     grad_sh = shard_map(
         grad_local, mesh=mesh,
-        in_specs=(P(),) * 5 + (P("dp"),) * 7,
+        in_specs=(P(),) * 4 + (P("dp"),) * 9,
         out_specs=(P(), P()), check_rep=False)
 
     RT_J = jnp.asarray(RT_IDS, jnp.int32)
     SK_J = jnp.asarray(SK_IDS, jnp.int32)
 
     @jax.jit
-    def train_step(pol, opt_state, base_p, ref, rt_j, sk_j, *batch):
-        l, g = grad_sh(pol, base_p, ref, rt_j, sk_j, *batch)
+    def train_step(pol, opt_state, base_p, rt_j, sk_j, *batch):
+        l, g = grad_sh(pol, base_p, rt_j, sk_j, *batch)
         up, opt_state = tx.update(g, opt_state, pol)
         return optax.apply_updates(pol, up), opt_state, l
 
@@ -335,6 +334,9 @@ def main():
                 toks[j, :T] = e["tokens"][:T]
             r1, _ = infer_sh(policy, base, jnp.asarray(toks), pt, px)
             r1 = np.asarray(r1)[:, RT_IDS]
+            r1r, _ = infer_sh(ref_lora, base, jnp.asarray(toks), pt, px)
+            r1r = np.asarray(r1r)[:, RT_IDS]
+            sk_rows_ref = []
             # 每视频采 G 个 RT → 逐 RT 求条件 SK 行(G 次前向,B=DP)
             rt_pick = [[sample_subset(r1[j], np.arange(len(RT_SET)),
                                       a.temp, rng)
@@ -348,6 +350,8 @@ def main():
                     t2[j, T + 1] = PIPE
                 _, r2 = infer_sh(policy, base, jnp.asarray(t2), pt, px)
                 sk_rows.append(np.asarray(r2)[:, SK_IDS])
+                _, r2r = infer_sh(ref_lora, base, jnp.asarray(t2), pt, px)
+                sk_rows_ref.append(np.asarray(r2r)[:, SK_IDS])
             for j, i_ in enumerate(grp[:len(exs)]):
                 lab = (ds.recs[i_].get("labels") or ds.recs[i_])
                 gt_rt, gt_sk = lab["role_type"], lab["sub_keyscene"]
@@ -368,8 +372,10 @@ def main():
                 if not keep:
                     continue        # DAPO 动态采样: 零梯度组丢弃
                 kept += 1
-                for (krt, ksk, lprt, lpsk), ad in zip(branch, adv):
-                    buf.append((i_, krt, ksk, lprt, lpsk, float(ad)))
+                for g_, ((krt, ksk, lprt, lpsk), ad) in enumerate(
+                        zip(branch, adv)):
+                    buf.append((i_, krt, ksk, lprt, lpsk, float(ad),
+                                r1r[j], sk_rows_ref[g_][j]))
         print(f"[rollout] round {rd}: 视频 {tot} kept {kept} "
               f"({kept/max(tot,1):.0%}) branches={len(buf)} "
               f"mean_reward={np.mean(stat_r):.3f}", flush=True)
@@ -394,12 +400,14 @@ def main():
                     toks[j, T + 1] = PIPE
                     toks[j, T + 2] = SK_IDS[ksk]
                 policy, opt_state, l = train_step(
-                    policy, opt_state, base, ref_lora, RT_J, SK_J,
+                    policy, opt_state, base, RT_J, SK_J,
                     jnp.asarray(toks), pt, px,
                     jnp.asarray([s[1] for s in sl], jnp.int32),
                     jnp.asarray([s[2] for s in sl], jnp.int32),
                     jnp.asarray([[s[3], s[4]] for s in sl], jnp.float32),
-                    jnp.asarray([s[5] for s in sl], jnp.float32))
+                    jnp.asarray([s[5] for s in sl], jnp.float32),
+                    jnp.asarray(np.stack([s[6] for s in sl]), jnp.float32),
+                    jnp.asarray(np.stack([s[7] for s in sl]), jnp.float32))
             print(f"[train] round {rd} epoch {ep} loss={float(l):.4f} "
                   f"({time.time()-t0:.0f}s)", flush=True)
 

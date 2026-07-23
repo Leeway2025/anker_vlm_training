@@ -238,8 +238,10 @@ def main():
         pvi = PreprocessedVisionInput(
             patches=patches, positions_xy=pos_xy, soft_token_counts=c00)
         out = model.apply({"params": params}, tokens=tokens, images=pvi)
-        lg = (out.logits if hasattr(out, "logits") else out).astype(jnp.float32)
-        return lg[:, T - 1], lg[:, T + 1]          # 全词表行,子集在外部取
+        lg = out.logits if hasattr(out, "logits") else out
+        # 先切片后转型(全尺寸 [B,L,V] 转 fp32 会多吃 ~2G HBM,OOM 实锤)
+        return (lg[:, T - 1].astype(jnp.float32),
+                lg[:, T + 1].astype(jnp.float32))
 
     def _bf(tree):
         return jax.tree.map(lambda x: x.astype(jnp.bfloat16), tree)

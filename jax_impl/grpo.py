@@ -302,7 +302,7 @@ def main():
     RT_J = jnp.asarray(RT_IDS, jnp.int32)
     SK_J = jnp.asarray(SK_IDS, jnp.int32)
 
-    @jax.jit
+    @functools.partial(jax.jit, donate_argnums=(0, 1))
     def train_step(pol, opt_state, base_p, rt_j, sk_j, *batch):
         l, g = grad_sh(pol, base_p, rt_j, sk_j, *batch)
         up, opt_state = tx.update(g, opt_state, pol)

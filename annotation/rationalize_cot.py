@@ -15,7 +15,11 @@
 用法:
   python -m annotation.rationalize_cot --labels DATA/labels.jsonl \
       --video-root videos/ --out rat_pass.jsonl \
-      --asset-out DATA_assets_rat/asset_C_reasoning.jsonl
+      --asset-out DATA_assets_rat/asset_C_reasoning.jsonl \
+      --workers 32        # 并发数按 API 配额调(客户配额 20~50);默认 32
+
+吞吐参考: 单条 ~5-10s;串行 83k ≈ 一周,32 并发 ≈ 5-6h,50 并发 ≈ 3-4h。
+先 --limit 200 试跑看 unsupported 率与限流报错,再放全量。
 
 判读: unsupported 率 <1% = 闸没咬合(prompt 被无视,重查);
       1%~25% = 正常;>30% = prompt 过严或标签质量问题,抽查再定。
@@ -135,6 +139,9 @@ def main():
     ap.add_argument("--model", default="gemini-3.1-pro")
     ap.add_argument("--temperature", type=float, default=0.1)
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--workers", type=int, default=32,
+                    help="并发请求数(IO 等待为主,线程池;按 API 配额调,"
+                         "客户配额支持 20~50)")
     ap.add_argument("--only-ids", default=None,
                     help="仅补采清单内的 video_id(如白名单外样本清单)")
     ap.add_argument("--vertex-project", default=None)
@@ -159,28 +166,39 @@ def main():
     os.makedirs(os.path.dirname(os.path.abspath(a.asset_out)), exist_ok=True)
     unsup_path = a.asset_out + ".unsupported_ids.txt"
 
-    seen = set()
+    # 先收集任务(去重/断点/清单过滤),再并发执行;写文件只在主线程
+    seen, tasks = set(), []
+    for line in open(a.labels, encoding="utf-8"):
+        rec = json.loads(line)
+        vid = rec["video_id"]
+        if vid in done or vid in seen:          # labels 可能含复制行,只标一次
+            continue
+        seen.add(vid)
+        if only is not None and vid not in only:
+            continue
+        if a.limit and len(tasks) >= a.limit:
+            break
+        lab = rec.get("labels", rec)
+        path = os.path.join(a.video_root,
+                            os.path.basename(rec.get("video_uri", vid)))
+        tasks.append((vid, lab, path))
+    print(f"todo: {len(tasks)} 条, workers={a.workers}")
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     n_ok = n_err = n_sup = n_unsup = 0
     with open(a.out, "a", encoding="utf-8") as fout, \
          open(a.out + ".errors", "a", encoding="utf-8") as ferr, \
          open(a.asset_out, "a", encoding="utf-8") as fasset, \
-         open(unsup_path, "a", encoding="utf-8") as funsup:
-        for line in open(a.labels, encoding="utf-8"):
-            rec = json.loads(line)
-            vid = rec["video_id"]
-            if vid in done or vid in seen:      # labels 可能含复制行,只标一次
-                continue
-            seen.add(vid)
-            if only is not None and vid not in only:
-                continue
-            if a.limit and n_ok >= a.limit:
-                break
-            lab = rec.get("labels", rec)
-            prompt = build_prompt(lab["role_type"], lab["sub_keyscene"])
-            path = os.path.join(a.video_root,
-                                os.path.basename(rec.get("video_uri", vid)))
-            d, errs = rationalize_one(client, a.model, path, prompt,
-                                      a.temperature)
+         open(unsup_path, "a", encoding="utf-8") as funsup, \
+         ThreadPoolExecutor(max_workers=a.workers) as ex:
+        futs = {ex.submit(rationalize_one, client, a.model, path,
+                          build_prompt(lab["role_type"],
+                                       lab["sub_keyscene"]),
+                          a.temperature): (vid, lab)
+                for vid, lab, path in tasks}
+        for fut in as_completed(futs):
+            vid, lab = futs[fut]
+            d, errs = fut.result()
             if d is not None and not errs:
                 fout.write(json.dumps(
                     {"video_id": vid, "gemini_model": a.model,

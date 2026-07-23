@@ -226,8 +226,8 @@ def main():
     mesh = Mesh(np.asarray(devs[:DP]), ("dp",))
 
     # ---- 前向: 两个决策位的字母子集 logits(rollout 与训练共用底) ----
-    def _rows(lora_h, tokens, patches, pos_xy):
-        params = gpeft.merge_params(base, lora_h)
+    def _rows(lora_h, base_p, tokens, patches, pos_xy):
+        params = gpeft.merge_params(base_p, lora_h)
         pvi = PreprocessedVisionInput(
             patches=patches, positions_xy=pos_xy, soft_token_counts=c00)
         out = model.apply({"params": params}, tokens=tokens, images=pvi)
@@ -237,19 +237,19 @@ def main():
     def _bf(tree):
         return jax.tree.map(lambda x: x.astype(jnp.bfloat16), tree)
 
-    def infer_local(pol, tokens, patches, pos_xy):
-        return _rows(_bf(pol), tokens, patches, pos_xy)
+    def infer_local(pol, base_p, tokens, patches, pos_xy):
+        return _rows(_bf(pol), base_p, tokens, patches, pos_xy)
     infer_sh = jax.jit(shard_map(
         infer_local, mesh=mesh,
-        in_specs=(P(), P("dp"), P("dp"), P("dp")),
+        in_specs=(P(), P(), P("dp"), P("dp"), P("dp")),
         out_specs=(P("dp"), P("dp")), check_rep=False))
 
-    def loss_fn(pol, rt_ids, sk_ids, tokens, patches, pos_xy,
-                idx_rt, idx_sk, behav, adv):
+    def loss_fn(pol, base_p, ref, rt_ids, sk_ids, tokens, patches,
+                pos_xy, idx_rt, idx_sk, behav, adv):
         pol_h = jax.tree_util.tree_map_with_path(
             lambda p, x: x.astype(jnp.bfloat16) if _is_trainable(_path_str(p))
             else jax.lax.stop_gradient(x.astype(jnp.bfloat16)), pol)
-        r1f, r2f = _rows(pol_h, tokens, patches, pos_xy)
+        r1f, r2f = _rows(pol_h, base_p, tokens, patches, pos_xy)
         r1 = jnp.take(r1f, rt_ids, axis=-1)
         r2 = jnp.take(r2f, sk_ids, axis=-1)
         lp1 = jax.nn.log_softmax(r1 / a.temp)
@@ -264,7 +264,7 @@ def main():
             cl = jnp.clip(ratio, 1 - a.eps_low, 1 + a.eps_high) * adv
             obj = obj + jnp.minimum(un, cl)
         # KL 锚: 子集分布对 ref 的精确 KL
-        rr1f, rr2f = _rows(ref_lora, tokens, patches, pos_xy)
+        rr1f, rr2f = _rows(ref, base_p, tokens, patches, pos_xy)
         rr1 = jnp.take(rr1f, rt_ids, axis=-1)
         rr2 = jnp.take(rr2f, sk_ids, axis=-1)
         kl = 0.0
@@ -276,24 +276,24 @@ def main():
         loss = (-obj + a.kl_coef * kl).mean()
         return loss
 
-    def grad_local(pol, rt_ids, sk_ids, tokens, patches, pos_xy,
-                   idx_rt, idx_sk, behav, adv):
-        l, g = jax.value_and_grad(loss_fn)(pol, rt_ids, sk_ids, tokens,
-                                           patches, pos_xy, idx_rt, idx_sk,
-                                           behav, adv)
+    def grad_local(pol, base_p, ref, rt_ids, sk_ids, tokens, patches,
+                   pos_xy, idx_rt, idx_sk, behav, adv):
+        l, g = jax.value_and_grad(loss_fn)(pol, base_p, ref, rt_ids, sk_ids,
+                                           tokens, patches, pos_xy, idx_rt,
+                                           idx_sk, behav, adv)
         return (jax.lax.pmean(l, "dp"),
                 jax.tree.map(lambda x: jax.lax.pmean(x, "dp"), g))
     grad_sh = shard_map(
         grad_local, mesh=mesh,
-        in_specs=(P(), P(), P()) + (P("dp"),) * 7,
+        in_specs=(P(),) * 5 + (P("dp"),) * 7,
         out_specs=(P(), P()), check_rep=False)
 
     RT_J = jnp.asarray(RT_IDS, jnp.int32)
     SK_J = jnp.asarray(SK_IDS, jnp.int32)
 
     @functools.partial(jax.jit, donate_argnums=(0, 1))
-    def train_step(pol, opt_state, *batch):
-        l, g = grad_sh(pol, RT_J, SK_J, *batch)
+    def train_step(pol, opt_state, base_p, ref, rt_j, sk_j, *batch):
+        l, g = grad_sh(pol, base_p, ref, rt_j, sk_j, *batch)
         up, opt_state = tx.update(g, opt_state, pol)
         return optax.apply_updates(pol, up), opt_state, l
 
@@ -324,7 +324,7 @@ def main():
             toks = np.zeros((DP, L), np.int32)
             for j, e in enumerate(exs):
                 toks[j, :T] = e["tokens"][:T]
-            r1, _ = infer_sh(policy, jnp.asarray(toks), pt, px)
+            r1, _ = infer_sh(policy, base, jnp.asarray(toks), pt, px)
             r1 = np.asarray(r1)[:, RT_IDS]
             # 每视频采 G 个 RT → 逐 RT 求条件 SK 行(G 次前向,B=DP)
             rt_pick = [[sample_subset(r1[j], np.arange(len(RT_SET)),
@@ -337,7 +337,7 @@ def main():
                 for j in range(DP):
                     t2[j, T] = RT_IDS[rt_pick[j][g_][0]]
                     t2[j, T + 1] = PIPE
-                _, r2 = infer_sh(policy, jnp.asarray(t2), pt, px)
+                _, r2 = infer_sh(policy, base, jnp.asarray(t2), pt, px)
                 sk_rows.append(np.asarray(r2)[:, SK_IDS])
             for j, i_ in enumerate(grp[:len(exs)]):
                 lab = (ds.recs[i_].get("labels") or ds.recs[i_])
@@ -385,7 +385,8 @@ def main():
                     toks[j, T + 1] = PIPE
                     toks[j, T + 2] = SK_IDS[ksk]
                 policy, opt_state, l = train_step(
-                    policy, opt_state, jnp.asarray(toks), pt, px,
+                    policy, opt_state, base, ref_lora, RT_J, SK_J,
+                    jnp.asarray(toks), pt, px,
                     jnp.asarray([s[1] for s in sl], jnp.int32),
                     jnp.asarray([s[2] for s in sl], jnp.int32),
                     jnp.asarray([[s[3], s[4]] for s in sl], jnp.float32),

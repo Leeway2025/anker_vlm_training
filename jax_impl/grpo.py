@@ -254,7 +254,8 @@ def main():
         out_specs=(P("dp"), P("dp")), check_rep=False))
 
     def loss_fn(pol, base_p, rt_ids, sk_ids, tokens, patches,
-                pos_xy, idx_rt, idx_sk, behav, adv, ref1, ref2):
+                pos_xy, idx_rt, idx_sk, behav_rt, behav_sk, adv,
+                ref1, ref2):
         pol_h = jax.tree_util.tree_map_with_path(
             lambda p, x: x.astype(jnp.bfloat16) if _is_trainable(_path_str(p))
             else jax.lax.stop_gradient(x.astype(jnp.bfloat16)), pol)
@@ -267,7 +268,7 @@ def main():
         lp_sk = jnp.take_along_axis(lp2, idx_sk[:, None], 1)[:, 0]
         # PPO 裁剪(token 级,两个决策位;Clip-Higher 上界独立)
         obj = 0.0
-        for lp, bh in ((lp_rt, behav[:, 0]), (lp_sk, behav[:, 1])):
+        for lp, bh in ((lp_rt, behav_rt), (lp_sk, behav_sk)):
             ratio = jnp.exp(lp - bh)
             un = ratio * adv
             cl = jnp.clip(ratio, 1 - a.eps_low, 1 + a.eps_high) * adv
@@ -285,15 +286,17 @@ def main():
         return loss
 
     def grad_local(pol, base_p, rt_ids, sk_ids, tokens, patches,
-                   pos_xy, idx_rt, idx_sk, behav, adv, ref1, ref2):
+                   pos_xy, idx_rt, idx_sk, behav_rt, behav_sk, adv,
+                   ref1, ref2):
         l, g = jax.value_and_grad(loss_fn)(pol, base_p, rt_ids, sk_ids,
                                            tokens, patches, pos_xy, idx_rt,
-                                           idx_sk, behav, adv, ref1, ref2)
+                                           idx_sk, behav_rt, behav_sk, adv,
+                                           ref1, ref2)
         return (jax.lax.pmean(l, "dp"),
                 jax.tree.map(lambda x: jax.lax.pmean(x, "dp"), g))
     grad_sh = shard_map(
         grad_local, mesh=mesh,
-        in_specs=(P(),) * 4 + (P("dp"),) * 9,
+        in_specs=(P(),) * 4 + (P("dp"),) * 10,
         out_specs=(P(), P()), check_rep=False)
 
     RT_J = jnp.asarray(RT_IDS, jnp.int32)
@@ -404,7 +407,8 @@ def main():
                     jnp.asarray(toks), pt, px,
                     jnp.asarray([s[1] for s in sl], jnp.int32),
                     jnp.asarray([s[2] for s in sl], jnp.int32),
-                    jnp.asarray([[s[3], s[4]] for s in sl], jnp.float32),
+                    jnp.asarray([s[3] for s in sl], jnp.float32),
+                    jnp.asarray([s[4] for s in sl], jnp.float32),
                     jnp.asarray([s[5] for s in sl], jnp.float32),
                     jnp.asarray(np.stack([s[6] for s in sl]), jnp.float32),
                     jnp.asarray(np.stack([s[7] for s in sl]), jnp.float32))

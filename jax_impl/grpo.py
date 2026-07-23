@@ -232,7 +232,7 @@ def main():
             patches=patches, positions_xy=pos_xy, soft_token_counts=c00)
         out = model.apply({"params": params}, tokens=tokens, images=pvi)
         lg = (out.logits if hasattr(out, "logits") else out).astype(jnp.float32)
-        return lg[:, T - 1][:, RT_IDS], lg[:, T + 1][:, SK_IDS]
+        return lg[:, T - 1], lg[:, T + 1]          # 全词表行,子集在外部取
 
     def _bf(tree):
         return jax.tree.map(lambda x: x.astype(jnp.bfloat16), tree)
@@ -244,12 +244,14 @@ def main():
         in_specs=(P(), P("dp"), P("dp"), P("dp")),
         out_specs=(P("dp"), P("dp")), check_rep=False))
 
-    def loss_fn(pol, tokens, patches, pos_xy, idx_rt, idx_sk,
-                behav, adv):
+    def loss_fn(pol, rt_ids, sk_ids, tokens, patches, pos_xy,
+                idx_rt, idx_sk, behav, adv):
         pol_h = jax.tree_util.tree_map_with_path(
             lambda p, x: x.astype(jnp.bfloat16) if _is_trainable(_path_str(p))
             else jax.lax.stop_gradient(x.astype(jnp.bfloat16)), pol)
-        r1, r2 = _rows(pol_h, tokens, patches, pos_xy)
+        r1f, r2f = _rows(pol_h, tokens, patches, pos_xy)
+        r1 = jnp.take(r1f, rt_ids, axis=-1)
+        r2 = jnp.take(r2f, sk_ids, axis=-1)
         lp1 = jax.nn.log_softmax(r1 / a.temp)
         lp2 = jax.nn.log_softmax(r2 / a.temp)
         lp_rt = jnp.take_along_axis(lp1, idx_rt[:, None], 1)[:, 0]
@@ -262,7 +264,9 @@ def main():
             cl = jnp.clip(ratio, 1 - a.eps_low, 1 + a.eps_high) * adv
             obj = obj + jnp.minimum(un, cl)
         # KL 锚: 子集分布对 ref 的精确 KL
-        rr1, rr2 = _rows(ref_lora, tokens, patches, pos_xy)
+        rr1f, rr2f = _rows(ref_lora, tokens, patches, pos_xy)
+        rr1 = jnp.take(rr1f, rt_ids, axis=-1)
+        rr2 = jnp.take(rr2f, sk_ids, axis=-1)
         kl = 0.0
         for r_, rr in ((r1, rr1), (r2, rr2)):
             p_ = jax.nn.softmax(r_ / a.temp)
@@ -272,20 +276,24 @@ def main():
         loss = (-obj + a.kl_coef * kl).mean()
         return loss
 
-    def grad_local(pol, tokens, patches, pos_xy, idx_rt, idx_sk,
-                   behav, adv):
-        l, g = jax.value_and_grad(loss_fn)(pol, tokens, patches, pos_xy,
-                                           idx_rt, idx_sk, behav, adv)
+    def grad_local(pol, rt_ids, sk_ids, tokens, patches, pos_xy,
+                   idx_rt, idx_sk, behav, adv):
+        l, g = jax.value_and_grad(loss_fn)(pol, rt_ids, sk_ids, tokens,
+                                           patches, pos_xy, idx_rt, idx_sk,
+                                           behav, adv)
         return (jax.lax.pmean(l, "dp"),
                 jax.tree.map(lambda x: jax.lax.pmean(x, "dp"), g))
     grad_sh = shard_map(
         grad_local, mesh=mesh,
-        in_specs=(P(),) + (P("dp"),) * 7,
+        in_specs=(P(), P(), P()) + (P("dp"),) * 7,
         out_specs=(P(), P()), check_rep=False)
+
+    RT_J = jnp.asarray(RT_IDS, jnp.int32)
+    SK_J = jnp.asarray(SK_IDS, jnp.int32)
 
     @functools.partial(jax.jit, donate_argnums=(0, 1))
     def train_step(pol, opt_state, *batch):
-        l, g = grad_sh(pol, *batch)
+        l, g = grad_sh(pol, RT_J, SK_J, *batch)
         up, opt_state = tx.update(g, opt_state, pol)
         return optax.apply_updates(pol, up), opt_state, l
 
@@ -317,7 +325,7 @@ def main():
             for j, e in enumerate(exs):
                 toks[j, :T] = e["tokens"][:T]
             r1, _ = infer_sh(policy, jnp.asarray(toks), pt, px)
-            r1 = np.asarray(r1)
+            r1 = np.asarray(r1)[:, RT_IDS]
             # 每视频采 G 个 RT → 逐 RT 求条件 SK 行(G 次前向,B=DP)
             rt_pick = [[sample_subset(r1[j], np.arange(len(RT_SET)),
                                       a.temp, rng)
@@ -330,7 +338,7 @@ def main():
                     t2[j, T] = RT_IDS[rt_pick[j][g_][0]]
                     t2[j, T + 1] = PIPE
                 _, r2 = infer_sh(policy, jnp.asarray(t2), pt, px)
-                sk_rows.append(np.asarray(r2))
+                sk_rows.append(np.asarray(r2)[:, SK_IDS])
             for j, i_ in enumerate(grp[:len(exs)]):
                 lab = (ds.recs[i_].get("labels") or ds.recs[i_])
                 gt_rt, gt_sk = lab["role_type"], lab["sub_keyscene"]

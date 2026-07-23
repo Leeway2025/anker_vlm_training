@@ -72,6 +72,14 @@ def main():
     ap.add_argument("--aux-conf-threshold", type=float, default=0.5,
                     help="低于此置信度的标注整条屏蔽(torch 同款)")
     ap.add_argument("--aux-coef", type=float, default=0.3)
+    ap.add_argument("--teacher-npz", default=None,
+                    help="蒸馏老师产物(uniform 单一 rank,由 "
+                         "svd_truncate_lora --pad-to-uniform 产出);"
+                         "老师冻结前向 + KL 对齐,步耗时约 ×1.8。"
+                         "仅支持 uniform 学生(小 rank 修复轮)")
+    ap.add_argument("--distill-coef", type=float, default=0.5,
+                    help="KL 蒸馏损失系数(硬标签 CE 保持全额)")
+    ap.add_argument("--distill-temp", type=float, default=2.0)
     ap.add_argument("--ks-head", action="store_true", help="KS 父类头(6 类)")
     ap.add_argument("--ks-coef", type=float, default=0.2)
     ap.add_argument("--cot-file", help="资产 C reasoning.jsonl → 隐式 CoT")
@@ -276,6 +284,43 @@ def main():
             msg += (f";⚠️ 全零 LoRA a 跳过 {st['zero_a_skip']} 叶"
                     f"(npz 来自未训 LoRA 的阶段,保留本次新初始化)")
         print(msg)
+    # ---- 蒸馏老师(--teacher-npz): uniform 大 rank 冻结前向,KL 对齐 ----
+    TEACH = {"lora": {}, "proj": {}}
+    model_t = None
+    if a.teacher_npz:
+        if a.rank_scheme == "prod":
+            raise SystemExit(
+                "--teacher-npz 仅支持 uniform 学生: prod 的 adapter patch "
+                "是类级别的,会同时劫持老师前向(老师 rank 会被按路径改写)")
+        from jax_impl.npz_io import (detect_rank_scheme as _drs,
+                                     load_lora_strict as _lls)
+        zt = np.load(a.teacher_npz)
+        t_scheme, t_ranks = _drs(zt)
+        if t_scheme != "uniform":
+            raise SystemExit(
+                f"老师 npz 须 uniform 单一 rank(现 {t_ranks})—— 用 "
+                "svd_truncate_lora.py --rank <R> --pad-to-uniform 重切")
+        model_t = gm.nn.LoRA(rank=t_ranks[0],
+                             model=gm.nn.Gemma4_E2B(text_only=False,
+                                                    config=cfg64))
+        struct_t = jax.eval_shape(lambda: model_t.init(
+            jax.random.PRNGKey(0),
+            tokens=jnp.asarray(ex["tokens"][None]), images=dummy_pvi))
+        lora_t = _lls(zt, gpeft.split_params(struct_t["params"])[1],
+                      jnp, jnp.bfloat16)
+        proj_t = {}
+        for f in zt.files:                 # 老师 proj 同车(若产物携带)
+            if not f.startswith("proj/"):
+                continue
+            segs = f.split("/")[1:]
+            node = proj_t
+            for s0 in segs[:-1]:
+                node = node.setdefault(s0, {})
+            node[segs[-1]] = jnp.asarray(zt[f], jnp.bfloat16)
+        TEACH = {"lora": lora_t, "proj": proj_t}
+        print(f"[distill] teacher rank={t_ranks[0]} coef={a.distill_coef} "
+              f"temp={a.distill_temp} proj={'有' if proj_t else '无(用 base)'}")
+
     # lr 日程: warmup + 线性衰减到 0(对齐 torch Trainer 默认;MultiSteps
     # 只在累积满时调用内层 update → 日程按 opt step 计数,与 torch 同拍)
     def mk_sched(peak):
@@ -325,8 +370,8 @@ def main():
     T = len(full.template)
     mesh = Mesh(np.asarray(devs[:DP]), ("dp",))
 
-    def loss_fn(train, base_p, tokens, labels, weights, patches, pos_xy,
-                aux_labels, ks_label):
+    def loss_fn(train, base_p, teach, tokens, labels, weights, patches,
+                pos_xy, aux_labels, ks_label):
         # v1 坑 5: fp32 参与会把激活链提升 fp32 → 前向统一 bf16;
         # 冻结 lora 叶 stop_gradient(v1 坑 6: 切断未训练子树反向)
         lora_h = jax.tree_util.tree_map_with_path(
@@ -360,6 +405,32 @@ def main():
         ce = jnp.where(valid > 0, ce, 0.0)      # PAD 行 NaN×0 防护
         loss = (ce * wt).sum() / jnp.clip((wt * valid).sum(), 1.0)
 
+        if a.teacher_npz:                       # KL 蒸馏(老师冻结前向)
+            lora_t_h = jax.tree.map(
+                lambda x: jax.lax.stop_gradient(x.astype(jnp.bfloat16)),
+                teach["lora"])
+            base_t = base_p
+            if teach["proj"]:
+                emb_t = dict(base_p["embedder"])
+                for k in teach["proj"]:
+                    emb_t[k] = jax.tree.map(
+                        lambda x: x.astype(jnp.bfloat16), teach["proj"][k])
+                base_t = dict(base_p)
+                base_t["embedder"] = emb_t
+            params_t = gpeft.merge_params(base_t, lora_t_h)
+            out_t = model_t.apply({"params": params_t}, tokens=tokens,
+                                  images=pvi)
+            lg_t = jax.lax.stop_gradient(
+                (out_t.logits if hasattr(out_t, "logits") else out_t)
+                [:, T - 1:-1].astype(jnp.float32))
+            tau = a.distill_temp
+            p_t = jax.nn.softmax(lg_t / tau)
+            kl = (p_t * (jax.nn.log_softmax(lg_t / tau)
+                         - jax.nn.log_softmax(lg / tau))).sum(-1)
+            kl = jnp.where(valid > 0, kl, 0.0)
+            dloss = (kl * wt).sum() / jnp.clip((wt * valid).sum(), 1.0)
+            loss = loss + a.distill_coef * (tau * tau) * dloss
+
         if need_hidden:
             hs = out.hidden_states
             hs = hs[-1] if isinstance(hs, (tuple, list)) else hs
@@ -389,35 +460,36 @@ def main():
                     train["aux"]["ks"]["w"], train["aux"]["ks"]["b"], ks_label)
         return loss
 
-    def grad_local(train, base_p, tokens, labels, weights, patches, pos_xy,
-                   aux_labels, ks_label):
+    def grad_local(train, base_p, teach, tokens, labels, weights, patches,
+                   pos_xy, aux_labels, ks_label):
         loss, grads = jax.value_and_grad(loss_fn)(
-            train, base_p, tokens, labels, weights, patches, pos_xy,
+            train, base_p, teach, tokens, labels, weights, patches, pos_xy,
             aux_labels, ks_label)
         return (jax.lax.pmean(loss, "dp"),
                 jax.tree.map(lambda g: jax.lax.pmean(g, "dp"), grads))
 
     grad_sharded = shard_map(
         grad_local, mesh=mesh,
-        in_specs=(P(), P(), P("dp"), P("dp"), P("dp"), P("dp"), P("dp"),
-                  P("dp"), P("dp")),
+        in_specs=(P(), P(), P(), P("dp"), P("dp"), P("dp"), P("dp"),
+                  P("dp"), P("dp"), P("dp")),
         out_specs=(P(), P()), check_rep=False)
 
     @functools.partial(jax.jit, donate_argnums=(0, 1))
-    def train_step(train, opt_state, base_p, tokens, labels, weights,
+    def train_step(train, opt_state, base_p, teach, tokens, labels, weights,
                    patches, pos_xy, aux_labels, ks_label):
-        loss, grads = grad_sharded(train, base_p, tokens, labels, weights,
-                                   patches, pos_xy, aux_labels, ks_label)
+        loss, grads = grad_sharded(train, base_p, teach, tokens, labels,
+                                   weights, patches, pos_xy, aux_labels,
+                                   ks_label)
         updates, opt_state = optim.update(grads, opt_state, train)
         train = optax.apply_updates(train, updates)
         return train, opt_state, loss
 
     eval_local = shard_map(
-        lambda tr, bp, t, l, w, p, x, al, kl: jax.lax.pmean(
-            loss_fn(tr, bp, t, l, w, p, x, al, kl), "dp"),
+        lambda tr, bp, tc, t, l, w, p, x, al, kl: jax.lax.pmean(
+            loss_fn(tr, bp, tc, t, l, w, p, x, al, kl), "dp"),
         mesh=mesh,
-        in_specs=(P(), P(), P("dp"), P("dp"), P("dp"), P("dp"), P("dp"),
-                  P("dp"), P("dp")),
+        in_specs=(P(), P(), P(), P("dp"), P("dp"), P("dp"), P("dp"),
+                  P("dp"), P("dp"), P("dp")),
         out_specs=P(), check_rep=False)
     eval_loss_j = jax.jit(eval_local)
 
@@ -472,7 +544,8 @@ def main():
             idxs = [draw(cursor + j) for j in range(DP * BS)]
             cursor += DP * BS
             batch = collect(idxs)
-        train, opt_state, loss = train_step(train, opt_state, base, *batch)
+        train, opt_state, loss = train_step(train, opt_state, base, TEACH,
+                                            *batch)
         if micro == 0:
             print(f"[compile+step0] {time.time()-t0:.0f}s", flush=True)
             t0 = time.time()
@@ -490,7 +563,7 @@ def main():
                 vl = []
                 for k in range(0, len(val_idx) - DP * BS + 1, DP * BS):
                     vb = collect(val_idx[k:k + DP * BS])
-                    vl.append(float(eval_loss_j(train, base, *vb)))
+                    vl.append(float(eval_loss_j(train, base, TEACH, *vb)))
                 v = sum(vl) / max(len(vl), 1)
                 tag = ""
                 if vl and v < best[0]:

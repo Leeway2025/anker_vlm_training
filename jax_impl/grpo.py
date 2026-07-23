@@ -222,8 +222,15 @@ def main():
 
     tx = optax.adamw(a.lr, weight_decay=0.0)
     tx = optax.MultiSteps(tx, every_k_schedule=a.accum)
-    opt_state = tx.init(policy0)
     mesh = Mesh(np.asarray(devs[:DP]), ("dp",))
+    # 显式复制布局: base 来自 ckpt 加载器,自带 'devices' mesh 分片,
+    # 直接喂 jit(shard_map) 会编译/运行布局不一致(真机门禁实锤)
+    from jax.sharding import NamedSharding
+    _REP = NamedSharding(mesh, P())
+    base = jax.device_put(base, _REP)
+    ref_lora = jax.device_put(ref_lora, _REP)
+    policy0 = jax.device_put(policy0, _REP)
+    opt_state = tx.init(policy0)
 
     # ---- 前向: 两个决策位的字母子集 logits(rollout 与训练共用底) ----
     def _rows(lora_h, base_p, tokens, patches, pos_xy):
@@ -291,7 +298,7 @@ def main():
     RT_J = jnp.asarray(RT_IDS, jnp.int32)
     SK_J = jnp.asarray(SK_IDS, jnp.int32)
 
-    @functools.partial(jax.jit, donate_argnums=(0, 1))
+    @jax.jit
     def train_step(pol, opt_state, base_p, ref, rt_j, sk_j, *batch):
         l, g = grad_sh(pol, base_p, ref, rt_j, sk_j, *batch)
         up, opt_state = tx.update(g, opt_state, pol)

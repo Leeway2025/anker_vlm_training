@@ -181,9 +181,17 @@ def main():
     a = ap.parse_args()
 
     from google import genai
-    client = genai.Client(vertexai=True, project=a.vertex_project,
-                          location=a.location) if a.vertex_project \
-        else genai.Client(api_key=a.api_key)   # None → SDK 读环境变量
+    key = a.api_key or os.environ.get("GOOGLE_API_KEY") \
+        or os.environ.get("GEMINI_API_KEY")
+    if a.vertex_project:
+        client = genai.Client(vertexai=True, project=a.vertex_project,
+                              location=a.location)
+    elif key and key.startswith("AQ."):
+        # Vertex express key(AQ. 前缀)必须走 vertexai 通道,
+        # 当普通 key 用会打到 generativelanguage → 403 SERVICE_DISABLED
+        client = genai.Client(vertexai=True, api_key=key)
+    else:
+        client = genai.Client(api_key=key)     # None → SDK 读环境变量
 
     # GT 映射: video_id → (rt, sk);labels 复制行天然去重(dict 覆盖)
     gt = {}

@@ -25,9 +25,16 @@ def main():
                     help="训练日志 [data] 行的 val 数(如 515)")
     ap.add_argument("--seed", type=int, default=0, help="同训练 --seed")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--ids-out", default=None,
+                    help="同时导出 video_id 清单(供 train_sft --val-ids)")
     a = ap.parse_args()
     recs = [json.loads(l) for l in open(a.labels, encoding="utf-8")]
     _, va = split_by_camera(recs, a.val_n, seed=a.seed)
+    if a.ids_out:
+        with open(a.ids_out, "w") as f:
+            for r in va:
+                f.write(r["video_id"] + "\n")
+        print(f"[OK] val_ids({len(va)} 条)-> {a.ids_out}")
     with open(a.out, "w", encoding="utf-8") as f:
         for r in va:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")

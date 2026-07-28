@@ -61,6 +61,9 @@ def main():
                     help="连续 N 次 eval 无 val 改善即停(0=关;torch 同款"
                          "语义 patience=3;best 权重始终已落盘)")
     ap.add_argument("--val-n", type=int, default=8)
+    ap.add_argument("--val-ids", default=None,
+                    help="固定 val 卷子文件(每行一个 video_id;传入后 "
+                         "--val-n 失效,所有实验在同一标尺上选 best)")
     ap.add_argument("--out", default="/dev/shm/out_jax_sft")
     ap.add_argument("--stage", choices=["a", "b"], default="b",
                     help="a=仅 projector 预热(LoRA 全冻结)")
@@ -176,9 +179,11 @@ def main():
     from jax_impl.data import load_jsonl_map
     tok = gm.text.Gemma4Tokenizer()
     sw = json.load(open(a.sample_weights)) if a.sample_weights else None
+    val_ids = (set(open(a.val_ids).read().split())
+               if a.val_ids else None)
     # val_n 对齐 DP*BS: 旧版 val_n < DP*BS 时 eval 空转、val_loss 恒 0
     vn = 0
-    if a.eval_every and a.val_n:
+    if a.eval_every and a.val_n and not val_ids:
         g = DP * BS
         vn = ((a.val_n + g - 1) // g) * g
         if vn != a.val_n:
@@ -189,7 +194,7 @@ def main():
         cot_ratio=a.cot_ratio,
         attributes=load_jsonl_map(a.aux_file) if a.aux_file else None,
         seed=a.seed, val_n=vn, aux_conf_threshold=a.aux_conf_threshold,
-        augment=a.augment)
+        augment=a.augment, val_ids=val_ids)
     train_idx, val_idx = full.train_idx, full.val_idx
     print(f"[data] train={len(train_idx)} val={len(val_idx)}"
           f"(按 camera 切分, seed={a.seed}, 先切后复制) "

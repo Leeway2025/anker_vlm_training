@@ -83,11 +83,18 @@ class SftDataset:
                  max_label_len=64, cls_weight=4.0, sample_weights=None,
                  reasoning=None, cot_ratio=0.6, attributes=None,
                  max_think_len=96, seed=0, val_n=0,
-                 aux_conf_threshold=0.5, augment=False):
+                 aux_conf_threshold=0.5, augment=False, val_ids=None):
         recs = [json.loads(l) for l in open(labels_file, encoding="utf-8")]
         # 顺序铁律: 先切 val、再对 train 做 hard-mining 复制 —— 反过来
         # 副本会横跨 train/val(泄漏,val loss 虚低)。torch 侧同序。
-        if val_n:
+        if val_ids:
+            # 固定卷子: val 成员由外部清单钉死,训练数据增删不再改变
+            # 选模标尺(消跑次方差中的"选模噪声";清单外的行全部进 train)
+            val_recs = [r for r in recs if r["video_id"] in val_ids]
+            train_recs = [r for r in recs if r["video_id"] not in val_ids]
+            print(f"[data] val 固定卷子: 命中 {len(val_recs)}/{len(val_ids)}"
+                  f"(清单内不在本数据文件的 {len(val_ids)-len(val_recs)} 条忽略)")
+        elif val_n:
             train_recs, val_recs = split_by_camera(recs, val_n, seed=seed)
         else:
             train_recs, val_recs = recs, []

@@ -224,6 +224,34 @@ python jax_impl/diagnose_preds.py --preds outputs/eval_preds.jsonl \
 输出:RT / SubKS / 双对 acc、KS 父类 acc、安全关键 SubKS 召回、
 格式合规率(与客户口径一致)。
 
+## S8.5 指标观测与共享(2026-07-28 起全轮启用)
+
+训练器对每个 opt step / eval 做**三路标量输出**,同一份数据三个受众:
+
+| 出口 | 开关 | 受众/用途 |
+|---|---|---|
+| `<out>/metrics.jsonl` | 永远开 | 机读分析/跨轮对比 —— 训练完把此文件归档共享即可 |
+| `<out>/tb/` | 镜像有 tensorboardX 即写 | 本机看图: `ssh -L 6006:localhost:6006` + `tensorboard --logdir outputs` |
+| wandb | `--wandb` + 环境变量 | 团队仪表盘(见下) |
+
+**wandb 本地自托管**(数据不出机,内网共享;免费 license 覆盖单机):
+
+```bash
+sudo docker run -d --name wandb-local --restart unless-stopped \
+    -p 8080:8080 -v /data/wandb_server:/vol wandb/local
+# 浏览器 http://<机器IP>:8080 注册本地账号 → 拿本地 API key
+export WANDB_BASE_URL=http://localhost:8080
+export WANDB_API_KEY=<本地key>
+# 训练命令加 --wandb
+```
+
+**性能剖析**: 冒烟时加 `--profile-steps 20`,XLA timeline 落
+`<out>/tb_profile/`,TensorBoard 打开看算子级耗时。
+
+**相关缺省变更(2026-07-28)**: Adam 一阶动量默认 bf16(--mu-dtype
+可回退 float32);val 卷子建议统一钉死: `export_val_split.py --ids-out`
+产清单后,所有训练加 `--val-ids <清单>`(消跨轮选模噪声)。
+
 ## S9. 导出交付 —— 回到 HF/RKLLM 生态
 
 > **视觉塔 LoRA 已可导出**(2026-07-20,commit cb4bbe0 起): export_hf

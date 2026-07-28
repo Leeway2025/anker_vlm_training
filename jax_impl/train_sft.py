@@ -97,6 +97,9 @@ def main():
     ap.add_argument("--profile-steps", type=int, default=0,
                     help=">0: 抓 opt step 10 起 N 步的 XLA trace 到 "
                          "<out>/tb_profile(TensorBoard 打开看 timeline)")
+    ap.add_argument("--wandb", action="store_true",
+                    help="上报 wandb(需 WANDB_API_KEY;指标/超参上云,"
+                         "先过数据合规再开;离线用 WANDB_MODE=offline)")
     a = ap.parse_args()
     # v7 防过热: prod 的 rsLoRA scale(32/45)叠加热 lr/LoRA+ 会训死
     # 视觉→字母回路 —— prod 缺省自动用已验证冷配方,显式传参可覆盖
@@ -526,12 +529,24 @@ def main():
     except Exception:  # noqa: BLE001
         _tb = None
         print("[metrics] tensorboardX 不可用,仅写 metrics.jsonl")
+    _wb = None
+    if a.wandb:
+        try:
+            import wandb as _wb
+            _wb.init(project="anker-vlm",
+                     name=os.path.basename(a.out.rstrip("/")),
+                     config=vars(a))
+        except Exception as e:  # noqa: BLE001
+            _wb = None
+            print(f"[metrics] wandb 初始化失败,忽略: {e}")
 
     def _log_scalar(step, **kv):
         _mf.write(json.dumps({"step": step, **kv}) + "\n")
         if _tb:
             for k, v in kv.items():
                 _tb.add_scalar(k, v, step)
+        if _wb:
+            _wb.log(kv, step=step)
     hist, best = [], (1e9, -1)
     cursor = 0
     t0 = time.time()

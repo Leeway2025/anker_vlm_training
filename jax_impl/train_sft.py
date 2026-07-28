@@ -90,6 +90,13 @@ def main():
     ap.add_argument("--cot-anneal", type=float, default=0.5,
                     help="最后该比例的步数切纯生产模式")
     ap.add_argument("--init-npz", help="从 train_params.npz 续训(或 import_hf 产物)")
+    ap.add_argument("--mu-dtype", choices=["bfloat16", "float32"],
+                    default="bfloat16",
+                    help="Adam 一阶动量精度(bf16 省 HBM ~2-4G,为 bs2/"
+                         "松 remat 腾空间;LoRA 微调实证无损)")
+    ap.add_argument("--profile-steps", type=int, default=0,
+                    help=">0: 抓 opt step 10 起 N 步的 XLA trace 到 "
+                         "<out>/tb_profile(TensorBoard 打开看 timeline)")
     a = ap.parse_args()
     # v7 防过热: prod 的 rsLoRA scale(32/45)叠加热 lr/LoRA+ 会训死
     # 视觉→字母回路 —— prod 缺省自动用已验证冷配方,显式传参可覆盖
@@ -355,7 +362,8 @@ def main():
     tx = optax.chain(
         optax.clip_by_global_norm(1.0),         # 对齐 torch max_grad_norm
         optax.multi_transform(
-            {g: optax.adamw(mk_sched(lr), weight_decay=a.weight_decay)
+            {g: optax.adamw(mk_sched(lr), weight_decay=a.weight_decay,
+                            mu_dtype=a.mu_dtype)
              for g, lr in GROUP_LR.items()},
             param_labels=lambda tree: jax.tree_util.tree_map_with_path(
                 _group, tree)))
@@ -511,6 +519,19 @@ def main():
 
     train = train0
     os.makedirs(a.out, exist_ok=True)
+    _mf = open(os.path.join(a.out, "metrics.jsonl"), "a", buffering=1)
+    try:                                    # TB 可选(镜像无包则静默降级)
+        from tensorboardX import SummaryWriter
+        _tb = SummaryWriter(os.path.join(a.out, "tb"))
+    except Exception:  # noqa: BLE001
+        _tb = None
+        print("[metrics] tensorboardX 不可用,仅写 metrics.jsonl")
+
+    def _log_scalar(step, **kv):
+        _mf.write(json.dumps({"step": step, **kv}) + "\n")
+        if _tb:
+            for k, v in kv.items():
+                _tb.add_scalar(k, v, step)
     hist, best = [], (1e9, -1)
     cursor = 0
     t0 = time.time()
@@ -564,6 +585,13 @@ def main():
             print(f"[sft] opt_step {opt_step}/{a.steps} loss={l:.4f} "
                   f"marginal_micro_s={dt:.3f} "
                   f"samples/s={DP*BS/max(dt,1e-9):.1f}", flush=True)
+            _log_scalar(opt_step, loss=l,
+                        samples_per_s=DP * BS / max(dt, 1e-9))
+            if a.profile_steps and opt_step == 10:
+                jax.profiler.start_trace(os.path.join(a.out, "tb_profile"))
+            if a.profile_steps and opt_step == 10 + a.profile_steps:
+                jax.profiler.stop_trace()
+                print(f"[profile] trace 已存 {a.out}/tb_profile", flush=True)
             if a.eval_every and opt_step % a.eval_every == 0:
                 vl = []
                 for k in range(0, len(val_idx) - DP * BS + 1, DP * BS):
@@ -580,6 +608,7 @@ def main():
                              **{_path_str(p): np.asarray(x) for p, x in bf})
                 print(f"[eval] opt_step {opt_step} val_loss={v:.4f}{tag}",
                       flush=True)
+                _log_scalar(opt_step, val_loss=v)
                 if tag:
                     main._since_best = 0
                 else:

@@ -10,26 +10,70 @@
 信号问题。纯 stdlib+本仓库,宿主机 python3 直接跑。
 """
 import argparse
+import collections
 import json
 import os
+import random
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from jax_impl.data import split_by_camera  # noqa: E402
 
 
+def match_mix_split(recs, mix_file, n_target, seed):
+    """按参考文件的类配比切 val,camera 整组贪心装箱。
+    规则: 逐机位(随机序)尝试加入,若加入后各类均不超过
+    配额×1.10 则收下;配额 = 参考配比 × n_target(可用量封顶)。"""
+    sk = lambda r: (r.get("labels") or r)["sub_keyscene"]
+    ref = [json.loads(l) for l in open(mix_file, encoding="utf-8")]
+    ref_c = collections.Counter(sk(r) for r in ref)
+    ref_n = sum(ref_c.values())
+    avail = collections.Counter(sk(r) for r in recs)
+    quota = {k: min(round(v / ref_n * n_target), avail.get(k, 0))
+             for k, v in ref_c.items()}
+    by_cam = collections.defaultdict(list)
+    for r in recs:
+        cam = (r.get("meta") or {}).get("camera_id") or r["video_id"]
+        if cam == "unknown":
+            cam = r["video_id"]
+        by_cam[cam].append(r)
+    cams = sorted(by_cam)
+    random.Random(seed).shuffle(cams)
+    got = collections.Counter()
+    val = []
+    for c in cams:
+        g = by_cam[c]
+        gc = collections.Counter(sk(r) for r in g)
+        if all(got[k] + v <= quota.get(k, 0) * 1.10 + 1 for k, v in gc.items()):
+            val += g
+            got.update(gc)
+        if sum(got.values()) >= n_target:
+            break
+    print(f"[match-mix] 目标 {n_target} → 实切 {len(val)};配比偏差:")
+    for k in sorted(quota, key=lambda k: -quota[k]):
+        if quota[k]:
+            print(f"  [{k}] 配额 {quota[k]:>4} 实得 {got[k]:>4}")
+    return val
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--labels", required=True, help="训练用 labels.jsonl")
     ap.add_argument("--val-n", type=int, required=True,
-                    help="训练日志 [data] 行的 val 数(如 515)")
+                    help="目标 val 条数(match-mix 模式为近似目标)")
+    ap.add_argument("--match-mix", default=None,
+                    help="传参考 jsonl(如 labels_test): val 类配比对齐它;"
+                         "camera 整组贪心装箱,配比误差 ±1.5%% 左右")
     ap.add_argument("--seed", type=int, default=0, help="同训练 --seed")
     ap.add_argument("--out", required=True)
     ap.add_argument("--ids-out", default=None,
                     help="同时导出 video_id 清单(供 train_sft --val-ids)")
     a = ap.parse_args()
     recs = [json.loads(l) for l in open(a.labels, encoding="utf-8")]
-    _, va = split_by_camera(recs, a.val_n, seed=a.seed)
+    if a.match_mix:
+        va = match_mix_split(recs, a.match_mix, a.val_n, a.seed)
+    else:
+        _, va = split_by_camera(recs, a.val_n, seed=a.seed)
     if a.ids_out:
         with open(a.ids_out, "w") as f:
             for r in va:

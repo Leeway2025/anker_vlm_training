@@ -34,7 +34,17 @@ def main():
     ap.add_argument("--init-npz", help="SFT 产物 lora(policy 起点)")
     ap.add_argument("--steps", type=int, default=10)
     ap.add_argument("--accum", type=int, default=4)
-    ap.add_argument("--lr", type=float, default=1e-5)
+    ap.add_argument("--lr", type=float, default=1e-6,
+                    help="偏好族冷 lr(GRPO 死因二教训: 1e-5 级 Adam 在 "
+                         "LoRA 尺度上是随机游走;KTO 信号更密,1e-6 起步)")
+    ap.add_argument("--kto-update", choices=["b", "ab"], default="b",
+                    help="b=只更新 LoRA B(默认,A 尺度小经不起噪声);ab=全更新")
+    ap.add_argument("--probe-ids", default=None,
+                    help="探针卷子(val_ids_v2.txt): 定期贪心评 SubKS,"
+                         "只保留超过更新前基线的最优权重;卷内视频从"
+                         "训练对中剔除防污染")
+    ap.add_argument("--probe-every", type=int, default=50,
+                    help="每 N 个 opt step 探针一次")
     ap.add_argument("--beta", type=float, default=0.1)
     ap.add_argument("--w-desirable", type=float, default=1.0)
     ap.add_argument("--w-undesirable", type=float, default=1.5)
@@ -120,6 +130,12 @@ def main():
 
     pairs = [json.loads(l) for l in open(a.kto_data, encoding="utf-8")]
     pairs = [p for p in pairs if p["video_id"] in recs_by_vid]
+    probe_set = (set(open(a.probe_ids).read().split())
+                 if a.probe_ids else set())
+    if probe_set:
+        n0 = len(pairs)
+        pairs = [p for p in pairs if p["video_id"] not in probe_set]
+        print(f"[probe] 训练对剔除探针视频 {n0 - len(pairs)} 条")
     print(f"[kto] pairs={len(pairs)} "
           f"des={sum(1 for p in pairs if p['label'])} "
           f"und={sum(1 for p in pairs if not p['label'])}")
@@ -197,9 +213,11 @@ def main():
         if not (k.startswith("layer_") or "/layer_" in k):
             return False
         # 与 train_sft 可训集合一致: 只训可交付模块(PLE 门等冻结)
-        return any(t in k for t in ("q_einsum", "kv_einsum",
+        if not any(t in k for t in ("q_einsum", "kv_einsum",
                                     "attn_vec_einsum", "gating_einsum",
-                                    "/mlp/linear"))
+                                    "/mlp/linear")):
+            return False
+        return k.endswith("/b") if a.kto_update == "b" else True
 
     def kto_loss_fn(lora, base_p, ref_l, tokens, labels, kl_tokens,
                     kl_labels, patches, pos_xy, is_des):
@@ -255,8 +273,73 @@ def main():
         updates, opt_state = optim.update(grads, opt_state, lora)
         return optax.apply_updates(lora, updates), opt_state, loss, m
 
+    RT_SET, SK_SET = "ABCDE", "abcdefghijklmnopqrstu"
+    RT_IDS = np.asarray([tok.encode(c)[0] for c in RT_SET])
+    SK_IDS = np.asarray([tok.encode(c)[0] for c in SK_SET])
+    PIPE = tok.encode("|")[0]
+
+    def _rows_local(lora_h, base_p, tokens, patches, pos_xy):
+        pol = gpeft.merge_params(base_p, jax.tree.map(
+            lambda x: x.astype(jnp.bfloat16), lora_h))
+        pvi = PreprocessedVisionInput(
+            patches=patches, positions_xy=pos_xy, soft_token_counts=counts)
+        out = model.apply({"params": pol}, tokens=tokens, images=pvi)
+        lg = out.logits if hasattr(out, "logits") else out
+        return (lg[:, T - 1].astype(jnp.float32),
+                lg[:, T + 1].astype(jnp.float32))
+    rows_sh = jax.jit(shard_map(
+        _rows_local, mesh=mesh,
+        in_specs=(P(), P(), P("dp"), P("dp"), P("dp")),
+        out_specs=(P("dp"), P("dp")), check_rep=False))
+
+    probe_idx = [recs_by_vid[v] for v in probe_set if v in recs_by_vid]
+    _pcache = {}
+
+    def probe_acc(lora_now):
+        ok = tot = 0
+        for k0 in range(0, len(probe_idx), DP):
+            grp = list(probe_idx[k0:k0 + DP])
+            n_real = len(grp)
+            while len(grp) % DP:
+                grp.append(probe_idx[0])
+            exs = [_pcache.setdefault(i, ds[i]) for i in grp]
+            pt_, px_, _ = make_vision_input([e["frames"] for e in exs])
+            toks = np.zeros((DP, L), np.int32)
+            for j, e in enumerate(exs):
+                toks[j, :T] = e["tokens"][:T]
+            r1, _ = rows_sh(lora_now, base, jnp.asarray(toks),
+                            jnp.asarray(pt_), jnp.asarray(px_))
+            krt = np.asarray(r1)[:, RT_IDS].argmax(-1)
+            t2 = toks.copy()
+            for j in range(DP):
+                t2[j, T] = RT_IDS[krt[j]]
+                t2[j, T + 1] = PIPE
+            _, r2 = rows_sh(lora_now, base, jnp.asarray(t2),
+                            jnp.asarray(pt_), jnp.asarray(px_))
+            ksk = np.asarray(r2)[:, SK_IDS].argmax(-1)
+            for j in range(n_real):
+                lab = (ds.recs[grp[j]].get("labels") or ds.recs[grp[j]])
+                tot += 1
+                ok += int(SK_SET[ksk[j]] == lab["sub_keyscene"])
+        return ok / max(tot, 1)
+
+    def save_npz(lora_now, name):
+        flat = jax.tree_util.tree_flatten_with_path(lora_now)[0]
+        d_ = {"lora/" + "/".join(getattr(k, "key", str(k)) for k in p):
+              np.asarray(v) for p, v in flat}
+        if z is not None:
+            for kk in z.files:
+                if kk.startswith("proj/"):
+                    d_[kk] = z[kk]
+        np.savez(os.path.join(a.out, name), **d_)
+
     lora = lora0
     os.makedirs(a.out, exist_ok=True)
+    best_probe, best_step = -1.0, -1
+    if probe_idx:
+        best_probe = probe_acc(lora)
+        print(f"[probe] step -1(更新前基线) SubKS={best_probe:.4f}",
+              flush=True)
     t0 = time.time()
     n_micro = a.steps * a.accum
     cursor = 0
@@ -286,6 +369,14 @@ def main():
                   f"kl={float(kl):.3f} |logratio|={float(lr_abs):.3f} "
                   f"micro_s/it={(time.time()-t0)/max(micro,1):.2f}",
                   flush=True)
+            if probe_idx and o % a.probe_every == 0:
+                acc = probe_acc(lora)
+                tag = ""
+                if acc > best_probe:
+                    best_probe, best_step = acc, o
+                    save_npz(lora, "lora_params_best.npz")
+                    tag = " *best(已落盘)"
+                print(f"[probe] step {o} SubKS={acc:.4f}{tag}", flush=True)
     flat = jax.tree_util.tree_flatten_with_path(lora)[0]
     import numpy as _np
     out_d = {"lora/" + "/".join(getattr(k, "key", str(k)) for k in p):
@@ -295,6 +386,13 @@ def main():
             if kk.startswith("proj/"):
                 out_d[kk] = z[kk]
     _np.savez(os.path.join(a.out, "lora_params.npz"), **out_d)
+    if probe_idx:
+        if best_step < 0:
+            print(f"[save] ⚠️ 全程未超更新前基线({best_probe:.4f})——"
+                  f"未产出 best 权重,产物不建议使用")
+        else:
+            print(f"[save] 评测/交付用 lora_params_best.npz"
+                  f"(探针最优 step {best_step}, SubKS={best_probe:.4f})")
     print(f"[save] {a.out}")
 
 

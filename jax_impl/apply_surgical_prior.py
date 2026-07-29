@@ -68,6 +68,9 @@ def main():
             rt[RT_SET.index("E")] += d_e
             k_sk = max(range(21), key=lambda i: sk[i])
             k_rt = max(range(5), key=lambda i: rt[i])
+            # 与在线版 legalize_combo 同款: 家人(A)不可能"包裹被拿走/闯入"
+            if RT_SET[k_rt] == "A" and SK_SET[k_sk] in ("n", "u"):
+                k_rt = RT_SET.index("C")
             f.write(json.dumps({"video_id": d["video_id"],
                                 "output": f"{RT_SET[k_rt]}|{SK_SET[k_sk]}|"},
                                ensure_ascii=False) + "\n")

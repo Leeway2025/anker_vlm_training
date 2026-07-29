@@ -372,6 +372,10 @@ def main():
 
     best_probe, best_rd = -1.0, -1
     policy, t0 = policy0, time.time()
+    if probe_idx:                    # 更新前基线: best 门槛 = 起点水位,
+        best_probe = probe_acc(policy)   # 不超过起点的轮次一律不配落盘
+        print(f"[probe] round -1(更新前基线) SubKS={best_probe:.4f}",
+              flush=True)
     for rd in range(a.rounds):
         picks = [train_idx[i] for i in
                  rng.choice(len(train_idx), a.chunk, replace=False)]
@@ -475,9 +479,13 @@ def main():
                 tag = " *best(已落盘)"
             print(f"[probe] round {rd} SubKS={acc:.4f}{tag}", flush=True)
     if probe_idx:
-        print(f"[save] 评测/交付用 train_params_best.npz"
-              f"(探针最优 round {best_rd}, SubKS={best_probe:.4f});"
-              f"train_params.npz 是最后一轮")
+        if best_rd < 0:
+            print(f"[save] ⚠️ 全部轮次未超过更新前基线({best_probe:.4f})"
+                  f"—— 未产出 best 权重,产物不建议使用,底座保持原权重")
+        else:
+            print(f"[save] 评测/交付用 train_params_best.npz"
+                  f"(探针最优 round {best_rd}, SubKS={best_probe:.4f});"
+                  f"train_params.npz 是最后一轮")
     else:
         print(f"[save] {a.out}/train_params.npz(最后一轮策略;"
               f"建议传 --probe-ids 启用逐轮选优)")

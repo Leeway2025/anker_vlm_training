@@ -1,6 +1,6 @@
 #!/bin/bash
 # 夜链 v2: val_v2 切卷 → 新原点 → seed-1 训练 → 评测 → 模型汤 → 自动选赢家
-#          → 裸 logits → 全类先验优化 → 交付候选分
+#          → 裸 logits → 手工手术先验(离线施加) → 交付候选分
 # 用法(容器内 /workspace):
 #   nohup bash jax_impl/night_v2.sh > night_v2.log 2>&1 &
 # 前置: /data/labels_dedup.jsonl、labels_test.jsonl、hf_layout.json、
@@ -58,7 +58,7 @@ bash jax_impl/infer_sharded.sh python /data/labels_test.jsonl /data/hf_layout.js
 python3 jax_impl/eval_metrics.py --preds outputs/soup2/eval_preds.jsonl \
     --labels /data/labels_test.jsonl --per-class | tee outputs/soup2/eval_report.txt
 
-# ⑥ 自动选赢家 → 裸 logits → 全类先验优化 → 交付候选分
+# ⑥ 自动选赢家 → 裸 logits → 手工手术先验(离线施加) → 交付候选分
 WINNER=$(python3 - <<'PY'
 import re, sys
 def subks(p, default=0.0):
@@ -82,10 +82,10 @@ mkdir -p outputs/optin
 INFER_ARGS='--dump-letter-logits' \
 bash jax_impl/infer_sharded.sh python /data/labels_test.jsonl /data/hf_layout.json \
     outputs/optin/preds "$WINNER" 8
-python3 jax_impl/prior_opt.py --logits outputs/optin/preds.jsonl \
+python3 jax_impl/apply_surgical_prior.py --logits outputs/optin/preds.jsonl \
     --labels /data/labels_test.jsonl \
     --fold-a /data/test_sfoldA.jsonl --fold-b /data/test_sfoldB.jsonl \
-    --out outputs/optin/preds_opt.jsonl
-python3 jax_impl/eval_metrics.py --preds outputs/optin/preds_opt.jsonl \
+    --tau 0.7 --out outputs/optin/preds_surg.jsonl
+python3 jax_impl/eval_metrics.py --preds outputs/optin/preds_surg.jsonl \
     --labels /data/labels_test.jsonl --per-class | tee outputs/optin/eval_report.txt
 echo "[nv2] 全链完成 $(date)"

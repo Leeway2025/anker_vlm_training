@@ -81,6 +81,9 @@ def main():
                     help="不合并 npz 中的 projector(默认: npz 无 proj/ 即报错)")
     ap.add_argument("--no-constrain", action="store_true",
                     help="关闭字母位受限解码与非法组合矫正(默认开启)")
+    ap.add_argument("--dump-letter-logits", action="store_true",
+                    help="输出记录附 RT/SK 决策位裸子集 logits"
+                         "(全类先验优化的原料;裸=未加任何先验偏移)")
     ap.add_argument("--prior-target", help="目标(自然)先验 json"
                     "(dump_priors.py 产物;与 --prior-train 成对启用校正)")
     ap.add_argument("--prior-train", help="训练集先验 json")
@@ -256,11 +259,16 @@ def main():
                     else constrained_pick(row, i, RT_IDS, SK_IDS, PIPE_ID,
                                           RT_D, SK_D))
         out_ids = []
+        cap = {}                          # 字母位裸 logits(step0=RT, step2=SK)
         if not a.no_kv_cache:
             row, kv = prefill_fn(params, jnp.asarray(toks[None, :T]),
                                  pvi, cache0)
             row = np.asarray(row)
             for i in range(a.max_new):
+                if a.dump_letter_logits and i == 0:
+                    cap["rt"] = [float(x) for x in row[RT_IDS]]
+                if a.dump_letter_logits and i == 2:
+                    cap["sk"] = [float(x) for x in row[SK_IDS]]
                 nxt = pick(row, i)
                 out_ids.append(int(nxt))
                 if nxt == EOT:
@@ -274,6 +282,10 @@ def main():
             for i in range(a.max_new):
                 row = np.asarray(step_logits(params, jnp.asarray(toks[None]),
                                              pvi, T + i))
+                if a.dump_letter_logits and i == 0:
+                    cap["rt"] = [float(x) for x in row[RT_IDS]]
+                if a.dump_letter_logits and i == 2:
+                    cap["sk"] = [float(x) for x in row[SK_IDS]]
                 nxt = pick(row, i)
                 out_ids.append(int(nxt))
                 toks[T + i] = nxt
@@ -287,9 +299,10 @@ def main():
         if not txt.strip():
             n_empty = getattr(main, "_n_empty", 0) + 1
             main._n_empty = n_empty
-        fout.write(json.dumps({"video_id": rec["video_id"],
-                               "output": txt.strip()},
-                              ensure_ascii=False) + "\n")
+        outrec = {"video_id": rec["video_id"], "output": txt.strip()}
+        if a.dump_letter_logits:
+            outrec.update(cap)
+        fout.write(json.dumps(outrec, ensure_ascii=False) + "\n")
         fout.flush()
         print(f"[infer] {n+1}/{len(recs)} {rec['video_id']} "
               f"({time.time()-t0:.1f}s): {txt[:60]!r}", flush=True)

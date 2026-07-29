@@ -19,8 +19,12 @@
   - 轮式结构(PPO 风格): 采样一批 → 1~2 epoch 裁剪更新 → 重采,
     行为 logprob 记录在采样时,ratio/clip 处理轮内策略漂移。
 
-产物: <out>/train_params.npz(lora=策略 + proj 从 init 透传),
-infer.py 直接可评。⚠️ 使用前门禁(纪律):
+产物: train_params_best.npz(--probe-ids 时,探针最优轮)/
+train_params.npz(最后一轮);lora=策略 + proj 从 init 透传,infer 直评。
+v2(首战 -6.3 复盘): ①reward-ks 默认 0 —— m 父类覆盖 82%% 样本,
+父类部分分造出"永远答 m"避险策略(m 预测 2158→4347,s/q/t 坍缩);
+②--probe-ids 逐轮探针选优(RL 早停,防熵坍缩晚期烂档);
+③kl 0.05 / rounds 6 收紧缰绳。⚠️ 使用前门禁(纪律):
   ① 合成可分数据: 奖励应在数轮内逼近上限(机制正确性);
   ② 真数据首轮小规模(--rounds 2 --chunk 256)观察 kept 比例与 KL。
 """
@@ -87,7 +91,7 @@ def main():
     ap.add_argument("--init-npz", required=True, help="SFT best(策略起点+ref)")
     ap.add_argument("--rank-scheme", choices=["auto", "uniform", "prod"],
                     default="auto")
-    ap.add_argument("--rounds", type=int, default=12)
+    ap.add_argument("--rounds", type=int, default=6)
     ap.add_argument("--chunk", type=int, default=2048,
                     help="每轮采样的视频数")
     ap.add_argument("--group", type=int, default=6, help="每视频采样数 G")
@@ -98,13 +102,19 @@ def main():
     ap.add_argument("--eps-low", type=float, default=0.2)
     ap.add_argument("--eps-high", type=float, default=0.28,
                     help="DAPO Clip-Higher 上界")
-    ap.add_argument("--kl-coef", type=float, default=0.02)
+    ap.add_argument("--kl-coef", type=float, default=0.05)
     ap.add_argument("--reward-sk", type=float, default=1.0)
-    ap.add_argument("--reward-ks", type=float, default=0.3)
+    ap.add_argument("--reward-ks", type=float, default=0.0,
+                    help="⚠️ KS 父类部分分默认 0: m 的父类覆盖 82%% 样本,"
+                         "+0.3 会造出'永远答 m'的避险策略(首战 -6.3 实锤)")
     ap.add_argument("--reward-rt", type=float, default=0.3)
     ap.add_argument("--class-weight-json", default=None,
                     help='奖励类加权 {"m":1.5,...}(先验矫正内化)')
     ap.add_argument("--dp", type=int, default=0)
+    ap.add_argument("--probe-ids", default=None,
+                    help="探针卷子(video_id 清单,如 val_ids.txt): 每轮"
+                         "训后贪心评一次 SubKS 准确率,只保留最优轮权重"
+                         "(RL 早停;清单视频自动从采样池剔除防污染)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
@@ -309,7 +319,14 @@ def main():
         return optax.apply_updates(pol, up), opt_state, l
 
     # ---- 数据装配 ----
-    train_idx = list(ds.train_idx)
+    probe_set = (set(open(a.probe_ids).read().split())
+                 if a.probe_ids else set())
+    train_idx = [i for i in ds.train_idx
+                 if ds.recs[i]["video_id"] not in probe_set]
+    probe_idx = [i for i in ds.train_idx
+                 if ds.recs[i]["video_id"] in probe_set]
+    if probe_set:
+        print(f"[probe] 探针 {len(probe_idx)} 条(已从采样池剔除)")
     by_i = {}
 
     def vin(idxs):
@@ -322,6 +339,38 @@ def main():
             lst.append(fill)
         return lst
 
+    def probe_acc(pol):
+        ok = tot = 0
+        for k0 in range(0, len(probe_idx), DP):
+            grp = pad_dp(list(probe_idx[k0:k0 + DP]), probe_idx[0])[:DP]
+            n_real = len(probe_idx[k0:k0 + DP])
+            exs, (pt, px) = vin(grp)
+            toks = np.zeros((DP, L), np.int32)
+            for j, e in enumerate(exs):
+                toks[j, :T] = e["tokens"][:T]
+            r1, _ = infer_sh(pol, base, jnp.asarray(toks), pt, px)
+            krt = np.asarray(r1)[:, RT_IDS].argmax(-1)
+            t2 = toks.copy()
+            for j in range(DP):
+                t2[j, T] = RT_IDS[krt[j]]
+                t2[j, T + 1] = PIPE
+            _, r2 = infer_sh(pol, base, jnp.asarray(t2), pt, px)
+            ksk = np.asarray(r2)[:, SK_IDS].argmax(-1)
+            for j in range(n_real):
+                lab = (ds.recs[grp[j]].get("labels") or ds.recs[grp[j]])
+                tot += 1
+                ok += int(SK_SET[ksk[j]] == lab["sub_keyscene"])
+        return ok / max(tot, 1)
+
+    def save_npz(pol, path):
+        flat = jax.tree_util.tree_flatten_with_path(pol)[0]
+        sv = {"lora/" + _path_str(p): np.asarray(v) for p, v in flat}
+        for f in z.files:                          # proj 透传,infer 直评
+            if f.startswith("proj/"):
+                sv[f] = z[f]
+        np.savez(path, **sv)
+
+    best_probe, best_rd = -1.0, -1
     policy, t0 = policy0, time.time()
     for rd in range(a.rounds):
         picks = [train_idx[i] for i in
@@ -415,14 +464,23 @@ def main():
             print(f"[train] round {rd} epoch {ep} loss={float(l):.4f} "
                   f"({time.time()-t0:.0f}s)", flush=True)
 
-        flat = jax.tree_util.tree_flatten_with_path(policy)[0]
-        save = {"lora/" + _path_str(p): np.asarray(v) for p, v in flat}
-        for f in z.files:                          # proj 透传,infer 直评
-            if f.startswith("proj/"):
-                save[f] = z[f]
-        np.savez(os.path.join(a.out, "train_params.npz"), **save)
-    print(f"[save] {a.out}/train_params.npz(最后一轮策略;评测选轮请按 "
-          f"round 存档扩展)")
+        save_npz(policy, os.path.join(a.out, "train_params.npz"))
+        if probe_idx:
+            acc = probe_acc(policy)
+            tag = ""
+            if acc > best_probe:
+                best_probe, best_rd = acc, rd
+                save_npz(policy,
+                         os.path.join(a.out, "train_params_best.npz"))
+                tag = " *best(已落盘)"
+            print(f"[probe] round {rd} SubKS={acc:.4f}{tag}", flush=True)
+    if probe_idx:
+        print(f"[save] 评测/交付用 train_params_best.npz"
+              f"(探针最优 round {best_rd}, SubKS={best_probe:.4f});"
+              f"train_params.npz 是最后一轮")
+    else:
+        print(f"[save] {a.out}/train_params.npz(最后一轮策略;"
+              f"建议传 --probe-ids 启用逐轮选优)")
 
 
 if __name__ == "__main__":

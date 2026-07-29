@@ -94,11 +94,19 @@ def main():
     ap.add_argument("--rounds", type=int, default=6)
     ap.add_argument("--chunk", type=int, default=2048,
                     help="每轮采样的视频数")
-    ap.add_argument("--group", type=int, default=6, help="每视频采样数 G")
+    ap.add_argument("--group", type=int, default=8,
+                    help="每视频采样数 G(加大压优势方差)")
+    ap.add_argument("--rl-update", choices=["b", "ab"], default="b",
+                    help="b=只更新 LoRA B 矩阵(默认): A 初始尺度 1/r 极小,"
+                         "Adam 噪声步长相对 A 是 7%%/轮的随机游走(v2 死因);"
+                         "B 尺度由 SFT 训出,抗噪得多。ab=全更新(复古)")
     ap.add_argument("--temp", type=float, default=1.0)
     ap.add_argument("--epochs", type=int, default=1, help="每轮更新遍数")
     ap.add_argument("--accum", type=int, default=16)
-    ap.add_argument("--lr", type=float, default=2e-6)
+    ap.add_argument("--lr", type=float, default=3e-7,
+                    help="RL 专用低 lr: 两 token 位策略梯度方差大,Adam 尺度"
+                         "归一会把噪声放大成随机游走(v2 实弹: 2e-6 一轮"
+                         "即损 -2);3e-7 起步,宁欠勿过")
     ap.add_argument("--eps-low", type=float, default=0.2)
     ap.add_argument("--eps-high", type=float, default=0.28,
                     help="DAPO Clip-Higher 上界")
@@ -222,9 +230,14 @@ def main():
                   "gating_einsum", "/mlp/linear")
 
     def _is_trainable(pstr):
+        # RL 版收窄: 视觉塔一律冻结(两 token 位的信号不配动它);
+        # 默认只动 B 矩阵(A 尺度太小,经不起噪声梯度的 Adam 随机游走)
         llm = pstr.startswith("layer_") or "/layer_" in pstr
-        vis = "vision_encoder" in pstr and "stacked_layers" in pstr
-        return (llm or vis) and any(k in pstr for k in EXPORTABLE)
+        if not (llm and any(k in pstr for k in EXPORTABLE)):
+            return False
+        if a.rl_update == "b":
+            return pstr.endswith("/b")
+        return True
 
     # 策略参数 fp32(可训),ref 固定 bf16
     policy0 = jax.tree.map(lambda x: x.astype(jnp.float32), lora_bf)

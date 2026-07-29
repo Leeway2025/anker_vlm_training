@@ -99,6 +99,9 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--annotation", default=None,
                     help="euno 标注 json;只标其覆盖的 key(不传=标全量)")
+    ap.add_argument("--only-ids", default=None,
+                    help="video_id 清单文件或 labels.jsonl: 只标清单内样本"
+                         "(如对测试集盲判时圈定 11,022 条)")
     ap.add_argument("--model", default="gemini-3.1-pro")
     ap.add_argument("--temperature", type=float, default=0.1)
     ap.add_argument("--shards", default=None, help="如 0-3 或 0,5,7")
@@ -122,6 +125,19 @@ def main():
         anns = read_json(a.annotation)
         want = {x["videos"][0] for x in anns}
         print(f"[scope] annotation 覆盖 {len(want)} keys")
+    if a.only_ids:
+        import json as _j
+        ids = set()
+        for line in open(a.only_ids, encoding="utf-8"):
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("{"):
+                ids.add(_j.loads(line)["video_id"])
+            else:
+                ids.add(line)
+        want = ids if want is None else (want & ids)
+        print(f"[scope] only-ids 圈定 {len(want)} keys")
 
     done = set()
     if os.path.exists(a.out):

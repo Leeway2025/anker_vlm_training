@@ -44,16 +44,19 @@ def load(logits_file, labels_file):
             np.asarray(rt_y), np.asarray(sk_y))
 
 
-def coord_ascent(lg, y, max_off=2.0, passes=6):
-    """坐标上升: 逐类试网格偏移,收准确率增益,循环至收敛。"""
+def coord_ascent(lg, y, max_off=0.8, passes=6, allow=None):
+    """坐标上升: 逐类试网格偏移,收准确率增益,循环至收敛。
+    allow: 允许学偏移的类下标集合(None=全部)。"""
     n_cls = lg.shape[1]
     off = np.zeros(n_cls)
-    grid = np.array([-1.5, -1.0, -0.6, -0.3, -0.15,
-                     0.15, 0.3, 0.6, 1.0, 1.5])
+    grid = np.array([-0.8, -0.5, -0.3, -0.15,
+                     0.15, 0.3, 0.5, 0.8])
     best_acc = (np.argmax(lg + off, 1) == y).mean()
     for _ in range(passes):
         improved = False
         for c in range(n_cls):
+            if allow is not None and c not in allow:
+                continue
             cand_acc, cand_d = best_acc, 0.0
             for d in grid:
                 nd = np.clip(off[c] + d, -max_off, max_off)
@@ -79,7 +82,11 @@ def main():
     ap.add_argument("--labels", required=True)
     ap.add_argument("--fold-a", required=True)
     ap.add_argument("--fold-b", required=True)
-    ap.add_argument("--max-off", type=float, default=2.0)
+    ap.add_argument("--max-off", type=float, default=0.8)
+    ap.add_argument("--min-n", type=int, default=300,
+                    help="标定折内样本数低于此的类不学偏移(小类噪声禁赛;"
+                         "首跑教训: r/q/j 的 ±1.5 偏移全是折内噪声,"
+                         "折内 +1.6 跨折只剩 +0.3)")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
 
@@ -92,9 +99,25 @@ def main():
 
     out_rt = np.zeros((len(vids), 5))
     out_sk = np.zeros((len(vids), 21))
+    def robust_fit(lg, y, max_off, min_n, seed=0):
+        """折内复现门: 标定折对半再切,两半独立拟合,仅保留方向一致的
+        偏移(幅度取小);小类(<min_n)禁赛。全程只用标定折标签。"""
+        cnt = np.bincount(y, minlength=lg.shape[1])
+        allow = {c for c in range(lg.shape[1]) if cnt[c] >= min_n}
+        rng = np.random.RandomState(seed)
+        half = rng.permutation(len(y)) < len(y) // 2
+        o1, _ = coord_ascent(lg[half], y[half], max_off, allow=allow)
+        o2, _ = coord_ascent(lg[~half], y[~half], max_off, allow=allow)
+        agree = np.sign(o1) == np.sign(o2)
+        off = np.where(agree, np.sign(o1) * np.minimum(np.abs(o1), np.abs(o2)),
+                       0.0)
+        acc = (np.argmax(lg + off, 1) == y).mean()
+        return off, acc
+
     for fit, apply_ in ((ib, ia), (ia, ib)):     # B 上拟合 → 用于 A;反之
-        off_sk, acc_sk = coord_ascent(sk_lg[fit], sk_y[fit], a.max_off)
-        off_rt, acc_rt = coord_ascent(rt_lg[fit], rt_y[fit], a.max_off)
+        off_sk, acc_sk = robust_fit(sk_lg[fit], sk_y[fit], a.max_off, a.min_n)
+        off_rt, acc_rt = robust_fit(rt_lg[fit], rt_y[fit], a.max_off,
+                                    max(a.min_n // 2, 150))
         base_sk = (np.argmax(sk_lg[fit], 1) == sk_y[fit]).mean()
         print(f"  拟合折: SubKS {base_sk:.4f} -> {acc_sk:.4f}"
               f"(拟合内增益 {acc_sk-base_sk:+.4f});偏移 "

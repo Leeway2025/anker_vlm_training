@@ -20,10 +20,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from jax_impl.data import split_by_camera  # noqa: E402
 
 
-def match_mix_split(recs, mix_file, n_target, seed):
-    """按参考文件的类配比切 val,camera 整组贪心装箱。
-    规则: 逐机位(随机序)尝试加入,若加入后各类均不超过
-    配额×1.10 则收下;配额 = 参考配比 × n_target(可用量封顶)。"""
+def match_mix_split(recs, mix_file, n_target, seed, fill_loose=False):
+    """按参考文件的类配比切 val,camera 整组、缺口驱动贪心装箱。
+    每轮给每个未选机位打分: score = Σ min(机位类数, 剩余缺口)
+    − Σ 超额部分;收下正分最高者,循环至达标或无正分机位。"""
     sk = lambda r: (r.get("labels") or r)["sub_keyscene"]
     ref = [json.loads(l) for l in open(mix_file, encoding="utf-8")]
     ref_c = collections.Counter(sk(r) for r in ref)
@@ -37,19 +37,48 @@ def match_mix_split(recs, mix_file, n_target, seed):
         if cam == "unknown":
             cam = r["video_id"]
         by_cam[cam].append(r)
+    cam_cnt = {c: collections.Counter(sk(r) for r in g)
+               for c, g in by_cam.items()}
     cams = sorted(by_cam)
     random.Random(seed).shuffle(cams)
     got = collections.Counter()
-    val = []
-    for c in cams:
-        g = by_cam[c]
-        gc = collections.Counter(sk(r) for r in g)
-        if all(got[k] + v <= quota.get(k, 0) * 1.10 + 1 for k, v in gc.items()):
-            val += g
-            got.update(gc)
-        if sum(got.values()) >= n_target:
+    chosen = []
+    remaining = set(cams)
+    while sum(got.values()) < n_target:
+        best, best_s = None, 0.0
+        for c in remaining:
+            s = 0.0
+            for k, v in cam_cnt[c].items():
+                deficit = max(0, quota.get(k, 0) - got[k])
+                s += min(v, deficit) - max(0, v - deficit)
+            if s > best_s:
+                best, best_s = c, s
+        if best is None:
             break
-    print(f"[match-mix] 目标 {n_target} → 实切 {len(val)};配比偏差:")
+        chosen.append(best)
+        remaining.discard(best)
+        got.update(cam_cnt[best])
+    val = [r for c in chosen for r in by_cam[c]]
+    if fill_loose:
+        in_val = {r["video_id"] for r in val}
+        pool = collections.defaultdict(list)
+        for c in remaining:
+            for r in by_cam[c]:
+                pool[sk(r)].append(r)
+        rng2 = random.Random(seed + 1)
+        n_fill = 0
+        for k, q in quota.items():
+            need = q - got[k]
+            if need > 0 and pool.get(k):
+                rng2.shuffle(pool[k])
+                take = pool[k][:need]
+                val += take
+                got.update({k: len(take)})
+                n_fill += len(take)
+        if n_fill:
+            print(f"[match-mix] ⚠️ 松散补齐 {n_fill} 条(该部分机位与 train "
+                  f"重叠,相关类的 val 读数会略乐观)")
+    print(f"[match-mix] 目标 {n_target} → 实切 {len(val)};配比对照:")
     for k in sorted(quota, key=lambda k: -quota[k]):
         if quota[k]:
             print(f"  [{k}] 配额 {quota[k]:>4} 实得 {got[k]:>4}")
@@ -63,7 +92,10 @@ def main():
                     help="目标 val 条数(match-mix 模式为近似目标)")
     ap.add_argument("--match-mix", default=None,
                     help="传参考 jsonl(如 labels_test): val 类配比对齐它;"
-                         "camera 整组贪心装箱,配比误差 ±1.5%% 左右")
+                         "camera 整组贪心装箱")
+    ap.add_argument("--fill-loose", action="store_true",
+                    help="整机位装箱后仍有缺口的类,按单条补齐(牺牲该部分"
+                         "机位完整性 → 这些类的 val 读数会略乐观,会告警)")
     ap.add_argument("--seed", type=int, default=0, help="同训练 --seed")
     ap.add_argument("--out", required=True)
     ap.add_argument("--ids-out", default=None,
@@ -71,7 +103,8 @@ def main():
     a = ap.parse_args()
     recs = [json.loads(l) for l in open(a.labels, encoding="utf-8")]
     if a.match_mix:
-        va = match_mix_split(recs, a.match_mix, a.val_n, a.seed)
+        va = match_mix_split(recs, a.match_mix, a.val_n, a.seed,
+                             fill_loose=a.fill_loose)
     else:
         _, va = split_by_camera(recs, a.val_n, seed=a.seed)
     if a.ids_out:

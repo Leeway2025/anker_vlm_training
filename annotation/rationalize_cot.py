@@ -102,10 +102,33 @@ disappearing at the door = l, walking straight away outward = k.
 """
 
 
-def build_prompt(rt, sk):
-    return PROMPT_TEMPLATE.format(
+# RT 强化(--rt-focus): 补上 v1 缺失的 A vs D 判据(RT 错误的 53% 在这对
+# 边界),并对懒标 D 收紧核验立场 —— v1 的宽松立场会把"满身住户证据却标 D"
+# 的行圆成 D 结论("unspecified resident"自相矛盾链),训练时教模型怯判,
+# 正是测试集 A→D 589 条的同谋。严判后这类行转 unsupported,不产链。
+RT_FOCUS_EXTRA = """
+5. RoleType A vs D (THE key distinction for this pass):
+   - A (Family Member) requires resident-level evidence: confident purposeful \
+approach without scouting; direct entry/exit through the door (keys/code); \
+using household fixtures as an owner would (bins, hose, garage, yard tools, \
+unloading groceries); pets reacting familiarly.
+   - D (Unspecified) is reserved for genuinely indeterminate presence: brief or \
+partial appearance, person mostly out of frame or far away, no interaction \
+with the home, merely passing through the view.
+
+STRICTER VERDICT RULE overriding Step 2 for RoleType D labels: if the label is \
+D but the person shows resident-level cues from the list above, output \
+verdict="unsupported". Never write a chain that describes a confident resident \
+and then concludes "Unspecified". For RoleType A labels, the chain must cite \
+at least one concrete resident-level cue from the list above.
+"""
+
+
+def build_prompt(rt, sk, rt_focus=False):
+    p = PROMPT_TEMPLATE.format(
         rt=rt, sk=sk,
         rt_name=RT_NAMES.get(rt, "?"), sk_name=SK_NAMES.get(sk, "?"))
+    return p + RT_FOCUS_EXTRA if rt_focus else p
 
 
 def validate_record(d):
@@ -177,6 +200,9 @@ def main():
     ap.add_argument("--api-key", default=None,
                     help="Gemini API key(也可用环境变量 GOOGLE_API_KEY / "
                          "GEMINI_API_KEY)")
+    ap.add_argument("--rt-focus", action="store_true",
+                    help="RT 强化 prompt: A vs D 判据 + 懒标 D 严判"
+                         "(unsupported,不产怯判链)")
     ap.add_argument("--location", default="global")
     a = ap.parse_args()
 
@@ -221,7 +247,7 @@ def main():
         key, frames = item
         rt, sk = gt[key]
         d, errs = rationalize_frames_one(client, a.model, frames,
-                                         build_prompt(rt, sk),
+                                         build_prompt(rt, sk, a.rt_focus),
                                          a.temperature)
         with lock:
             if d is not None and not errs:

@@ -12,6 +12,12 @@ from jax_impl.prior_opt import coord_ascent, load, RT_SET, SK_SET
 
 vids, rt_lg, sk_lg, rt_y, sk_y = load('outputs/optin/preds.jsonl',
                                       '/data/labels_test.jsonl')
+bare = (sk_lg.argmax(1) == sk_y).mean()
+if bare < 0.730:
+    sys.exit(f'[门禁] 裸 SubKS={bare:.4f} = 复刻(72.32)水位,不是 seed-1(73.5x)。'
+             f'先重新 dump: INFER_ARGS=--dump-letter-logits infer_sharded ... '
+             f'outputs/jax_5b_seed1/train_params_best.npz 8')
+print(f'[门禁通过] 裸 SubKS={bare:.4f} = seed-1 底座')
 fa = {json.loads(l)["video_id"] for l in open('/data/test_sfoldA.jsonl')}
 ia = np.asarray([v in fa for v in vids]); ib = ~ia
 

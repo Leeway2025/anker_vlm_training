@@ -6,7 +6,7 @@ cd "$(dirname "$0")/.."
 python3 - <<'PY'
 import json, re, random, collections
 
-ASSET = '/data/assets_rat/asset_C_clean.jsonl'
+ASSET = '/data/assets_rat/asset_C_reasoning.jsonl'
 gt = {}
 for l in open('/data/labels_dedup.jsonl', encoding='utf-8'):
     d = json.loads(l); lb = d.get('labels') or d
@@ -42,7 +42,7 @@ for l in open(ASSET, encoding='utf-8'):
             sk_conf[f'{g_sk}->{p}'] += 1
             mism.append(('SK', v, g_sk, p, desc, c))
 
-print(f'对账样本: {n}(清洗版资产 ∩ labels_dedup)')
+print(f'对账样本: {n}(资产 ∩ labels_dedup)')
 print(f'RT 显式字母提取率 {rt_hit/n:.1%} | 与 GT 一致 {rt_ok}/{rt_hit} '
       f'({rt_ok/max(rt_hit,1):.2%})')
 print(f'SK 显式字母提取率 {sk_hit/n:.1%} | 与 GT 一致 {sk_ok}/{sk_hit} '

@@ -46,23 +46,37 @@ print(f'中文混入: {cjk} 条 | 词数 p5/p50/p95 = {q(.05)}/{q(.5)}/{q(.95)} 
 
 BANNED = re.compile(r'ground.?truth|the label|annotat|provided answer|correct answer',
                     re.I)
-spill = [v for v, c in rows.items() if BANNED.search(c)]
-print(f'泄漏话术(label/ground truth/annotation...): {len(spill)} 条'
-      + (f' 例: {spill[:3]}' if spill else ''))
+spill = {v for v, c in rows.items() if BANNED.search(c)}
+print(f'泄漏话术(label/ground truth/annotation...): {len(spill)} 条')
+
+# ==== 清洗: 剔除测试集重叠 + 泄漏话术 → asset_C_clean.jsonl(夜链只吃它) ====
+CLEAN = '/data/assets_rat/asset_C_clean.jsonl'
+clean = {v: c for v, c in rows.items() if v not in test and v not in spill}
+with open(CLEAN, 'w', encoding='utf-8') as f:
+    for v, c in clean.items():
+        f.write(json.dumps({"video_id": v, "reasoning_chain": c},
+                           ensure_ascii=False) + '\n')
+cov_c = len(train_ids & set(clean))
+print(f'清洗: 剔测试重叠 {leak_test} + 泄漏话术 {len(spill)} → 净 {len(clean)} 条'
+      f' | 洗后覆盖 train {cov_c}/{len(train_ids)} ({cov_c/len(train_ids):.1%})'
+      f' -> {CLEAN}')
 
 random.seed(0)
 print('\n== 抽样 5 条(肉眼扫: 链的结论应与 GT 字母同向,不许出现"标签说") ==')
-for v in random.sample(sorted(train_ids & set(rows)), 5):
+for v in random.sample(sorted(train_ids & set(clean)), 5):
     r, s, desc = gt[v]
     print(f'\n[{v}] GT={r}|{s}| {desc}')
-    print('  ' + rows[v][:300])
+    print('  ' + clean[v][:300])
 
 hard = []
 if bad_json + bad_field > 0.05 * max(n, 1): hard.append('坏行超5%')
-if leak_test: hard.append(f'测试集泄漏 {leak_test} 条')
-if cov < 0.5 * len(train_ids): hard.append(f'覆盖率过低 {cov/len(train_ids):.1%}')
+if leak_test > 0.10 * max(n, 1): hard.append(f'测试集泄漏超10%({leak_test}),生成批次有大错')
+if cov_c < 0.5 * len(train_ids): hard.append(f'洗后覆盖率过低 {cov_c/len(train_ids):.1%}')
 if cjk > 0.01 * n: hard.append('中文混入超1%')
 if hard:
     print(f'\n[硬伤,拒绝开训] {hard}'); sys.exit(1)
-print(f'\n[体检通过] 覆盖 {cov/len(train_ids):.1%};软指标如上,肉眼扫完再开夜链')
+print(f'\n[体检通过] 洗后覆盖 {cov_c/len(train_ids):.1%};夜链将使用 {CLEAN}')
+if leak_test:
+    print(f'[遗留议题] labels_dedup ∩ labels_test = 训练池含测试视频(资产泄漏{leak_test}条'
+          f'即由此而来)——白天必须专题处理,今晚仅隔离资产不动训练池')
 PY

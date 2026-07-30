@@ -10,7 +10,7 @@
 set -e
 cd "$(dirname "$0")/.."
 echo "[s5] 开跑 $(date) | 代码: $(git log --oneline -1)"
-test -s /data/assets_rat/asset_C_clean.jsonl || { echo "[s5] 缺清洗版资产,先跑 scripts/check_cot_asset.sh"; exit 1; }
+test -s /data/assets_rat/asset_C_reasoning.jsonl || { echo "[s5] 缺 CoT 资产"; exit 1; }
 
 # ① S5 训练: seed-1 配方逐字不动 + CoT 三参数(~5-6h)
 python jax_impl/train_sft.py --labels /data/labels_dedup.jsonl \
@@ -18,7 +18,7 @@ python jax_impl/train_sft.py --labels /data/labels_dedup.jsonl \
     --init-npz outputs/jax_5a/proj_a.npz --augment --early-stop-patience 3 \
     --accum 32 --steps 1500 --eval-every 100 --val-ids /data/val_ids_v2.txt \
     --seed 1 --mu-dtype float32 \
-    --cot-file /data/assets_rat/asset_C_clean.jsonl --cot-ratio 0.6 --cot-anneal 0.5 \
+    --cot-file /data/assets_rat/asset_C_reasoning.jsonl --cot-ratio 0.6 --cot-anneal 0.5 \
     --prefetch-workers 24 --out outputs/jax_5b_s5
 echo "[s5] 训完 $(date)"
 

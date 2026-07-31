@@ -40,7 +40,11 @@ print('outputs/jax_5b_s5/train_params_best.npz' if s5 > s1
 PY
 )
   echo "[day] KTO 配对底座(裸分 RT+SubKS 之和自动选优)= $BASE"
-  BASE="$BASE" nohup bash scripts/build_kto_rt_pairs.sh > kto_pairs.log 2>&1 &
+  if [ -s /data/kto_pairs_rt.jsonl ]; then
+    echo "[day] /data/kto_pairs_rt.jsonl 已存在,跳过重复挖掘(要重挖先删该文件)"
+  else
+    BASE="$BASE" nohup bash scripts/build_kto_rt_pairs.sh > kto_pairs.log 2>&1 &
+  fi
 else
   echo "[day] S5 从未跑过 → 补跑全链: 资产门禁 + S5夜链 + KTO配对接力"
   bash scripts/check_cot_asset.sh

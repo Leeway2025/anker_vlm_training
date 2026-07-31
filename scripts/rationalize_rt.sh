@@ -8,6 +8,9 @@
 set -e
 cd "$(dirname "$0")/.."
 : "${WDS_DIR:?请先 export WDS_DIR=<WDS tar 目录>}"
+# TPU 机自带的 GOOGLE_CLOUD_LOCATION=europe-west4 会把 Vertex 请求路由到
+# 无 gemini-3.1-pro 的区域(404 NOT_FOUND 实测) —— 强制 global 端点
+export GOOGLE_CLOUD_LOCATION=global
 mkdir -p /data/assets_rat
 
 # ① 圈定 A/D 行

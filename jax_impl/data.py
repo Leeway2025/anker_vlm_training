@@ -80,7 +80,8 @@ def split_by_camera(recs, val_size, seed=0):
 
 class SftDataset:
     def __init__(self, labels_file, layout_file, tokenizer, wds_dir=None,   # wds_dir 显式传入时覆盖 meta(见 load_frames)
-                 max_label_len=64, cls_weight=4.0, sample_weights=None,
+                 max_label_len=64, cls_weight=4.0, rt_weight=0.0,
+                 sample_weights=None,
                  reasoning=None, cot_ratio=0.6, attributes=None,
                  max_think_len=96, seed=0, val_n=0,
                  aux_conf_threshold=0.5, augment=False, val_ids=None):
@@ -123,6 +124,7 @@ class SftDataset:
         self.tok = tokenizer
         self.max_label_len = max_label_len
         self.cls_w = cls_weight
+        self.rt_w = rt_weight                   # >0 时 RT 字母位单独加权(④)
         self.reasoning = reasoning or {}        # video_id → 资产 C
         self.cot_ratio = cot_ratio
         self.anneal = False                     # True → 纯生产模式
@@ -181,7 +183,10 @@ class SftDataset:
         tgt_w, start = [], 0
         for k in range(1, len(tgt_ids) + 1):   # 注意勿用 i(样本下标)
             end = len(self.tok.decode(tgt_ids[:k]))
-            tgt_w.append(self.cls_w if start < len(cls_txt) else 1.0)
+            if self.rt_w and start < 2:   # 首 2 字符 = RT 字母+竖线
+                tgt_w.append(self.rt_w)
+            else:
+                tgt_w.append(self.cls_w if start < len(cls_txt) else 1.0)
             start = end
 
         think_ids = []

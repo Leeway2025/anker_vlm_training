@@ -87,6 +87,10 @@ def main():
     ap.add_argument("--ks-coef", type=float, default=0.2)
     ap.add_argument("--cot-file", help="资产 C reasoning.jsonl → 隐式 CoT")
     ap.add_argument("--cot-ratio", type=float, default=0.6)
+    ap.add_argument("--rt-w", type=float, default=0.0,
+                    help="RT 字母位 loss 权重(0=沿用 cls-w x4;④ RT位加权"
+                         "实验用 8: RT决策只占总loss千分之几,单独提权逼"
+                         "模型编码身份特征,SK/desc 绝对权重不变)")
     ap.add_argument("--cot-anneal", type=float, default=0.5,
                     help="最后该比例的步数切纯生产模式")
     ap.add_argument("--init-npz", help="从 train_params.npz 续训(或 import_hf 产物)")
@@ -200,6 +204,7 @@ def main():
             print(f"[data] val_n {a.val_n} -> {vn}(对齐 DP*BS={g})")
     full = SftDataset(
         a.labels, a.layout, tok, wds_dir=a.wds_dir, sample_weights=sw,
+        rt_weight=a.rt_w,
         reasoning=load_jsonl_map(a.cot_file) if a.cot_file else None,
         cot_ratio=a.cot_ratio,
         attributes=load_jsonl_map(a.aux_file) if a.aux_file else None,

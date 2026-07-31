@@ -4,6 +4,9 @@
 # 用法: nohup bash scripts/night_seed2.sh > night_seed2.log 2>&1 &
 set -e
 cd "$(dirname "$0")/.."
+# 防环境污染: rationalize 用的 WDS_DIR(训练集目录)若被继承,会把测试集
+# 推理导向错误 tar(KeyError 实测)。链内数据路径由 labels/meta 自解析。
+unset WDS_DIR
 echo "[s2] 开跑 $(date) | 代码: $(git log --oneline -1)"
 
 # ① seed-2 训练(配方逐字=seed-1,仅换种子)

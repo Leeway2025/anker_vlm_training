@@ -6,6 +6,9 @@
 # 用法: bash scripts/ensemble2.sh
 set -e
 cd "$(dirname "$0")/.."
+# 防环境污染: rationalize 用的 WDS_DIR(训练集目录)若被继承,会把测试集
+# 推理导向错误 tar(KeyError 实测)。链内数据路径由 labels/meta 自解析。
+unset WDS_DIR
 if [ ! -s outputs/optin_replica/preds.jsonl ]; then
   echo "[ens] dump replica 裸logits(~15min)"
   mkdir -p outputs/optin_replica

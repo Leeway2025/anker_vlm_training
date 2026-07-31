@@ -6,6 +6,9 @@
 # 验收: RT >= +0.3 且 SubKS 回撤 <= 0.2 才上位;否则回退 seed-1
 set -e
 cd "$(dirname "$0")/.."
+# 防环境污染: rationalize 用的 WDS_DIR(训练集目录)若被继承,会把测试集
+# 推理导向错误 tar(KeyError 实测)。链内数据路径由 labels/meta 自解析。
+unset WDS_DIR
 echo "[rtw] 开跑 $(date) | 代码: $(git log --oneline -1)"
 
 python jax_impl/train_sft.py --labels /data/labels_dedup.jsonl \

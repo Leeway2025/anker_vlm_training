@@ -6,6 +6,9 @@
 # 产物: /data/kto_pairs_rt.jsonl;KTO 启动命令见文末注释。
 set -e
 cd "$(dirname "$0")/.."
+# 防环境污染: rationalize 用的 WDS_DIR(训练集目录)若被继承,会把测试集
+# 推理导向错误 tar(KeyError 实测)。链内数据路径由 labels/meta 自解析。
+unset WDS_DIR
 BASE="${BASE:-outputs/jax_5b_seed1/train_params_best.npz}"
 echo "[kto-rt] 底座 = $BASE"
 

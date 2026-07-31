@@ -4,6 +4,9 @@
 # 用法: nohup bash scripts/kto_run.sh > kto_run.log 2>&1 &
 set -e
 cd "$(dirname "$0")/.."
+# 防环境污染: rationalize 用的 WDS_DIR(训练集目录)若被继承,会把测试集
+# 推理导向错误 tar(KeyError 实测)。链内数据路径由 labels/meta 自解析。
+unset WDS_DIR
 test -s outputs/kto_rt/train_preds.jsonl || { echo "[kto] 缺训练集完整串,先跑 build_kto_rt_pairs.sh"; exit 1; }
 
 # ① 配对扩挖: RT 或 SK 任一字母错 → 偏好对(CPU 秒级,零推理)

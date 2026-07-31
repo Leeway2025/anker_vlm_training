@@ -9,6 +9,9 @@
 #   outputs/optin/eval_report_joint.txt (seed-1 联合解码,对 83.65 比)
 set -e
 cd "$(dirname "$0")/.."
+# 防环境污染: rationalize 用的 WDS_DIR(训练集目录)若被继承,会把测试集
+# 推理导向错误 tar(KeyError 实测)。链内数据路径由 labels/meta 自解析。
+unset WDS_DIR
 echo "[s5] 开跑 $(date) | 代码: $(git log --oneline -1)"
 test -s /data/assets_rat/asset_C_reasoning.jsonl || { echo "[s5] 缺 CoT 资产"; exit 1; }
 

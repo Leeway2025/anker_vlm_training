@@ -4,6 +4,9 @@
 # 用法: nohup bash scripts/soup_full.sh > soup_full.log 2>&1 &
 set -e
 cd "$(dirname "$0")/.."
+# 防环境污染: rationalize 用的 WDS_DIR(训练集目录)若被继承,会把测试集
+# 推理导向错误 tar(KeyError 实测)。链内数据路径由 labels/meta 自解析。
+unset WDS_DIR
 echo "[soupf] 开跑 $(date)"
 
 for W in 0.60 0.75 0.85; do

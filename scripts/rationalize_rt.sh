@@ -29,6 +29,7 @@ PY
 python3 -m annotation.rationalize_cot \
     --wds-dir "$WDS_DIR" --labels /data/labels_dedup.jsonl \
     --only-ids /data/assets_rat/rt_focus_ids.txt --rt-focus \
+    --model "${RAT_MODEL:-gemini-3.5-flash}" \
     --out /data/assets_rat/rat_rt_raw.jsonl \
     --asset-out /data/assets_rat/asset_C_rt.jsonl \
     --workers 50

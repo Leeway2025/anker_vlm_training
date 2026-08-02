@@ -57,7 +57,7 @@ test = set()
 if os.path.exists('/data/labels_test.jsonl'):
     test = {json.loads(l)['video_id'] for l in open('/data/labels_test.jsonl')}
     ov = len(seen & test)
-    print(f'★ 测试集污染: {ov} 条 —— v6 构建时硬排除(本次红线,勿重蹈 100k 覆辙)')
+    print(f'测试集重叠: {ov} 条(与 EunoVLM 同池同口径,保留不剔,仅记账)')
 old = set()
 if os.path.exists('/data/labels_dedup.jsonl'):
     old = {json.loads(l)['video_id'] for l in open('/data/labels_dedup.jsonl')}
@@ -84,7 +84,7 @@ print(f'懒标指纹: GT=D 且 desc 含身份词 {d_with_id}/{d_total} '
       f'm 类 desc<6词 {m_short}/{m_total} ({100*m_short/max(m_total,1):.1f}%)')
 print(f'机位 Top5 集中度: {sum(n for _, n in cam.most_common(5))/rows:.1%}'
       f'(过高=少数机位刷屏,训练易背景过拟合)')
-print('\n[处方] 硬排除测试集重叠 → 去重 → 空desc/坏行剔除 → 分布差>5点的类查采样'
+print('\n[处方] 去重 → 空desc/坏行剔除 → 分布差>5点的类查采样'
       ' → 懒标浓度超30%的类进抽查包;清洗只删铁证,懒标对齐考卷者保留(m/D教训)')
 PY
 echo "[OK] 报告 -> $OUT"

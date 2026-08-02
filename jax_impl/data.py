@@ -15,6 +15,7 @@ import json
 import os
 import pickle
 import random
+import re
 import sys
 import tarfile
 
@@ -78,10 +79,16 @@ def split_by_camera(recs, val_size, seed=0):
     return [r for r in recs if r["video_id"] not in val_ids], val
 
 
+# desc 身份词表(方案三加权用): 判身份必须依赖的词
+_ID_WORDS = re.compile(
+    r"resident|home\s?owner|courier|delivery|staff|mail\s?carrier|"
+    r"stranger|visitor|intruder|uniform|family|neighbor", re.I)
+
+
 class SftDataset:
     def __init__(self, labels_file, layout_file, tokenizer, wds_dir=None,   # wds_dir 显式传入时覆盖 meta(见 load_frames)
                  max_label_len=64, cls_weight=4.0, rt_weight=0.0,
-                 sample_weights=None,
+                 id_weight=0.0, sample_weights=None,
                  reasoning=None, cot_ratio=0.6, attributes=None,
                  max_think_len=96, seed=0, val_n=0,
                  aux_conf_threshold=0.5, augment=False, val_ids=None):
@@ -125,6 +132,8 @@ class SftDataset:
         self.max_label_len = max_label_len
         self.cls_w = cls_weight
         self.rt_w = rt_weight                   # >0 时 RT 字母位单独加权(④)
+        self.id_w = id_weight                   # >0 时 desc 身份词加权(方案三:
+        #   逼模型为写对 resident/courier 等词先编码身份特征,不动判决先验)
         self.reasoning = reasoning or {}        # video_id → 资产 C
         self.cot_ratio = cot_ratio
         self.anneal = False                     # True → 纯生产模式
@@ -179,14 +188,21 @@ class SftDataset:
         # 权重按字符覆盖回填(与 torch offset 语义一致): 与 cls 前缀
         # 有重叠的 token ×cls_w,其余 ×1
         cls_txt = f"{lb['role_type']}|{lb['sub_keyscene']}|"
-        tgt_ids = self.tok.encode(cls_txt + str(lb["description"]).strip())
+        full_txt = cls_txt + str(lb["description"]).strip()
+        tgt_ids = self.tok.encode(full_txt)
+        id_spans = ([(m.start(), m.end()) for m in _ID_WORDS.finditer(full_txt)]
+                    if self.id_w else [])
         tgt_w, start = [], 0
         for k in range(1, len(tgt_ids) + 1):   # 注意勿用 i(样本下标)
             end = len(self.tok.decode(tgt_ids[:k]))
             if self.rt_w and start < 2:   # 首 2 字符 = RT 字母+竖线
                 tgt_w.append(self.rt_w)
+            elif start < len(cls_txt):
+                tgt_w.append(self.cls_w)
+            elif any(s0 < end and start < e0 for s0, e0 in id_spans):
+                tgt_w.append(self.id_w)   # desc 身份词 token
             else:
-                tgt_w.append(self.cls_w if start < len(cls_txt) else 1.0)
+                tgt_w.append(1.0)
             start = end
 
         think_ids = []

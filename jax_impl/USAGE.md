@@ -171,6 +171,14 @@ bash jax_impl/setup_jax_env.sh /path/to/venv_jax
 - **注意**:bs=2 走 `install_batched_encode_vision` 路径(此前生产一直
   bs=1),HBM 余量薄 —— 开跑头 100 步盯 `[hbm]`;深夜 OOM 由断点续训
   (S2b watchdog)兜底。
+- **第二档(remat 降档,数学恒等零配方风险)**:`--remat-policy dots`
+  把 LLM 层反向从"全重算"降为"保留矩阵乘输出",~+10-25% 吞吐、多吃
+  显存 —— 与 bs2 争 HBM,组合用同一道门验:
+  `SPEED_T_ARGS="--per-device-bs 2 --accum 4 --mu-dtype bfloat16 --remat-policy dots" bash scripts/speed_gate.sh`
+  (bs2+dots 若 OOM,退而验 bs1+dots vs bs2+full,吞吐高者上)。
+- **日历级加速(零代码)**:1M 计划本就要跑两次(第二跑=蒸馏 teacher)。
+  若客户能再给一台 v6e-8(独立单机窗口,不需要多机互联/多机代码),
+  两跑并行,双跑总日历从 ~8 天砍到 ~4 天。
 
 ## S3. hard_mining —— 难例挖掘续训(可选)
 

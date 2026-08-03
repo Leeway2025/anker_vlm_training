@@ -35,9 +35,13 @@ PY
 
 COMMON="--layout $LAYOUT --rank-scheme prod --train-vision --train-projector \
   --seed 7 --prefetch-workers 8"
-# 生产配置(P)与吞吐包(T): 同全局 batch 64(8芯×bs×accum)
+# 生产配置(P)与吞吐包(T): 同全局 batch 64(8芯×bs×accum)。
+# T 可用 SPEED_T_ARGS 覆盖以验其它组合(全局 batch 必须保持 64!),如:
+#   SPEED_T_ARGS="--per-device-bs 2 --accum 4 --mu-dtype bfloat16 --remat-policy dots"
+#   SPEED_T_ARGS="--per-device-bs 1 --accum 8 --mu-dtype bfloat16 --remat-policy dots"
 P_ARGS="--per-device-bs 1 --accum 8 --mu-dtype float32"
-T_ARGS="--per-device-bs 2 --accum 4 --mu-dtype bfloat16"
+T_ARGS="${SPEED_T_ARGS:---per-device-bs 2 --accum 4 --mu-dtype bfloat16}"
+echo "[gate] 吞吐包配置: $T_ARGS"
 
 SHORT="--steps 30 --eval-every 30 --val-n 64"   # step30 同卷 val = 轨迹对齐判据
 echo "== [1/4] 短程 30 步 · 生产配置 =="

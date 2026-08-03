@@ -96,6 +96,12 @@ def main():
     ap.add_argument("--cot-anneal", type=float, default=0.5,
                     help="最后该比例的步数切纯生产模式")
     ap.add_argument("--init-npz", help="从 train_params.npz 续训(或 import_hf 产物)")
+    ap.add_argument("--remat-policy", choices=["full", "dots"],
+                    default="full",
+                    help="LLM 层重算策略: full=nothing_saveable(全重算,最省"
+                         "显存,历史默认)/ dots=保留矩阵乘输出(反向少重算,"
+                         "~+10-25% 吞吐,多吃显存)。数学恒等零配方风险,"
+                         "OOM 风险由 speed_gate 实测把关")
     ap.add_argument("--ckpt-every", type=int, default=0,
                     help=">0: 每 N 个 opt step 落全量断点(参数+优化器+进度),"
                          "原子写、滚动保留 2 份;跨天长跑(1M)必开。"
@@ -160,7 +166,12 @@ def main():
     # ---- 逐层重算(gm 无内置 remat;v1 坑 3/4)----
     if not getattr(g4_modules, "_REMAT_PATCHED", False):
         _orig_call = g4_modules.Block.__call__
-        _POL = jax.checkpoint_policies.nothing_saveable
+        _POL = (jax.checkpoint_policies.nothing_saveable
+                if a.remat_policy == "full" else
+                jax.checkpoint_policies.dots_with_no_batch_dims_saveable)
+        if a.remat_policy != "full":
+            print(f"[remat] LLM 层策略={a.remat_policy}"
+                  "(保留矩阵乘输出,反向少重算;盯 [hbm] 防 OOM)")
 
         def _make_core(skip_flag):
             def core(self, x, pos, cache, mask, pli, kvs):

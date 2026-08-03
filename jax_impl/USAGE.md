@@ -156,6 +156,22 @@ bash jax_impl/setup_jax_env.sh /path/to/venv_jax
 - **验收**:`bash scripts/test_resume.sh`(TPU 机,~20min):kill -9
   中断+续跑 vs 一气跑完,逐步 loss 与最终参数逐位对齐才放行。
 
+### S2c. 吞吐包(可选加速,~1.4-1.5×;上生产前必过验收门)
+
+- **内容(一个单变量整体)**:`--per-device-bs 2`(批式视觉编码)+
+  `--mu-dtype bfloat16`(代码默认;train_1m.sh 曾显式钉 float32)。
+  **accum 必须同步减半**(32→16)保持全局 batch 256 不变,否则是另一个
+  配方(lr 要重标)。
+- **验收门**:`bash scripts/speed_gate.sh`(TPU 机,~1.5h)——生产配置
+  vs 吞吐包四段 A/B,自动裁决:①吞吐 ≥+15% ②HBM peak<95% limit
+  ③step30 同卷 val_loss Δ<0.02(两配置每 opt step 消费同一批样本,梯度
+  数学同值)④64 样本过拟合塌陷不劣(v7 铁律,防数值悄悄错)。
+- **过门后改法**:train_1m.sh `--accum 32`→`16`,加 `--per-device-bs 2`,
+  删 `--mu-dtype float32`。
+- **注意**:bs=2 走 `install_batched_encode_vision` 路径(此前生产一直
+  bs=1),HBM 余量薄 —— 开跑头 100 步盯 `[hbm]`;深夜 OOM 由断点续训
+  (S2b watchdog)兜底。
+
 ## S3. hard_mining —— 难例挖掘续训(可选)
 
 - **前置**:S2 产物。三步:推理 → 挖掘 → 加权续训。

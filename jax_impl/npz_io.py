@@ -130,3 +130,90 @@ def restore_train_tree(train0, z, jnp, is_zero_skippable):
 
     tree = jax.tree_util.tree_map_with_path(restore, train0)
     return tree, stats
+
+
+def save_ckpt(out_dir, train, opt_state, meta):
+    """全量断点落盘: train 树 + optimizer 树(Adam μ/ν + MultiSteps 累积
+    缓冲/计数)+ 进度元数据(step/best/patience/loss 历史)。
+
+    崩溃安全: 先写 ckpt.tmp.npz 再 rename(POSIX 原子),滚动保留
+    latest/prev 两份 —— "存到一半被杀"最坏丢一个保存间隔,不会留坏档。
+    opt 树按 flatten 序号存(O:0000…): 结构由重建时的 optim.init 提供,
+    序号只需与同配置下的 flatten 顺序一致(load_ckpt 有叶数硬校验)。
+    返回耗时秒数。"""
+    import json
+    import os
+    import time
+
+    import jax
+    t0 = time.time()
+
+    def _raw(v):
+        # bf16 等 ml_dtypes 在 npz 里不保真(读回变 void,jnp 无法 cast)
+        # → 存原始位(同宽无符号整型视图),load 端按模板 dtype 视图还原
+        v = np.asarray(v)
+        if v.dtype.kind == "V":
+            return v.view(f"u{v.dtype.itemsize}")
+        return v
+
+    tl = jax.tree_util.tree_flatten_with_path(train)[0]
+    ol = jax.tree_util.tree_flatten(opt_state)[0]
+    payload = {"__meta__": np.array(json.dumps(meta))}
+    payload.update({"T:" + _path_str(p): _raw(v) for p, v in tl})
+    payload.update({f"O:{i:04d}": _raw(v) for i, v in enumerate(ol)})
+    tmp = os.path.join(out_dir, "ckpt.tmp.npz")
+    latest = os.path.join(out_dir, "ckpt_latest.npz")
+    prev = os.path.join(out_dir, "ckpt_prev.npz")
+    np.savez(tmp, **payload)
+    if os.path.exists(latest):
+        os.replace(latest, prev)
+    os.replace(tmp, latest)
+    return time.time() - t0
+
+
+def load_ckpt(out_dir, train0, opt_state0, jnp):
+    """恢复断点。latest 损坏(截断/坏 zip)自动回退 prev;两份都没有
+    返回 None(调用方从头开跑)。train0/opt_state0 只当结构+dtype 模板,
+    值全部被断点覆盖。形状/叶数不匹配硬报错 —— 配置漂移必须显性失败。"""
+    import json
+    import os
+
+    import jax
+
+    def _typed(v, leaf, what):
+        lt = np.dtype(leaf.dtype)
+        if lt.kind == "V" and v.dtype.kind == "u" \
+                and v.dtype.itemsize == lt.itemsize:
+            v = v.view(lt)               # save 端 _raw 的逆: 原始位→ml_dtype
+        if v.shape != np.shape(leaf):
+            raise ValueError(f"{what} 形状 {v.shape} != 模板 "
+                             f"{np.shape(leaf)}")
+        return jnp.asarray(v, leaf.dtype)
+
+    for name in ("ckpt_latest.npz", "ckpt_prev.npz"):
+        path = os.path.join(out_dir, name)
+        if not os.path.exists(path):
+            continue
+        try:
+            z = np.load(path, allow_pickle=False)
+            meta = json.loads(str(z["__meta__"]))
+            tl = jax.tree_util.tree_flatten_with_path(train0)[0]
+            t_leaves = [_typed(z["T:" + _path_str(p)], leaf,
+                               f"train 叶 {_path_str(p)}")
+                        for p, leaf in tl]
+            train = jax.tree_util.tree_unflatten(
+                jax.tree_util.tree_structure(train0), t_leaves)
+            ol, odef = jax.tree_util.tree_flatten(opt_state0)
+            n_saved = sum(1 for k in z.files if k.startswith("O:"))
+            if n_saved != len(ol):
+                raise ValueError(f"opt 叶数 {n_saved} != 模板 {len(ol)}"
+                                 "(优化器配置变了?)")
+            o_leaves = [_typed(z[f"O:{i:04d}"], ol[i], f"opt 叶 {i}")
+                        for i in range(len(ol))]
+            opt_state = jax.tree_util.tree_unflatten(odef, o_leaves)
+            print(f"[resume] 载入 {name}: opt_step {meta.get('opt_step')} "
+                  f"(train {len(t_leaves)} 叶 + opt {len(o_leaves)} 叶)")
+            return train, opt_state, meta
+        except Exception as e:  # noqa: BLE001 —— 坏档回退是本函数的职责
+            print(f"[resume] {name} 不可用({e}),尝试上一份")
+    return None

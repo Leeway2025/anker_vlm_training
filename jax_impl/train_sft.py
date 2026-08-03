@@ -96,6 +96,15 @@ def main():
     ap.add_argument("--cot-anneal", type=float, default=0.5,
                     help="最后该比例的步数切纯生产模式")
     ap.add_argument("--init-npz", help="从 train_params.npz 续训(或 import_hf 产物)")
+    ap.add_argument("--ckpt-every", type=int, default=0,
+                    help=">0: 每 N 个 opt step 落全量断点(参数+优化器+进度),"
+                         "原子写、滚动保留 2 份;跨天长跑(1M)必开。"
+                         "注意与 --init-npz 的区别: init-npz 只热启参数,"
+                         "丢优化器动量/日程/数据位置")
+    ap.add_argument("--resume", action="store_true",
+                    help="从 <out>/ckpt_latest.npz 精确续跑(优化器动量、lr "
+                         "日程、数据位置、best/patience 全恢复);断点不存在"
+                         "时静默从头跑 —— 因此可无脑配 watchdog 外壳")
     ap.add_argument("--mu-dtype", choices=["bfloat16", "float32"],
                     default="bfloat16",
                     help="Adam 一阶动量精度(bf16 省 HBM ~2-4G,为 bs2/"
@@ -389,6 +398,31 @@ def main():
     optim = optax.MultiSteps(tx, every_k_schedule=a.accum)
     opt_state = optim.init(train0)
 
+    # ---- 断点恢复(--resume): 参数+优化器+进度全量覆盖 ----
+    # 与 --init-npz 的分工: init-npz=跨阶段热启(只参数,动量/日程归零),
+    # resume=同一次跑的精确续接(中断点处一切如初)。两者同给时 resume 赢
+    # (init-npz 先应用,随后被断点整树覆盖)。
+    start_micro, _ck = 0, None
+    if a.resume:
+        from jax_impl.npz_io import load_ckpt
+        r = load_ckpt(a.out, train0, opt_state, jnp)
+        if r:
+            train0, opt_state, _ck = r
+            for k, want in (("seed", a.seed), ("accum", a.accum),
+                            ("dp", DP), ("bs", BS), ("steps", a.steps),
+                            ("cot_anneal", a.cot_anneal)):
+                if _ck.get(k) != want:
+                    raise SystemExit(
+                        f"[resume] 断点 {k}={_ck.get(k)} 与本次 {want} 不一致"
+                        " —— 拒绝续跑: 改配置=另一次实验,数据序/lr 日程都会"
+                        "错位,请换 --out 从头跑")
+            start_micro = int(_ck["micro_done"])
+            print(f"[resume] 自 opt_step {_ck['opt_step']}/{a.steps} 续跑"
+                  f"(micro {start_micro},best={_ck['best'][0]:.4f}"
+                  f"@{_ck['best'][1]},since_best={_ck['since_best']})")
+        else:
+            print("[resume] 未发现可用断点,从头开始")
+
     ls = a.label_smoothing
     T = len(full.template)
     mesh = Mesh(np.asarray(devs[:DP]), ("dp",))
@@ -555,7 +589,11 @@ def main():
         if _wb:
             _wb.log(kv, step=step)
     hist, best = [], (1e9, -1)
-    cursor = 0
+    if _ck:                                  # 进度状态随断点一并恢复
+        hist = [float(x) for x in _ck["hist"]]
+        best = (float(_ck["best"][0]), int(_ck["best"][1]))
+        main._since_best = int(_ck["since_best"])
+    cursor = start_micro * DP * BS
     t0 = time.time()
     total_micro = a.steps * a.accum
     # 每 epoch 用固定 seed 重洗(旧版严格顺序循环: 同类样本成段 →
@@ -571,14 +609,20 @@ def main():
         e, i = divmod(k, ep_len)
         return int(train_np[_perms[e][i]])
     switch_at = int(total_micro * (1 - a.cot_anneal)) if a.cot_file else -1
+    if switch_at >= 0 and start_micro >= switch_at:
+        full.set_anneal(True)   # resume 落在退火段: 循环内的 == 触发点已过,
+        print(f"[anneal] resume 于退火段(micro {start_micro} ≥ "
+              f"{switch_at}),直接以纯生产模式续跑")
     pf = None
     if a.prefetch_workers > 0:
         from jax_impl.prefetch import BatchPrefetcher
         pf = BatchPrefetcher(full, draw,
                              DP * BS, workers=a.prefetch_workers)
+        if start_micro:         # 丢掉构造时从 0 预取的批,跳到断点位置
+            pf.flush(restart_at=start_micro * DP * BS)
         print(f"[prefetch] workers={a.prefetch_workers} depth=2 "
-              f"(每 epoch 重洗, seed={a.seed})")
-    for micro in range(total_micro):
+              f"(每 epoch 重洗, seed={a.seed}, start={start_micro * DP * BS})")
+    for micro in range(start_micro, total_micro):
         if switch_at >= 0 and micro == switch_at and not full.anneal:
             full.set_anneal(True)
             if pf:                      # 清掉队列里旧模式 batch,边界零滞后
@@ -594,7 +638,7 @@ def main():
             batch = collect(idxs)
         train, opt_state, loss = train_step(train, opt_state, base, TEACH,
                                             *batch)
-        if micro == 0:
+        if micro == start_micro:
             print(f"[compile+step0] {time.time()-t0:.0f}s", flush=True)
             t0 = time.time()
         if (micro + 1) % a.accum == 0:
@@ -641,6 +685,17 @@ def main():
                               f"无改善(best={best[0]:.4f}@{best[1]}),提前结束",
                               flush=True)
                         break
+            if a.ckpt_every and opt_step % a.ckpt_every == 0:
+                from jax_impl.npz_io import save_ckpt
+                dt_ck = save_ckpt(a.out, train, opt_state, {
+                    "micro_done": micro + 1, "opt_step": opt_step,
+                    "best": [float(best[0]), int(best[1])],
+                    "since_best": int(getattr(main, "_since_best", 0)),
+                    "hist": [float(x) for x in hist],
+                    "seed": a.seed, "accum": a.accum, "dp": DP, "bs": BS,
+                    "steps": a.steps, "cot_anneal": a.cot_anneal})
+                print(f"[ckpt] opt_step {opt_step} 断点已落盘"
+                      f"({dt_ck:.0f}s)", flush=True)
 
     try:
         ms = jax.local_devices()[0].memory_stats()
@@ -657,6 +712,7 @@ def main():
     json.dump({"loss_history": hist, "rank": a.rank, "dp": DP,
                "best_val": list(best), "seed": a.seed,
                "lr_schedule": a.lr_schedule, "warmup": a.warmup,
+               "resumed_from_step": _ck["opt_step"] if _ck else None,
                "code_commit": code_version()},
               open(os.path.join(a.out, "train_meta.json"), "w"))
     has_best = os.path.exists(os.path.join(a.out, "train_params_best.npz"))

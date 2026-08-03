@@ -131,6 +131,31 @@ bash jax_impl/setup_jax_env.sh /path/to/venv_jax
 - **已有 torch stage b 成果?** 见文末「与 torch 成果衔接」§A——
   可导入续训,但**须走 legacy 方案且不可再用 --rank-scheme prod**。
 
+### S2b. 断点续训(跨天长跑必开;1M 全量默认开)
+
+- **开关**:`--ckpt-every 250 --resume`。每 250 opt step 落全量断点
+  `<out>/ckpt_latest.npz`(参数 + Adam μ/ν + MultiSteps 累积缓冲 +
+  step/lr 日程位置 + 数据位置 + best/patience + loss 历史),原子写
+  (tmp→rename),滚动保留 latest/prev 两份,单份 ~3-4G、写一次 ~1min。
+- **与 --init-npz 的区别(易混,记住)**:init-npz = 跨阶段热启,只
+  恢复参数,优化器动量清零、lr 日程与数据从头 —— 中断后拿它"续跑"
+  会重复训前段数据且丢动量(v3 事故同款伤);resume = 同一次跑的精确
+  续接,断点处一切如初。两者同给时 resume 赢。
+- **resume 语义**:断点不存在时静默从头跑,因此命令可无脑带 --resume
+  配 watchdog 外壳(模板见 scripts/train_1m.sh):
+  ```bash
+  until python jax_impl/train_sft.py ... --ckpt-every 250 --resume; do
+    sleep 60   # libtpu 锁释放需 >10s
+  done
+  ```
+- **防呆**:断点与本次的 seed/accum/dp/bs/steps/cot_anneal 任一不符即
+  拒绝续跑(改配置=另一次实验,数据序与 lr 日程都会错位,换 --out)。
+  latest 损坏自动回退 prev。
+- **增强语义**:resume 后 `--augment` 的 RNG 重播(统计等价,非逐位
+  复现 —— 多线程下两次不中断的跑之间本就不逐位一致)。
+- **验收**:`bash scripts/test_resume.sh`(TPU 机,~20min):kill -9
+  中断+续跑 vs 一气跑完,逐步 loss 与最终参数逐位对齐才放行。
+
 ## S3. hard_mining —— 难例挖掘续训(可选)
 
 - **前置**:S2 产物。三步:推理 → 挖掘 → 加权续训。

@@ -160,43 +160,48 @@ def main():
                 r.setdefault("slices", []).append(name)
         s += W["scene"] * scene_sim.get(r["video_id"], 0.0)
         s += W["retr"] * min(retr_hit.get(r["video_id"], 0), 5) / 5.0
+        if r["sk"] in TAIL:
+            s += 2.0          # 尾类加成: 类内优先, 但不再绕过 RT 配额(修 top100k 被 C 挤爆的 bug)
         r["score"] = s
 
     # ---- 出池: 尾类全收 + 随机保底 + 分层(RT×SK 对齐 test 边际)贪心 ----
     sizes = sorted(int(x) for x in a.sizes.split(","))
-    tail = [r for r in recs if r["sk"] in TAIL]
-    rest = [r for r in recs if r["sk"] not in TAIL]
-    rng.shuffle(rest)
+    rng.shuffle(recs)
     n_floor = int(sizes[-1] * a.rand_floor)
-    floor = rest[:n_floor]
-    body = sorted(rest[n_floor:], key=lambda r: -r["score"])
-    # 机位配额(闸0 cap)在贪心时执行
+    floor = set(id(r) for r in recs[:n_floor])
+    for r in recs[:n_floor]:
+        r["score"] = r.get("score", 0.0) + 1.0   # 随机保底: 加成而非独立通道
+    body = sorted(recs, key=lambda r: -r["score"])
     per_cam = Counter()
     ranked = []
-    for r in tail + floor + body:
+    for r in body:
         if per_cam[r["cam"]] >= a.cam_cap and r["sk"] not in TAIL:
-            continue
+            continue    # 尾类豁免机位cap(稀缺事件同机位也收)
         per_cam[r["cam"]] += 1
         ranked.append(r)
     # 边际对齐: 对每个截断档, 按 test RT 边际做水位裁剪
     open(os.path.join(a.out_dir, "ranked_all.txt"), "w").write(
         "\n".join(r["video_id"] for r in ranked) + "\n")
+    n_tail = sum(1 for r in recs if r["sk"] in TAIL)
     rep = [f"strategy={a.strategy} 池={len(recs)} 排序后={len(ranked)} "
-           f"尾类全收={len(tail)} 随机保底={len(floor)}"]
+           f"尾类池={n_tail} 随机保底={len(floor)}"]
     for size in sizes:
         quota = {k: max(1, int(size * v / tn)) for k, v in t_rt.items()}
-        got, sel = Counter(), []
-        for r in ranked:
+        got, sel, seen_sel = Counter(), [], set()
+        for r in ranked:                       # 第一段: 严格按 test 边际配额
             if len(sel) >= size:
                 break
-            if got[r["rt"]] >= quota.get(r["rt"], 0) and r["sk"] not in TAIL:
+            if got[r["rt"]] >= quota.get(r["rt"], 0):
                 continue
             got[r["rt"]] += 1
-            sel.append(r["video_id"])
+            sel.append(r["video_id"]); seen_sel.add(r["video_id"])
         # 没填满(某类池内不够)则按分数补齐
-        if len(sel) < size:
-            pool_left = [r["video_id"] for r in ranked if r["video_id"] not in set(sel)]
-            sel += pool_left[: size - len(sel)]
+        if len(sel) < size:                    # 第二段: 类内不够, 按总分补齐
+            for r in ranked:
+                if len(sel) >= size:
+                    break
+                if r["video_id"] not in seen_sel:
+                    sel.append(r["video_id"]); seen_sel.add(r["video_id"])
         open(os.path.join(a.out_dir, f"pool_top{size//1000}k.txt"), "w").write(
             "\n".join(sel) + "\n")
         rep.append(f"top{size//1000}k: {len(sel)} 条, RT配额={dict(got)}")

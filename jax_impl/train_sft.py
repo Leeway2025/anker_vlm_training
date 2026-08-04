@@ -71,6 +71,10 @@ def main():
     ap.add_argument("--augment", action="store_true",
                     help="训练增强: 翻转/亮度/帧dropout(val 不增强;"
                          "时序翻转结构性禁止)")
+    ap.add_argument("--cartography", action="store_true",
+                    help="训练动力学日志: 每样本每次相遇的 CE →"
+                         "<out>/cartography.jsonl(零额外前向;清洗夜标配,"
+                         "错标 vs 真难例的第四证人)")
     ap.add_argument("--augment-v2", action="store_true",
                     help="增强包 v2: crop-zoom/对比度/轻遮挡(叠加在 v1 "
                          "之上;默认关,须在干净标签 100k 上 from-scratch "
@@ -476,6 +480,10 @@ def main():
         ce = (1 - ls) * (lse - tgt) + ls * (lse - lg.mean(-1))
         ce = jnp.where(valid > 0, ce, 0.0)      # PAD 行 NaN×0 防护
         loss = (ce * wt).sum() / jnp.clip((wt * valid).sum(), 1.0)
+        # 训练动力学(cartography): 每样本加权 CE, 与 loss 同一批中间量,
+        # 零额外前向。只含生产口径 CE(不混 KL/aux 头), 信号纯净 ——
+        # 高波动低置信=疑似错标, 稳定高 loss=真难例(区分二者的第四证人)
+        per_ex = (ce * wt).sum(-1) / jnp.clip((wt * valid).sum(-1), 1.0)
 
         if a.teacher_npz:                       # KL 蒸馏(老师冻结前向)
             lora_t_h = jax.tree.map(
@@ -530,35 +538,35 @@ def main():
             if "ks" in train["aux"]:
                 loss = loss + a.ks_coef * head_ce(
                     train["aux"]["ks"]["w"], train["aux"]["ks"]["b"], ks_label)
-        return loss
+        return loss, per_ex
 
     def grad_local(train, base_p, teach, tokens, labels, weights, patches,
                    pos_xy, aux_labels, ks_label):
-        loss, grads = jax.value_and_grad(loss_fn)(
+        (loss, per_ex), grads = jax.value_and_grad(loss_fn, has_aux=True)(
             train, base_p, teach, tokens, labels, weights, patches, pos_xy,
             aux_labels, ks_label)
-        return (jax.lax.pmean(loss, "dp"),
+        return (jax.lax.pmean(loss, "dp"), per_ex,
                 jax.tree.map(lambda g: jax.lax.pmean(g, "dp"), grads))
 
     grad_sharded = shard_map(
         grad_local, mesh=mesh,
         in_specs=(P(), P(), P(), P("dp"), P("dp"), P("dp"), P("dp"),
                   P("dp"), P("dp"), P("dp")),
-        out_specs=(P(), P()), check_rep=False)
+        out_specs=(P(), P("dp"), P()), check_rep=False)
 
     @functools.partial(jax.jit, donate_argnums=(0, 1))
     def train_step(train, opt_state, base_p, teach, tokens, labels, weights,
                    patches, pos_xy, aux_labels, ks_label):
-        loss, grads = grad_sharded(train, base_p, teach, tokens, labels,
-                                   weights, patches, pos_xy, aux_labels,
-                                   ks_label)
+        loss, per_ex, grads = grad_sharded(train, base_p, teach, tokens,
+                                           labels, weights, patches, pos_xy,
+                                           aux_labels, ks_label)
         updates, opt_state = optim.update(grads, opt_state, train)
         train = optax.apply_updates(train, updates)
-        return train, opt_state, loss
+        return train, opt_state, loss, per_ex
 
     eval_local = shard_map(
         lambda tr, bp, tc, t, l, w, p, x, al, kl: jax.lax.pmean(
-            loss_fn(tr, bp, tc, t, l, w, p, x, al, kl), "dp"),
+            loss_fn(tr, bp, tc, t, l, w, p, x, al, kl)[0], "dp"),
         mesh=mesh,
         in_specs=(P(), P(), P(), P("dp"), P("dp"), P("dp"), P("dp"),
                   P("dp"), P("dp"), P("dp")),
@@ -579,6 +587,12 @@ def main():
     train = train0
     os.makedirs(a.out, exist_ok=True)
     _mf = open(os.path.join(a.out, "metrics.jsonl"), "a", buffering=1)
+    # 训练动力学日志(--cartography): (video_id, micro, per-sample CE) →
+    # <out>/cartography.jsonl。跑完用 均值(难度)×方差(波动) 二维图分桶:
+    # 高波动低置信=疑似错标 / 稳定高 loss=真难例(Dataset Cartography/AUM)
+    _carto_f = (open(os.path.join(a.out, "cartography.jsonl"), "a")
+                if a.cartography else None)
+    _carto_buf = []
     try:                                    # TB 可选(镜像无包则静默降级)
         from tensorboardX import SummaryWriter
         _tb = SummaryWriter(os.path.join(a.out, "tb"))
@@ -651,8 +665,20 @@ def main():
             idxs = [draw(cursor + j) for j in range(DP * BS)]
             cursor += DP * BS
             batch = collect(idxs)
-        train, opt_state, loss = train_step(train, opt_state, base, TEACH,
-                                            *batch)
+        train, opt_state, loss, per_ex = train_step(train, opt_state, base,
+                                                    TEACH, *batch)
+        if _carto_f is not None:
+            # video_id 由 draw(纯函数) 宿主侧反推, 预取器零改动;
+            # per_ex 顺序=batch 顺序=draw 顺序(shard_map P("dp") 按首轴切)
+            _carto_buf.append((micro, [float(x) for x in np.asarray(per_ex)]))
+            if len(_carto_buf) >= 64:
+                for m_, ls_ in _carto_buf:
+                    for j_, v_ in enumerate(ls_):
+                        _carto_f.write(json.dumps({
+                            "video_id": full.recs[draw(m_ * DP * BS + j_)]
+                                            ["video_id"],
+                            "micro": m_, "loss": round(v_, 4)}) + "\n")
+                _carto_buf.clear()
         if micro == start_micro:
             print(f"[compile+step0] {time.time()-t0:.0f}s", flush=True)
             t0 = time.time()
@@ -712,6 +738,13 @@ def main():
                 print(f"[ckpt] opt_step {opt_step} 断点已落盘"
                       f"({dt_ck:.0f}s)", flush=True)
 
+    if _carto_f is not None:                 # 尾批落盘
+        for m_, ls_ in _carto_buf:
+            for j_, v_ in enumerate(ls_):
+                _carto_f.write(json.dumps({
+                    "video_id": full.recs[draw(m_ * DP * BS + j_)]["video_id"],
+                    "micro": m_, "loss": round(v_, 4)}) + "\n")
+        _carto_f.close()
     try:
         ms = jax.local_devices()[0].memory_stats()
         print(f"[hbm] dev0 peak={ms.get('peak_bytes_in_use', 0)/2**30:.2f}G "

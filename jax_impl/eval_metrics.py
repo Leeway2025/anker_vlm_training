@@ -21,21 +21,22 @@ def parse_output(text):
     return (m.group(1), m.group(2)) if m else (None, None)
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--preds", required=True)
-    ap.add_argument("--labels", required=True)
-    ap.add_argument("--per-class", action="store_true")
-    a = ap.parse_args()
+def pct(x, d):
+    return f"{100.0 * x / max(d, 1):.2f}%"
 
-    preds = {j["video_id"]: j["output"] for j in
-             (json.loads(l) for l in open(a.preds, encoding="utf-8"))}
+
+def compute(labels_path, preds, exclude=None, per_class=False):
+    """统计一遍指标;exclude=需跳过的 video_id 集合(去噪口径用)。返回打印用 dict。"""
+    exclude = exclude or set()
     n = rt_ok = sk_ok = both_ok = ks_ok = fmt_ok = miss = 0
-    saf_tp = saf_n = 0
+    saf_tp = saf_n = skipped = 0
     per_sk = {}
-    for l in open(a.labels, encoding="utf-8"):
+    for l in open(labels_path, encoding="utf-8"):
         j = json.loads(l)
         vid = j["video_id"]
+        if vid in exclude:
+            skipped += 1
+            continue
         rt, sk = j["labels"]["role_type"], j["labels"]["sub_keyscene"]
         n += 1
         # 口径统一(v1.8 修复): 缺失预测在所有指标中一律记错 ——
@@ -59,24 +60,53 @@ def main():
         st = per_sk.setdefault(sk, [0, 0])
         st[0] += 1
         st[1] += (psk == sk)
+    return dict(n=n, miss=miss, fmt_ok=fmt_ok, rt_ok=rt_ok, sk_ok=sk_ok,
+                both_ok=both_ok, ks_ok=ks_ok, saf_tp=saf_tp, saf_n=saf_n,
+                skipped=skipped, per_sk=per_sk)
 
-    def pct(x, d):
-        return f"{100.0 * x / max(d, 1):.2f}%"
 
-    print(f"samples={n} missing_pred={miss} 格式合规={pct(fmt_ok, n - miss)}")
-    if miss:
-        print(f"⚠️ {miss} 条无预测,已在全部指标中记错(含安全召回);"
+def report(r, per_class=False):
+    print(f"samples={r['n']} missing_pred={r['miss']} "
+          f"格式合规={pct(r['fmt_ok'], r['n'] - r['miss'])}")
+    if r["miss"]:
+        print(f"⚠️ {r['miss']} 条无预测,已在全部指标中记错(含安全召回);"
               f"若为分片未跑完,请先补齐再下结论")
-    print(f"RoleType acc   = {pct(rt_ok, n)}")
-    print(f"SubKS    acc   = {pct(sk_ok, n)}")
-    print(f"RT+SubKS acc   = {pct(both_ok, n)}")
-    print(f"KS 父类  acc   = {pct(ks_ok, n)}")
-    print(f"安全关键 SubKS({SAFETY_SK}) 召回 = {pct(saf_tp, saf_n)} "
-          f"(n={saf_n})")
-    if a.per_class:
-        for sk in sorted(per_sk):
-            c, k = per_sk[sk]
+    print(f"RoleType acc   = {pct(r['rt_ok'], r['n'])}")
+    print(f"SubKS    acc   = {pct(r['sk_ok'], r['n'])}")
+    print(f"RT+SubKS acc   = {pct(r['both_ok'], r['n'])}")
+    print(f"KS 父类  acc   = {pct(r['ks_ok'], r['n'])}")
+    print(f"安全关键 SubKS({SAFETY_SK}) 召回 = {pct(r['saf_tp'], r['saf_n'])} "
+          f"(n={r['saf_n']})")
+    if per_class:
+        for sk in sorted(r["per_sk"]):
+            c, k = r["per_sk"][sk]
             print(f"  [{sk}] n={c} acc={pct(k, c)}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--preds", required=True)
+    ap.add_argument("--labels", required=True)
+    ap.add_argument("--per-class", action="store_true")
+    ap.add_argument("--exclude-ids", default="",
+                    help="去噪口径: 该文件里的 video_id(每行一个)从测试集剔除后"
+                         "【额外】再报一遍;原全量口径始终保留、不替换")
+    a = ap.parse_args()
+
+    preds = {j["video_id"]: j["output"] for j in
+             (json.loads(l) for l in open(a.preds, encoding="utf-8"))}
+
+    # ① 官方口径(全量)—— 主指标, 永远第一、永不改动
+    print("== 官方口径(全量 test)==")
+    report(compute(a.labels, preds, per_class=a.per_class), a.per_class)
+
+    # ② 去噪口径(剔除 GT 自相矛盾且盲判证实的明显错标)—— 仅【附加】诊断
+    if a.exclude_ids and os.path.exists(a.exclude_ids):
+        excl = {x.strip() for x in open(a.exclude_ids, encoding="utf-8")
+                if x.strip()}
+        print(f"\n== 去噪口径(额外, 剔除 {len(excl)} 条明显错标 test)==")
+        report(compute(a.labels, preds, exclude=excl, per_class=a.per_class),
+               a.per_class)
 
 
 if __name__ == "__main__":

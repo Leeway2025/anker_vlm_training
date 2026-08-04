@@ -107,18 +107,29 @@ class SftDataset:
             train_recs, val_recs = split_by_camera(recs, val_n, seed=seed)
         else:
             train_recs, val_recs = recs, []
-        if sample_weights:      # hard-mining 物理复制(流式最大余数法:
-            out = []            # round 会把 1.0<w<1.5 全截成 1,类上限失效)
-            acc = 0.0
+        self.loss_scale = {}    # vid → (0,1) 降权(噪声软化, 见下)
+        if sample_weights:
+            # 双语义(08-04): w>1 = hard-mining 物理复制(原有);
+            # 0<w<1 = 嫌疑样本 loss 降权(不复制、不删除, __getitem__ 里
+            # 乘进 per-token weights)—— judge 单证嫌疑"宁软勿删"用,
+            # 保留样本信息量又不让可疑标签全额发声
+            out = []            # 复制用流式最大余数法(round 会把
+            acc = 0.0           # 1.0<w<1.5 全截成 1,类上限失效)
             for r in train_recs:
-                w = max(1.0, float(sample_weights.get(r["video_id"], 1.0)))
+                w0 = float(sample_weights.get(r["video_id"], 1.0))
+                if 0.0 < w0 < 1.0:
+                    self.loss_scale[r["video_id"]] = w0
+                w = max(1.0, w0)
                 n = int(w)
                 acc += w - n
                 if acc >= 1.0:
                     n += 1
                     acc -= 1.0
                 out.extend([r] * n)
-            print(f"[hard-mining] train {len(train_recs)} -> {len(out)}")
+            if len(out) != len(train_recs):
+                print(f"[hard-mining] train {len(train_recs)} -> {len(out)}")
+            if self.loss_scale:
+                print(f"[soft-weight] 降权样本 {len(self.loss_scale)}")
             train_recs = out
         self.recs = train_recs + val_recs
         self.first_val = len(train_recs)        # ≥此下标 = val(无 CoT 注入)
@@ -257,6 +268,9 @@ class SftDataset:
              + tgt_w + [1.0])
         cap = self.max_think + self.max_label_len
         lab, w = lab[:cap], w[:cap]
+        sc = self.loss_scale.get(vid)
+        if sc and i < self.first_val:   # 噪声软化: 仅 train, val 不动
+            w = [x * sc for x in w]
 
         L, T = self.max_len, len(self.template)
         tokens = np.zeros(L, np.int32)

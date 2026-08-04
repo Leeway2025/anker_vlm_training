@@ -8,3 +8,7 @@ DATA/
 .venv/
 *.log
 .cache/
+proxy_data/videos/
+proxy_data/DATA/
+KEY_TPU
+batch.sh

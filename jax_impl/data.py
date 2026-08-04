@@ -91,7 +91,8 @@ class SftDataset:
                  id_weight=0.0, sample_weights=None,
                  reasoning=None, cot_ratio=0.6, attributes=None,
                  max_think_len=96, seed=0, val_n=0,
-                 aux_conf_threshold=0.5, augment=False, val_ids=None):
+                 aux_conf_threshold=0.5, augment=False, augment_v2=False,
+                 val_ids=None):
         recs = [json.loads(l) for l in open(labels_file, encoding="utf-8")]
         # 顺序铁律: 先切 val、再对 train 做 hard-mining 复制 —— 反过来
         # 副本会横跨 train/val(泄漏,val loss 虚低)。torch 侧同序。
@@ -151,6 +152,7 @@ class SftDataset:
                           f"{hit}/{len(tr_ids)} ({hit/max(len(tr_ids),1):.1%})")
         self.rng = random.Random(seed)
         self.augment = augment                  # 仅 train 样本生效
+        self.augment_v2 = augment_v2            # v2 三样叠加在 v1 之上
         self.max_len = len(self.template) + self.max_think + max_label_len
 
     def _augment(self, frames):
@@ -170,6 +172,38 @@ class SftDataset:
             for f in frames[1:]:
                 out.append(out[-1] if r.random() < 0.1 else f)
             frames = out
+        return frames
+
+    def _augment_v2(self, frames):
+        """增强包 v2(默认关;必须在修正后干净 100k 上 from-scratch 消融
+        验过才进配方 —— 慢显性手段,增量续训验证必假阴性):
+        ✓ crop-zoom(全片同一裁剪框,放大近景身份细节;裁剪发生在
+          preprocess 拉伸 384² 之前,与"RandomCrop 必须在 resize 前"
+          的生产口径一致)
+        ✓ 对比度缩放(全片同 k,围绕各帧自身均值,与 v1 亮度正交)
+        ✓ 轻遮挡(全片同位置灰色矩形,模拟镜头污损/蛛网,逼模型用
+          剩余区域证据 —— 位置跨帧固定,不破坏时序)
+        ✗ 时序翻转/mixup/TTA: 与 v1 同款红线,不提供实现路径。"""
+        r = self.rng
+        h, w = frames[0].shape[:2]
+        if r.random() < 0.5 and min(h, w) >= 32:   # crop-zoom(裁 70~100%)
+            s = r.uniform(0.7, 1.0)
+            ch, cw = max(int(h * s), 16), max(int(w * s), 16)
+            y0, x0 = r.randint(0, h - ch), r.randint(0, w - cw)
+            frames = [np.ascontiguousarray(f[y0:y0 + ch, x0:x0 + cw])
+                      for f in frames]
+        if r.random() < 0.5:                       # 对比度 ±25%
+            k = r.uniform(0.75, 1.25)
+            frames = [np.clip((f.astype(np.float32) - f.mean()) * k
+                              + f.mean(), 0, 255).astype(np.uint8)
+                      for f in frames]
+        if r.random() < 0.3:                       # 轻遮挡(每边 10~30%)
+            h, w = frames[0].shape[:2]
+            oh, ow = int(h * r.uniform(0.1, 0.3)), int(w * r.uniform(0.1, 0.3))
+            y0, x0 = r.randint(0, h - oh), r.randint(0, w - ow)
+            frames = [f.copy() for f in frames]
+            for f in frames:
+                f[y0:y0 + oh, x0:x0 + ow] = 114
         return frames
 
     def set_anneal(self, flag):                 # CoT 退火(torch 同款语义)
@@ -252,8 +286,11 @@ class SftDataset:
                                  self.wds)
         else:
             frames = load_frames(rec, self.wds)
-        if self.augment and i < self.first_val:
-            frames = self._augment(frames)
+        if i < self.first_val:
+            if self.augment:
+                frames = self._augment(frames)
+            if self.augment_v2:
+                frames = self._augment_v2(frames)
         return {"tokens": tokens, "labels": labels, "weights": weights,
                 "aux_labels": aux, "ks_label": np.int32(ks),
                 "frames": frames, "video_id": vid}

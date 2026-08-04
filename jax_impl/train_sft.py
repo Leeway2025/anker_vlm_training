@@ -71,6 +71,10 @@ def main():
     ap.add_argument("--augment", action="store_true",
                     help="训练增强: 翻转/亮度/帧dropout(val 不增强;"
                          "时序翻转结构性禁止)")
+    ap.add_argument("--augment-v2", action="store_true",
+                    help="增强包 v2: crop-zoom/对比度/轻遮挡(叠加在 v1 "
+                         "之上;默认关,须在干净标签 100k 上 from-scratch "
+                         "消融过门后方可进 1M 配方)")
     ap.add_argument("--aux-file", help="资产 A attributes.jsonl → 7 属性头")
     ap.add_argument("--aux-conf-threshold", type=float, default=0.5,
                     help="低于此置信度的标注整条屏蔽(torch 同款)")
@@ -231,7 +235,7 @@ def main():
         cot_ratio=a.cot_ratio,
         attributes=load_jsonl_map(a.aux_file) if a.aux_file else None,
         seed=a.seed, val_n=vn, aux_conf_threshold=a.aux_conf_threshold,
-        augment=a.augment, val_ids=val_ids)
+        augment=a.augment, augment_v2=a.augment_v2, val_ids=val_ids)
     train_idx, val_idx = full.train_idx, full.val_idx
     print(f"[data] train={len(train_idx)} val={len(val_idx)}"
           f"(按 camera 切分, seed={a.seed}, 先切后复制) "

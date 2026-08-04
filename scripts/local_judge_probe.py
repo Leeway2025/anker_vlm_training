@@ -56,6 +56,7 @@ def main():
     for i, r in enumerate(exam):
         prompt = build_prompt(r["gt_rt"], r["desc"]) + \
             '\nAnswer with ONLY the JSON object, no other text.'
+        txt = ""
         try:
             txt = sampler.chat(prompt, multi_turn=False)
             m = re.search(r'\{.*\}', txt, re.S)
@@ -66,8 +67,13 @@ def main():
                 if cr not in ("A", "B", "C", "E") or r["gt_rt"] == "C" \
                         or cr == r["gt_rt"]:
                     v = "ok"
-        except Exception:
+        except Exception as e:  # noqa: BLE001
             stats["parse_err"] += 1
+            if stats["parse_err"] <= 3:      # 前3个异常打全栈(08-04: 31B全军
+                import traceback              # 覆没被静默吞掉的教训)
+                traceback.print_exc()
+                print(f"[err#{stats['parse_err']}] {type(e).__name__}: {e}",
+                      flush=True)
             v = "ok"          # 解析失败按 ok(保守, 会算进漏报)
         gt = r["verdict"]
         if v == gt:

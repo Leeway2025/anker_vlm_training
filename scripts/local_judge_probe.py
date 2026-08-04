@@ -75,6 +75,11 @@ def main():
                 print(f"[err#{stats['parse_err']}] {type(e).__name__}: {e}",
                       flush=True)
             v = "ok"          # 解析失败按 ok(保守, 会算进漏报)
+            if stats["parse_err"] <= 20:     # 前20例存模型原始输出供排障
+                with open(os.path.join(a.out, "parse_fail_raw.txt"),
+                          "a", encoding="utf-8") as pf:
+                    pf.write(f"--- #{i} {type(e).__name__}: {e}\n"
+                             f"{(txt or '')[:800]}\n")
         gt = r["verdict"]
         if v == gt:
             stats["agree"] += 1

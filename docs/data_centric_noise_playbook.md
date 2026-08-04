@@ -32,7 +32,7 @@
 | # | 方法族 | 代表工作 | 本项目状态 |
 |---|---|---|---|
 | 1 | 置信学习 | Cleanlab / Northcutt 2021 | ✅ 已跑(CL 615 条,∩judge 72 = 证人互补)|
-| 2 | LLM-as-Judge 清洗 | FineWeb, Nemotron-CC | ✅ 主力(RT 4240 / SK 827→622)|
+| 2 | LLM-as-Judge 清洗 | FineWeb, Nemotron-CC | ✅ 主力(RT 4240 / SK 终稿198, 撤judge定义错617)|
 | 3 | 训练动力学 | Dataset Cartography / AUM | ✅ 已落码(--cartography),清洗夜启用 |
 | 4 | 噪声鲁棒训练 | label smoothing / co-teaching / DivideMix | ✅ 软化通道已落码(降权 0.3)|
 | 5 | 主观边界正规化 | learning from disagreement | ✅ 纪律已建(只升级/不判 k-l-m)|

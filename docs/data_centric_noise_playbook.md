@@ -20,7 +20,7 @@
 | 测试集 | 11,022 条,**冻结、客户已验、永不清洗** | labels_test.jsonl |
 | RT 训练集错标(desc-judge) | 4,240 = 5.1%(D 3061 / A 1075 / B 90 / E 14) | gt_desc_judge_train.jsonl |
 | RT 测试集错标(desc-judge) | 522 = 4.7%(D 8.5% > A 5.9% > E 0.8% > B 0.3% > C 0%) | test_mislabel_exclude_ids_522.txt |
-| SubKS 测试集错标(desc-judge, 修正后) | 622 = 5.6%(e→b 424 系统性遛狗错标) | test_sk_mislabel_exclude_ids.txt |
+| SubKS 测试集错标(desc-judge, 终稿) | 198 = 1.8%(m→p野生/m→a/g→i 为主) | test_sk_mislabel_exclude_ids.txt |
 | SubKS 两证人嫌疑上限 | 882 = 8.0%(含主观边界,不可直接当错标) | 模型×盲判交叉 |
 | 本质模糊(全片都判不了) | RT 错误的 49% / SubKS 错误的 66% | 16帧盲判分解 |
 | 关键帧缺失真实上限 | RT 1.48pp / SubKS 4.01pp(事件类双双漏判) | 同上 |
@@ -62,8 +62,7 @@
 
 **两次实战教训**:
 - 第一轮试跑暴露"多主体场景"与"干活途中碰车"两个误杀模式 → prompt 加 MAIN-activity 约束,嫌疑率 4.1%→3.0%
-- SubKS 全量后审计发现 m→p 系统性误杀 277 条:**prompt 类定义没对齐父类语义**(p=野生动物,父类 LifeThreat;家猫家狗标 E|m 本来就对)→ 后过滤只留明确野生物种 70 条。教训:**judge prompt 的类定义必须逐条对照权威 taxonomy 与父类分组写**。
-- e→b 424 条(e 类的 46.5%!)是真·系统性错标:标注员把遛狗成批标进"休闲",94% 有旁证 —— 系统性错标一旦命中,单方向即可达全类近半,这是 judge 相对逐条人工审的核心价值。
+- SubKS 审计先后抓出 judge 自身的**两个类定义错误**(共撤回 test 617/827 条 flag):①m→p:p=野生动物且父类 LifeThreat,家猫家狗标 E|m 本来就对;②e→b:**b=【家人】遛狗**,路人(RT=D)遛狗=e 正确——曾被误判为"标注系统性错标 424 条",实为 judge 望文生义。**双重教训:SubKS 多为【身份×场景】联合定义,judge 的类定义必须逐条经客户语义确认;凡"单方向占比异常高"先怀疑 judge 而不是标注。**
 
 ## 5. 训练动力学(Dataset Cartography / AUM)
 
@@ -137,7 +136,7 @@
    - 全臂统一:--ckpt-every 200 --resume 断点保护;验收 = SubKS ≥ 基线 & 安全召回不降;**不看 test RT**
 2. cartography 出图 → 高方差桶 ∩ 嫌疑清单交叉 → 迭代第二轮清洗
 3. 增强 v2 消融(S2b2 门禁)可与清洗夜合并排期:clean 数据 × (v2 开/关)
-4. SubKS e→b 424 条系统性错标 → 训练集同方向 desc-judge(预计放大到 ~3000+ 条),纳入下轮清洗
+4. SubKS train judge 净错标 1997 条(g→i 689 最大:快递放件标成访客)→ 并入下版软化资产(RT+SK 双维)
 5. bucket ③ 115 条 + CL∩judge 差集抽样 → 人工终审 → platinum 子集
 
 ## 参考文献

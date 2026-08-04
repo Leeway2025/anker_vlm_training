@@ -115,7 +115,7 @@ def euno_to_labels(annotation_path: str, wds_dir: str, out_path: str,
     for ann in anns:
         if limit and len(out) >= limit:
             break
-        key = ann["videos"][0]
+        key = ann["video"] if "video" in ann else ann["videos"][0]
         try:
             rt, sk, desc = parse_gpt_label(ann["conversations"][1]["value"])
         except (ValueError, IndexError, KeyError):

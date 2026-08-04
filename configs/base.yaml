@@ -87,8 +87,8 @@ train:
   #   bs2+L1536+W384: 微步图通过,优化器步图差 1.8G → 不可用
   #   bs1+L1536+W384: 默认档(bs1 × 8芯 × accum32 = 全局 256,与方案等效)
   # accum 不占显存,OOM 只能降 bs、升 accum 补全局,勿动全局 256
-  per_device_batch_size: 1
-  gradient_accumulation: 32
+  per_device_batch_size: 4
+  gradient_accumulation: 8
   warmup_steps: 300
   weight_decay: 0.0
   max_grad_norm: 1.0
@@ -114,7 +114,8 @@ train:
 # ---------- 数据 ----------
 data:
   labels_file: "DATA/labels.jsonl"           # 客户侧改为自己的路径
-  video_root: "DATA/videos"
+  # labels_file: "DATA/labels_smoke.jsonl"
+  video_root: "/home/nas-tpu-poc/data/zx_vlm_dataset/anker_video_clips_wds_100k"
   attributes_file: "DATA/asset_A_attributes.jsonl"   # Phase 5b 用
   reasoning_file: "DATA/asset_C_reasoning.jsonl"     # Phase 5d 用
   whitelist_file: "DATA/asset_D_whitelist.txt"  # 客户方案: 仅留档,样本不

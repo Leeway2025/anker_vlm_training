@@ -20,8 +20,12 @@ from collections import Counter, defaultdict
 
 TAIL = set("qrujonst")          # 安全/稀缺事件类: 应收尽收(不复制)
 # 归因切片(去噪 test ①桶采购清单, 08-04): 关键词 → 加分标签
+# 身份三线索(08-05 用户领域知识: A/B/D 主要靠 穿着/工作车辆/开门随意度,
+# 全是画面内线索, 与机位无关) —— 线索切片是身份问题的主杠杆
 SLICES = [
-    ("idA",  re.compile(r"\b(own door|house key|unlock|access card|from inside|returns? home|garage)\b", re.I), "A"),
+    ("door", re.compile(r"\b(opens? the (front )?door|unlock|house key|access card|walks? (in|inside|into the house)|enters? the (house|home|residence)|from inside|returns? home|garage door)\b", re.I), None),
+    ("attire", re.compile(r"\b(uniform|vest|helmet|badge|hoodie|mask(ed)?|work(wear| clothes)|casual)\b", re.I), None),
+    ("workveh", re.compile(r"\b(truck|van|delivery (vehicle|car)|pickup|trailer|utility|company (car|vehicle))\b", re.I), None),
     ("cour", re.compile(r"\b(package|parcel|courier|delivery|deliver|mail|box)\b", re.I), None),
     ("loit", re.compile(r"\b(linger|loiter|paces?|back and forth|circle|wander)\b", re.I), None),
     ("crim", re.compile(r"\b(pry|pries|forc|break|climb|fence|weapon|smash|kick)\b", re.I), None),

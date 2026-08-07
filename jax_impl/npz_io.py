@@ -23,6 +23,12 @@ def detect_rank_scheme(z):
     rank 集合 —— 差异化({256,512} 等)即 prod,单一即 uniform。
     npz 无 LLM LoRA 键时报错(产物损坏或根本不是训练产物)。
     """
+    if "__svd_scale_folded__" in z.files:
+        raise ValueError(
+            "该 npz 是 svd_truncate_lora --rank-map 的非均匀折叠产物"
+            "(scale 已折进因子且 rank 混合)—— 按 prod 方案加载会二次"
+            "缩放,静默出错;此产物仅供体积/能量定价与裁剪退火初始化,"
+            "不能直接 infer 评测")
     ranks = sorted({int(z[k].shape[-1]) for k in z.files
                     if k.startswith("lora/") and k.endswith("/a")
                     and "layer_" in k})

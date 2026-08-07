@@ -3,6 +3,13 @@
   python3 jax_impl/svd_truncate_lora.py --in outputs/jax_5b_s4/train_params_best.npz \
       --rank 64 --out outputs/jax_5b_s4/train_params_r64.npz
   python3 jax_impl/svd_truncate_lora.py --in ... --report-only   # 只看奇异谱
+  # 累计能量曲线(按 llm/vision × attn/mlp 四组,定各组合理交付秩):
+  #   ... --curve 32,64,96,128,192,256
+  # 非均匀截断(attn 低秩/mlp 高秩,产物 = 候选交付包/退火初始化):
+  #   ... --rank-map llm_attn=64,llm_mlp=128,vision_attn=64,vision_mlp=192 --out ...
+  #   ⚠️ rank-map 产物含 __svd_scale_folded__ 标记,infer 直评暂不支持
+  #   (detect_rank_scheme 会硬拒,防按 prod scale 双重缩放的静默错)——
+  #   用途限于: 体积/能量定价、渐进裁剪退火的初始化。
   # 激活感知(先跑 collect_act_stats.py 采统计,损失更小):
   #   ... --rank 64 --act-stats outputs/act_stats.npz --out ...
   # 蒸馏老师产物(混 rank 512/256 → 补零成 uniform 512):
@@ -81,12 +88,66 @@ def truncate_pair(a, b, scale, k, act_diag=None, pad_to=0):
     return a_new, b_new, energy
 
 
+def module_group(key):
+    """lora 键 → 四组之一: {llm,vision} × {attn,mlp}(export_hf 同源命名:
+    attn 键含 /attn/,mlp 键含 /mlp/;vision 键含 vision_encoder)。"""
+    side = "vision" if "vision_encoder" in key else "llm"
+    part = "mlp" if "/mlp/" in key else "attn"
+    return f"{side}_{part}"
+
+
+def parse_rank_map(spec):
+    m = {}
+    for kv in spec.split(","):
+        g, r = kv.split("=")
+        if g.strip() not in ("llm_attn", "llm_mlp", "vision_attn", "vision_mlp"):
+            raise SystemExit(f"--rank-map 未知组 {g!r}(合法: llm_attn/"
+                             f"llm_mlp/vision_attn/vision_mlp)")
+        m[g.strip()] = int(r)
+    return m
+
+
+def print_curve(spectra, ks):
+    """spectra: {group: [每对的奇异值数组]} → 累计能量分位表 + 秩建议。"""
+    print(f"\n{'组':<12}{'对数':>4}" + "".join(f"  top-{k}(中位/P25/最差)" for k in ks))
+    advice = {}
+    for g in sorted(spectra):
+        cums = []
+        for s in spectra[g]:
+            tot = max(float((s ** 2).sum()), 1e-30)
+            cums.append(np.cumsum(s ** 2) / tot)
+        row = f"{g:<12}{len(cums):>4}"
+        for k in ks:
+            at = [float(c[min(k, len(c)) - 1]) for c in cums]
+            row += (f"  {np.median(at):6.1%}/{np.percentile(at, 25):6.1%}"
+                    f"/{min(at):6.1%}")
+        print(row)
+        # 建议秩 = 中位 ≥95% 的最小 k(无则最大档并标注不足)
+        for k in ks:
+            at = [float(c[min(k, len(c)) - 1]) for c in cums]
+            if np.median(at) >= 0.95:
+                advice[g] = f"r={k}(中位 {np.median(at):.1%})"
+                break
+        else:
+            advice[g] = f">r={ks[-1]}(最大档中位仍 <95%)"
+    print("\n建议交付秩(中位能量 ≥95% 的最小档):")
+    for g, s in sorted(advice.items()):
+        print(f"  {g:<12} {s}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--in", dest="inp", required=True)
     ap.add_argument("--out", default=None)
     ap.add_argument("--rank", type=int, default=64,
                     help="目标 rank;0 = 满秩重分解(回环门禁用)")
+    ap.add_argument("--rank-map", default=None,
+                    help="非均匀秩: llm_attn=64,llm_mlp=128,vision_attn=64,"
+                         "vision_mlp=192(覆盖 --rank;产物带折叠标记,"
+                         "只用于定价/退火初始化,infer 直评被硬拒)")
+    ap.add_argument("--curve", default=None,
+                    help="累计能量曲线报表的 k 档列表,如 32,64,96,128,192,256"
+                         "(只报表不写产物;与 --report-only 同类)")
     ap.add_argument("--act-stats", default=None,
                     help="collect_act_stats.py 产出的激活统计 npz"
                          "(激活感知加权,截断损失更小)")
@@ -96,14 +157,32 @@ def main():
     ap.add_argument("--report-only", action="store_true",
                     help="只打印奇异谱能量报表,不写产物")
     a = ap.parse_args()
-    if not a.report_only and not a.out:
-        ap.error("--out 必填(或改用 --report-only)")
+    if not (a.report_only or a.curve) and not a.out:
+        ap.error("--out 必填(或改用 --report-only / --curve)")
+    rank_map = parse_rank_map(a.rank_map) if a.rank_map else None
+    if rank_map and a.pad_to_uniform:
+        ap.error("--rank-map 与 --pad-to-uniform 互斥(老师必须 uniform)")
 
     z = np.load(a.inp)
     a_keys = sorted(k for k in z.files
                     if k.startswith("lora/") and k.endswith("/a"))
     if not a_keys:
         raise SystemExit("npz 中无 lora/…/a 键,不是训练产物")
+
+    if a.curve:                    # 曲线模式: 只算奇异谱,不写产物
+        ks = sorted(int(x) for x in a.curve.split(","))
+        spectra = {}
+        for ka in a_keys:
+            av, bv = z[ka], z[ka[:-2] + "/b"]
+            if np.abs(av).max() == 0 and np.abs(bv).max() == 0:
+                continue
+            scale = prod_scale_for_key(ka, av.shape)
+            m = scale * (av.astype(np.float64).reshape(-1, av.shape[-1])
+                         @ bv.astype(np.float64).reshape(bv.shape[0], -1))
+            s = np.linalg.svd(m, compute_uv=False)
+            spectra.setdefault(module_group(ka), []).append(s)
+        print_curve(spectra, ks)
+        return
 
     acts = np.load(a.act_stats) if a.act_stats else None
     n_act_hit = 0
@@ -115,10 +194,11 @@ def main():
         av, bv = z[ka], z[kb]
         if av.shape[-1] != bv.shape[0]:
             raise SystemExit(f"{ka} rank 轴不匹配: a{av.shape} b{bv.shape}")
+        tgt_rank = rank_map[module_group(ka)] if rank_map else a.rank
         pad_to = a.rank if (a.pad_to_uniform and a.rank) else 0
         if np.abs(av).max() == 0 and np.abs(bv).max() == 0:
             # 未训练的死叶(如 embedder 占位): 原样透传截断形状的零
-            k_eff = pad_to or min(a.rank or av.shape[-1], av.shape[-1])
+            k_eff = pad_to or min(tgt_rank or av.shape[-1], av.shape[-1])
             out[ka] = np.zeros((*av.shape[:-1], k_eff), np.float32)
             out[kb] = np.zeros((k_eff, *bv.shape[1:]), np.float32)
             continue
@@ -131,7 +211,7 @@ def main():
             else:
                 print(f"  ⚠️ act 统计缺 {act_key},该矩阵退化为无权 SVD")
         scale = prod_scale_for_key(ka, av.shape)
-        a_new, b_new, energy = truncate_pair(av, bv, scale, a.rank,
+        a_new, b_new, energy = truncate_pair(av, bv, scale, tgt_rank,
                                              act_diag=act_diag, pad_to=pad_to)
         out[ka] = a_new.astype(np.float32)
         out[kb] = b_new.astype(np.float32)
@@ -154,10 +234,25 @@ def main():
 
     if a.report_only:
         return
+    ranks_out = {v.shape[-1] for k_, v in out.items()
+                 if k_.startswith("lora/") and k_.endswith("/a")}
+    if len(ranks_out) > 1:         # 非均匀折叠产物: 打标记防静默双重缩放
+        out["__svd_scale_folded__"] = np.int32(1)
     np.savez(a.out, **out)
     sz = sum(v.nbytes for k_, v in out.items() if k_.startswith("lora/"))
-    print(f"[OK] → {a.out}(lora 子树 {sz/2**20:.0f} MB, float32);"
-          f"评测: infer 对产物照常跑,加载器自动判 uniform r={a.rank or '满秩'}")
+    if len(ranks_out) > 1:
+        by = {}
+        for k_, v in out.items():
+            if k_.startswith("lora/") and k_.endswith("/a"):
+                by.setdefault(module_group(k_), set()).add(v.shape[-1])
+        print(f"[OK] → {a.out}(lora 子树 {sz/2**20:.0f} MB, float32;"
+              f"非均匀 { {g: sorted(r) for g, r in sorted(by.items())} },"
+              f"已打 __svd_scale_folded__ 标记 —— 仅供定价/退火初始化,"
+              f"infer 直评会被 detect_rank_scheme 硬拒)")
+    else:
+        print(f"[OK] → {a.out}(lora 子树 {sz/2**20:.0f} MB, float32);"
+              f"评测: infer 对产物照常跑,加载器自动判 uniform "
+              f"r={ranks_out.pop() if ranks_out else '满秩'}")
 
 
 if __name__ == "__main__":

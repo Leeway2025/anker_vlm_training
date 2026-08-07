@@ -3,8 +3,9 @@
 #   的比例(怯判教材,A→D 病根同谋)。只读,秒级。
 set -e
 cd "$(dirname "$0")/.."
-python3 - <<'PY'
-import json, re, random
+ASSET="${ASSET:-/data/assets_rat/asset_C_reasoning.jsonl}" python3 - <<'PY'
+import json, re, random, os
+ASSET = os.environ['ASSET']
 
 gt = {}
 for l in open('/data/labels_dedup.jsonl', encoding='utf-8'):
@@ -16,7 +17,7 @@ A_CUE = re.compile(r'\bresident|home\s?owner|family member|confident(?:ly)?\b|'
                    re.I)
 n = {'A': 0, 'D': 0}; hit = {'A': 0, 'D': 0}
 d_bad = []
-for l in open('/data/assets_rat/asset_C_reasoning.jsonl', encoding='utf-8'):
+for l in open(ASSET, encoding='utf-8'):
     r = json.loads(l)
     v, c = r['video_id'], r['reasoning_chain']
     rt = gt.get(v, ('?',))[0]

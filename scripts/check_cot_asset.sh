@@ -3,10 +3,10 @@
 # 用法: bash scripts/check_cot_asset.sh && nohup bash scripts/night_s5.sh > night_s5.log 2>&1 &
 set -e
 cd "$(dirname "$0")/.."
-python3 - <<'PY'
-import json, re, sys, random, collections
+ASSET="${ASSET:-/data/assets_rat/asset_C_reasoning.jsonl}" python3 - <<'PY'
+import json, re, sys, random, collections, os
 
-ASSET = '/data/assets_rat/asset_C_reasoning.jsonl'
+ASSET = os.environ['ASSET']
 rows, bad_json, bad_field = {}, 0, 0
 dups = 0
 for l in open(ASSET, encoding='utf-8'):

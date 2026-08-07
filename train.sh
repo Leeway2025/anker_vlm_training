@@ -6,6 +6,10 @@ cd data/zx_vlm_dataset
 gcloud storage cp -r gs://zx_vlm_dataset/anker_video_clips_wds_testset/ ./   # 下载测试集
 gcloud storage cp -r gs://zx_vlm_dataset/anker_video_clips/ ./    # 下载标签
 gcloud storage cp -r gs://zx_vlm_dataset/anker_video_clips_wds_100k  ./  # 下载100k 训练集
+gcloud storage cp -r gs://zx_vlm_dataset/anker_video_clips_wds_full/  ./  # 下载全量 训练集
+mkdir videos
+cd videos
+gcloud storage cp -r gs://zx_vlm_dataset/videos/100k  ./  # 下载100k 数据原始视频
 
 
 # 创建容器
@@ -29,6 +33,7 @@ sudo docker run -d \
   --restart unless-stopped \
   europe-west4-docker.pkg.dev/leeway-main/anker/jax:env-v1 \
   tail -f /dev/null
+pip install seaborn    # 评估绘图使用
 
 
 # 生成训练集

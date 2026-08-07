@@ -3,10 +3,10 @@
 # 只读,可与训练并行。用法: bash scripts/check_cot_labels.sh
 set -e
 cd "$(dirname "$0")/.."
-python3 - <<'PY'
-import json, re, random, collections
+ASSET="${ASSET:-/data/assets_rat/asset_C_reasoning.jsonl}" python3 - <<'PY'
+import json, re, random, collections, os
 
-ASSET = '/data/assets_rat/asset_C_reasoning.jsonl'
+ASSET = os.environ['ASSET']
 gt = {}
 for l in open('/data/labels_dedup.jsonl', encoding='utf-8'):
     d = json.loads(l); lb = d.get('labels') or d

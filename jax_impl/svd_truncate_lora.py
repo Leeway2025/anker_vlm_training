@@ -54,6 +54,17 @@ def truncate_pair(a, b, scale, k, act_diag=None, pad_to=0):
     ||diag(s)·(ΔW-ΔW')||_F —— 激活大的输入方向误差权重高,任务损失
     更小;还原时左乘 diag(1/s),前向语义不变。
     pad_to: >k_eff 时因子补零至该 rank(混 rank 产物 → uniform 老师)。"""
+    r = a.shape[-1]
+    if b.shape[0] != r and a.ndim >= 2 and b.ndim >= 2 \
+            and a.shape[0] == b.shape[0] and b.shape[1] == r:
+        # scan 堆叠叶(如 vision stacked_layers, 首维=层数): 逐层独立截断。
+        # 千万不能整体 reshape——(L,r,Out) 摊平成 (r,·) 恰好整除,会把层
+        # 与层数学上搅混、静默出错。act_diag 为跨层累计均值,各层共用。
+        outs = [truncate_pair(a[i], b[i], scale, k, act_diag, pad_to)
+                for i in range(a.shape[0])]
+        return (np.stack([o[0] for o in outs]),
+                np.stack([o[1] for o in outs]),
+                float(np.mean([o[2] for o in outs])))
     a64 = a.astype(np.float64)
     b64 = b.astype(np.float64)
     in_dims, r = a64.shape[:-1], a64.shape[-1]
@@ -177,10 +188,16 @@ def main():
             if np.abs(av).max() == 0 and np.abs(bv).max() == 0:
                 continue
             scale = prod_scale_for_key(ka, av.shape)
-            m = scale * (av.astype(np.float64).reshape(-1, av.shape[-1])
-                         @ bv.astype(np.float64).reshape(bv.shape[0], -1))
-            s = np.linalg.svd(m, compute_uv=False)
-            spectra.setdefault(module_group(ka), []).append(s)
+            r = av.shape[-1]
+            if bv.shape[0] != r:                  # scan 堆叠叶: 逐层出谱
+                pairs = [(av[i], bv[i]) for i in range(av.shape[0])]
+            else:
+                pairs = [(av, bv)]
+            for ai, bi in pairs:
+                m = scale * (ai.astype(np.float64).reshape(-1, ai.shape[-1])
+                             @ bi.astype(np.float64).reshape(bi.shape[0], -1))
+                s = np.linalg.svd(m, compute_uv=False)
+                spectra.setdefault(module_group(ka), []).append(s)
         print_curve(spectra, ks)
         return
 
@@ -192,7 +209,10 @@ def main():
         if kb not in z.files:
             raise SystemExit(f"缺配对键 {kb}")
         av, bv = z[ka], z[kb]
-        if av.shape[-1] != bv.shape[0]:
+        stacked = (av.shape[-1] != bv.shape[0] and av.ndim >= 2
+                   and bv.ndim >= 2 and av.shape[0] == bv.shape[0]
+                   and bv.shape[1] == av.shape[-1])
+        if av.shape[-1] != bv.shape[0] and not stacked:
             raise SystemExit(f"{ka} rank 轴不匹配: a{av.shape} b{bv.shape}")
         tgt_rank = rank_map[module_group(ka)] if rank_map else a.rank
         pad_to = a.rank if (a.pad_to_uniform and a.rank) else 0
@@ -200,7 +220,9 @@ def main():
             # 未训练的死叶(如 embedder 占位): 原样透传截断形状的零
             k_eff = pad_to or min(tgt_rank or av.shape[-1], av.shape[-1])
             out[ka] = np.zeros((*av.shape[:-1], k_eff), np.float32)
-            out[kb] = np.zeros((k_eff, *bv.shape[1:]), np.float32)
+            out[kb] = (np.zeros((bv.shape[0], k_eff, *bv.shape[2:]), np.float32)
+                       if stacked else
+                       np.zeros((k_eff, *bv.shape[1:]), np.float32))
             continue
         act_key = ka[len("lora/"):-len("/a")]
         act_diag = None

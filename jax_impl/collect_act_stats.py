@@ -45,14 +45,22 @@ def _install_stats_tap():
 
     def ein_call(self, inputs):
         # 'inputs,a_str,b_str->out' → 归约到 a 的非 rank 维(与截断同序)
+        # in_str 可含省略号(如 '...D'):命名轴对应 inputs 的末尾诸维,
+        # 省略号覆盖的前导维全部归约——逐字符索引 shape 会越界,须分开算。
         es = self._lora_einsum_str
         in_str, a_str = es.split("->")[0].split(",")[:2]
-        red = f"{in_str}->{a_str[:-1]}"
+        a_keep = a_str[:-1]
+        named = in_str.replace("...", "")
+        n_lead = inputs.ndim - len(named)
+        red = (f"...{named}->{a_keep}" if "..." in in_str
+               else f"{in_str}->{a_keep}")
         xsq = jnp.einsum(red, (inputs * inputs).astype(jnp.float32))
         n = 1.0
-        for i, c in enumerate(in_str):
-            if c not in a_str[:-1]:
-                n *= inputs.shape[i]
+        for i in range(n_lead):
+            n *= inputs.shape[i]
+        for j, c in enumerate(named):
+            if c not in a_keep:
+                n *= inputs.shape[n_lead + j]
         key = "/".join(str(s) for s in (self.scope.path or ()))
         jax.experimental.io_callback(_acc(key, None), None, xsq / max(n, 1.0),
                                      ordered=False)

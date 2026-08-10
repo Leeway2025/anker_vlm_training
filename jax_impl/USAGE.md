@@ -414,3 +414,10 @@ JAX(1M≈14.3h/epoch): S1→S2(→S3 续训段)   torch(已全流程验证):
   逐字节一致;旧 checkpoint 输出带空格(评测两种都认,交付口径不同)。
   同批: eval_metrics 缺失预测在全部指标记错;export/import 非零键无
   映射时响亮告警;aux 低置信度标注整条屏蔽(`--aux-conf-threshold`)。
+- **压缩工具真机首跑两处修复**(2026-08-10): ① `collect_act_stats`
+  的 einsum 串含省略号(`...D`)时逐字符索引 shape 越界 → 命名轴对齐
+  末尾诸维、省略号维单独归约(真机门禁: `[act] 命中 = lora 对数`,
+  253/253 PASS)。② `svd_truncate_lora` 对 vision `stacked_layers`
+  scan 堆叠叶(a=[L,…,r], b=[L,r,…])原假设 b 秩在首维——`--curve`
+  直接崩,`--rank` 被门禁拦下;现逐层独立 SVD(--curve/--rank/死叶
+  透传三处),act 统计跨层共用。堆叠叶整体 reshape 会静默搅层,禁止。

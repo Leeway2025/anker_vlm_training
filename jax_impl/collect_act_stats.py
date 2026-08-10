@@ -104,9 +104,13 @@ def main():
 
     z = np.load(a.ckpt)
     scheme, ranks = detect_rank_scheme(z)
-    print(f"[scheme] {scheme} ranks={ranks}")
+    print(f"[scheme] {scheme} ranks="
+          f"{sorted(set(ranks.values())) if isinstance(ranks, dict) else ranks}")
     if scheme == "prod":
         install_prod_lora()
+    elif scheme == "map":                     # 折叠变秩产物: 查表 + scale=1
+        from jax_impl.prod_lora import install_map_lora
+        install_map_lora(ranks)
     _install_stats_tap()                      # 必须在模型构造前
     # infer 同款恒等旁路(漏打 → 尾窗错位)
     g4_tr._token_utils.remove_mm_logits = \

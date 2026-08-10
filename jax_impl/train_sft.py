@@ -33,9 +33,11 @@ def main():
     ap.add_argument("--per-device-bs", type=int, default=1)
     ap.add_argument("--prefetch-workers", type=int, default=8,
                     help="0=关闭预取(同步取数,调试用)")
-    ap.add_argument("--rank-scheme", choices=["uniform", "prod"],
+    ap.add_argument("--rank-scheme", choices=["uniform", "prod", "map"],
                     default="uniform",
-                    help="prod=生产方案: 差异化 rank 512/256 + rsLoRA α=2r")
+                    help="prod=生产方案: 差异化 rank 512/256 + rsLoRA α=2r;"
+                         "map=变秩折叠产物续训(svd_truncate --rank-map,"
+                         "秩查 --init-npz、前向 scale=1,修补轮用)")
     ap.add_argument("--lr", type=float, default=None,
                     help="缺省自动: prod=2e-5(v7 冷配方)/ uniform=1e-4")
     ap.add_argument("--proj-lr", type=float, default=5e-4)
@@ -134,9 +136,9 @@ def main():
     # 视觉→字母回路 —— prod 缺省自动用已验证冷配方,显式传参可覆盖
     # (覆盖越线时下方哨兵会警告)
     if a.lr is None:
-        a.lr = 2e-5 if a.rank_scheme == "prod" else 1e-4
+        a.lr = 2e-5 if a.rank_scheme in ("prod", "map") else 1e-4
     if a.loraplus_ratio is None:
-        a.loraplus_ratio = 1.0 if a.rank_scheme == "prod" else 16.0
+        a.loraplus_ratio = 1.0 if a.rank_scheme in ("prod", "map") else 16.0
     from jax_impl.logtee import tee_stdio
     tee_stdio(a.out)
     if a.stage == "a":
@@ -170,6 +172,20 @@ def main():
     if a.rank_scheme == "prod":
         from jax_impl.prod_lora import install_prod_lora
         install_prod_lora()      # 必须在模型构造前(patch 参数创建路径)
+    elif a.rank_scheme == "map":
+        # 变秩折叠续训: 秩表来自 --init-npz(必须带折叠标记)。
+        # 产物保存时回写标记(下方 savez),否则混合秩会被误判 prod
+        # → infer 二次缩放静默错。
+        if not a.init_npz:
+            raise SystemExit("--rank-scheme map 需要 --init-npz"
+                             "(svd_truncate --rank-map 折叠产物)")
+        from jax_impl.npz_io import detect_rank_scheme as _drs0
+        _ms, _mmap = _drs0(np.load(a.init_npz))
+        if _ms != "map":
+            raise SystemExit(f"--rank-scheme map 但 init-npz 判定为 {_ms}"
+                             "(无 __svd_scale_folded__ 标记),拒绝")
+        from jax_impl.prod_lora import install_map_lora
+        install_map_lora(_mmap)  # 必须在模型构造前
 
     # ---- 逐层重算(gm 无内置 remat;v1 坑 3/4)----
     if not getattr(g4_modules, "_REMAT_PATCHED", False):
@@ -338,10 +354,11 @@ def main():
     TEACH = {"lora": {}, "proj": {}}
     model_t = None
     if a.teacher_npz:
-        if a.rank_scheme == "prod":
+        if a.rank_scheme in ("prod", "map"):
             raise SystemExit(
-                "--teacher-npz 仅支持 uniform 学生: prod 的 adapter patch "
-                "是类级别的,会同时劫持老师前向(老师 rank 会被按路径改写)")
+                "--teacher-npz 仅支持 uniform 学生: prod/map 的 adapter "
+                "patch 是类级别的,会同时劫持老师前向(老师 rank/scale "
+                "会被按路径改写)。map 产物修补请用普通 SFT 续训")
         from jax_impl.npz_io import (detect_rank_scheme as _drs,
                                      load_lora_strict as _lls)
         zt = np.load(a.teacher_npz)
@@ -711,8 +728,11 @@ def main():
                     # best 即时落盘 —— 旧版只记 meta,交付的永远是最后
                     # 一步(过拟合了也照存)
                     bf = jax.tree_util.tree_flatten_with_path(train)[0]
+                    _pl = {_path_str(p): np.asarray(x) for p, x in bf}
+                    if a.rank_scheme == "map":   # 折叠标记随产物走(防误判 prod)
+                        _pl["__svd_scale_folded__"] = np.array(1)
                     np.savez(os.path.join(a.out, "train_params_best.npz"),
-                             **{_path_str(p): np.asarray(x) for p, x in bf})
+                             **_pl)
                 print(f"[eval] opt_step {opt_step} val_loss={v:.4f}{tag}",
                       flush=True)
                 _log_scalar(opt_step, val_loss=v)
@@ -754,8 +774,10 @@ def main():
     if pf:
         pf.close()
     flat = jax.tree_util.tree_flatten_with_path(train)[0]
-    np.savez(os.path.join(a.out, "train_params.npz"),
-             **{_path_str(p): np.asarray(v) for p, v in flat})
+    _pl = {_path_str(p): np.asarray(v) for p, v in flat}
+    if a.rank_scheme == "map":               # 折叠标记随产物走(防误判 prod)
+        _pl["__svd_scale_folded__"] = np.array(1)
+    np.savez(os.path.join(a.out, "train_params.npz"), **_pl)
     from jax_impl.logtee import code_version
     json.dump({"loss_history": hist, "rank": a.rank, "dp": DP,
                "best_val": list(best), "seed": a.seed,

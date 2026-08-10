@@ -6,18 +6,18 @@ cd /workspace && unset WDS_DIR
 M=outputs/delivery_0807
 ts() { date '+%m-%d %H:%M'; }
 
-echo "[$(ts)] 采集激活统计 n=256"
-python3 jax_impl/collect_act_stats.py --ckpt $M/model.npz \
-  --labels /data/pool_700k_final_labels.jsonl --layout /data/hf_layout.json \
-  --n 256 --out $M/act_stats.npz || exit 1
+if [ ! -f $M/act_stats.npz ]; then
+  echo "[$(ts)] 采集激活统计 n=256"
+  python3 jax_impl/collect_act_stats.py --ckpt $M/model.npz \
+    --labels /data/pool_700k_final_labels.jsonl --layout /data/hf_layout.json \
+    --n 256 --out $M/act_stats.npz || exit 1
+fi
 
-for R in 0 128 96 72 64; do
+for R in 128 96 72 64; do          # r0 门禁走 night_maps.sh 的 map 路径
   O=$M/trunc_r$R; mkdir -p $O
   echo "[$(ts)] === rank $R 截断 ==="
-  if [ "$R" = "0" ]; then
-    python3 jax_impl/svd_truncate_lora.py --in $M/model.npz --rank 0 \
-      --out $O/model.npz || continue
-  else
+  [ -f $O/eval_report.txt ] && { echo "[$(ts)] r$R 已有评测,跳过"; continue; }
+  if [ ! -f $O/model.npz ]; then
     python3 jax_impl/svd_truncate_lora.py --in $M/model.npz --rank $R \
       --act-stats $M/act_stats.npz --out $O/model.npz || continue
   fi

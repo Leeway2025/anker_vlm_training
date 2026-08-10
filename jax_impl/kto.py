@@ -108,6 +108,10 @@ def main():
             print(f"[scheme] 从 npz 判定: {scheme} ranks={ranks}")
         else:
             _, ranks = detect_rank_scheme(z)
+        if scheme == "map":
+            raise SystemExit("kto 暂不支持变秩折叠产物(map)—— ref/policy "
+                             "双模型共享 adapter patch 的接线未做;"
+                             "修补请走 train_sft --rank-scheme map")
         if scheme == "prod":
             from jax_impl.prod_lora import install_prod_lora
             install_prod_lora()          # 带 rsLoRA 缩放,与 SFT 前向一致

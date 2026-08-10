@@ -19,16 +19,23 @@ def _path_str(path):
 def detect_rank_scheme(z):
     """从 npz 推断 LoRA rank 方案。
 
-    返回 ("prod", ranks) 或 ("uniform", ranks)。依据: LLM 层 a 叶的
-    rank 集合 —— 差异化({256,512} 等)即 prod,单一即 uniform。
+    返回 ("prod", ranks)、("uniform", ranks) 或 ("map", rank_map)。
+    - prod/uniform: 依据 LLM 层 a 叶的 rank 集合 —— 差异化({256,512}
+      等)即 prod,单一即 uniform。
+    - map: npz 带 __svd_scale_folded__ 标记(svd_truncate --rank-map
+      产物,或其续训产物)。scale 已折进因子 → 前向必须 scale=1,
+      按 prod 方案加载会二次缩放静默错。rank_map = {适配器路径: rank},
+      交给 prod_lora.install_map_lora 消费(infer/train_sft 已接;
+      kto/export 未接,遇到会显式拒绝)。
     npz 无 LLM LoRA 键时报错(产物损坏或根本不是训练产物)。
     """
     if "__svd_scale_folded__" in z.files:
-        raise ValueError(
-            "该 npz 是 svd_truncate_lora --rank-map 的非均匀折叠产物"
-            "(scale 已折进因子且 rank 混合)—— 按 prod 方案加载会二次"
-            "缩放,静默出错;此产物仅供体积/能量定价与裁剪退火初始化,"
-            "不能直接 infer 评测")
+        rank_map = {k[len("lora/"):-len("/a")]: int(z[k].shape[-1])
+                    for k in z.files
+                    if k.startswith("lora/") and k.endswith("/a")}
+        if not rank_map:
+            raise ValueError("折叠标记存在但 npz 无 lora/ 键 —— 产物损坏")
+        return "map", rank_map
     ranks = sorted({int(z[k].shape[-1]) for k in z.files
                     if k.startswith("lora/") and k.endswith("/a")
                     and "layer_" in k})

@@ -27,6 +27,9 @@ def install_prod_lora(r_global=512, r_sliding=256, r_vision=256,
     from gemma.peft import _lora
     from gemma.peft import _einsum_utils
 
+    if getattr(_lora, "_MAP_PATCHED", False):
+        raise RuntimeError("map(变秩折叠)补丁已装,prod 不能共存"
+                           "(同一适配器类的 patch)")
     if getattr(_lora, "_PROD_PATCHED", False):
         return
 
@@ -79,6 +82,63 @@ def install_prod_lora(r_global=512, r_sliding=256, r_vision=256,
           f"r_sliding={r_sliding} r_vision={r_vision} "
           f"rsLoRA α={alpha_mult}r (scale {scale_for(r_sliding):.2f}/"
           f"{scale_for(r_global):.2f})")
+
+
+def install_map_lora(rank_map):
+    """变秩折叠方案: svd_truncate_lora --rank-map 产物的训练/推理注入。
+
+    rank_map: {适配器 scope 路径串: rank},即 npz 键去掉 'lora/' 前缀与
+    '/a' 后缀(detect_rank_scheme 的 "map" 返回值)。每个模块的秩查表
+    决定;**前向 scale=1** —— 截断时 rsLoRA scale 已折进因子,再乘一次
+    就是二次缩放静默错。与 install_prod_lora 互斥(同类 patch)。
+    路径不在表内 → 硬报错(产物与模型结构不一致,禁止静默猜)。"""
+    import flax.linen as nn
+    import jax.numpy as jnp
+    from gemma.peft import _lora
+    from gemma.peft import _einsum_utils
+
+    if getattr(_lora, "_PROD_PATCHED", False):
+        raise RuntimeError("prod 补丁已装,map 方案不能共存"
+                           "(同一适配器类的 patch)")
+    if getattr(_lora, "_MAP_PATCHED", False):
+        return
+
+    def eff_rank(path):
+        key = "/".join(str(s) for s in (path or ()))
+        if key not in rank_map:
+            raise KeyError(f"rank_map 缺路径 {key!r}({len(rank_map)} 项)"
+                           "—— 折叠产物与模型结构不一致")
+        return rank_map[key]
+
+    def ein_setup(self):
+        r = eff_rank(self.scope.path if self.scope else ())
+        out = _einsum_utils.get_lora_einsum_str_and_shapes(
+            einsum_str=self.einsum_str, weights_shape=self.shape, rank=r)
+        (lora_einsum_str, a_shape, b_shape) = out
+        self._lora_einsum_str = lora_einsum_str
+        self._a = self.param("a", self.a_init, a_shape, dtype=self.dtype)
+        self._b = self.param("b", self.b_init, b_shape, dtype=self.dtype)
+
+    def ein_call(self, inputs):
+        return jnp.einsum(self._lora_einsum_str, inputs, self._a, self._b)
+
+    _lora.LoRAEinsumAdapter.setup = ein_setup
+    _lora.LoRAEinsumAdapter.__call__ = ein_call
+
+    def dense_call(self, inputs):
+        r = eff_rank(self.scope.path if self.scope else ())
+        a = self.param("a", self.a_init,
+                       (inputs.shape[-1], r), dtype=self.dtype)
+        b = self.param("b", self.b_init,
+                       (r, self.features), dtype=self.dtype)
+        return inputs @ a @ b
+
+    _lora.LoRADenseAdapter.__call__ = nn.compact(dense_call)
+
+    _lora._MAP_PATCHED = True
+    ranks = sorted(set(rank_map.values()))
+    print(f"[map-lora] 变秩折叠方案: {len(rank_map)} 模块 "
+          f"ranks={ranks} 前向 scale=1(已折进因子)")
 
 
 def prod_adapter_config(base_model="google/gemma-4-e2b-it",

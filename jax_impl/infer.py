@@ -74,9 +74,10 @@ def main():
                     help="'i/n' 隔行分片(0 起),配 infer_sharded.sh 多芯并行")
     ap.add_argument("--max-new", type=int, default=40)
     ap.add_argument("--init-npz", help="载入训练产物 lora+projector(缺省纯 base)")
-    ap.add_argument("--rank-scheme", choices=["auto", "uniform", "prod"],
+    ap.add_argument("--rank-scheme", choices=["auto", "uniform", "prod", "map"],
                     default="auto",
-                    help="auto=从 npz 自动判定(差异化 rank 即 prod)")
+                    help="auto=从 npz 自动判定(差异化 rank 即 prod;"
+                         "折叠标记即 map=变秩 scale=1)")
     ap.add_argument("--no-proj", action="store_true",
                     help="不合并 npz 中的 projector(默认: npz 无 proj/ 即报错)")
     ap.add_argument("--no-constrain", action="store_true",
@@ -124,15 +125,28 @@ def main():
         z = np.load(a.init_npz)
         has_lora = any(k.startswith("lora/") for k in z.files)
         if has_lora:
+            det_scheme, ranks = detect_rank_scheme(z)
             scheme = a.rank_scheme
             if scheme == "auto":
-                scheme, ranks = detect_rank_scheme(z)
-                print(f"[scheme] 从 npz 判定: {scheme} ranks={ranks}")
-            else:
-                _, ranks = detect_rank_scheme(z)
+                scheme = det_scheme
+                rr = (sorted(set(ranks.values())) if isinstance(ranks, dict)
+                      else ranks)
+                print(f"[scheme] 从 npz 判定: {scheme} ranks={rr}")
+            elif det_scheme == "map" and scheme != "map":
+                # 折叠产物的 scale 语义不可协商 —— 按 prod/uniform 加载
+                # 必然二次缩放,强制纠正
+                print(f"[scheme] ⚠️ npz 是折叠变秩产物,--rank-scheme "
+                      f"{scheme} 被覆盖为 map")
+                scheme = "map"
             if scheme == "prod":
                 from jax_impl.prod_lora import install_prod_lora
                 install_prod_lora()      # 带 rsLoRA 缩放,与训练前向一致
+            elif scheme == "map":
+                if not isinstance(ranks, dict):
+                    raise SystemExit("--rank-scheme map 但 npz 无折叠标记"
+                                     "(非 --rank-map 产物),拒绝加载")
+                from jax_impl.prod_lora import install_map_lora
+                install_map_lora(ranks)  # 变秩查表,前向 scale=1
             else:
                 uni_rank = ranks[0]
         else:

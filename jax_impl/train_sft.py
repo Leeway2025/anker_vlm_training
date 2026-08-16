@@ -14,6 +14,7 @@ v1→v2:
 v1 的七个坑及修复见 FINDINGS.md;本文件保留全部关键注释。
 """
 import argparse
+import contextlib
 import dataclasses
 import functools
 import json
@@ -43,6 +44,9 @@ def main():
     ap.add_argument("--proj-lr", type=float, default=5e-4)
     ap.add_argument("--vision-lr", type=float, default=2e-5,
                     help="视觉塔 LoRA 学习率(torch 生产: 2e-5)")
+    ap.add_argument("--tok-lr", type=float, default=1e-3,
+                    help="可学习打分头 lr(仅 env TOKEN_LEARN_SCORE=1 生效;"
+                         "b 从 0 暖启,需较 LoRA 大的 lr 先让 b 离零)")
     ap.add_argument("--loraplus-ratio", type=float, default=None,
                     help="缺省自动: prod=1(v7 冷配方)/ uniform=16")
     ap.add_argument("--warmup", type=int, default=300,
@@ -81,6 +85,10 @@ def main():
                     help="增强包 v2: crop-zoom/对比度/轻遮挡(叠加在 v1 "
                          "之上;默认关,须在干净标签 100k 上 from-scratch "
                          "消融过门后方可进 1M 配方)")
+    ap.add_argument("--augment-v3", action="store_true",
+                    help="增强包 v3: 域定向(时序连续窗/灰度IR/低照度+噪声/"
+                         "鱼眼warp),攻具体域偏移;叠加在 v1/v2 上,默认关,"
+                         "同 v2 须 from-scratch 100k 消融过门后进配方")
     ap.add_argument("--aux-file", help="资产 A attributes.jsonl → 7 属性头")
     ap.add_argument("--aux-conf-threshold", type=float, default=0.5,
                     help="低于此置信度的标注整条屏蔽(torch 同款)")
@@ -90,6 +98,9 @@ def main():
                          "svd_truncate_lora --pad-to-uniform 产出);"
                          "老师冻结前向 + KL 对齐,步耗时约 ×1.8。"
                          "仅支持 uniform 学生(小 rank 修复轮)")
+    ap.add_argument("--teacher-npz2", default=None,
+                    help="第二蒸馏老师(0814 合议KD:与老师1同 uniform rank,"
+                         "两师 logits 在线平均后做 KL;步耗时再 +~35%%)")
     ap.add_argument("--distill-coef", type=float, default=0.5,
                     help="KL 蒸馏损失系数(硬标签 CE 保持全额)")
     ap.add_argument("--distill-temp", type=float, default=2.0)
@@ -160,7 +171,35 @@ def main():
     from gemma.gm.nn.gemma4._transformer import PreprocessedVisionInput
 
     from jax_impl.data import (SftDataset, make_vision_input,
-                               install_batched_encode_vision)
+                               install_batched_encode_vision,
+                               make_dyn_vision_input, make_full_vision_input)
+    _DYNSEG = os.environ.get("TOKEN_COMPRESS_MODE") == "dynseg"
+    # tome:时空 ToMe 单块合并(默认关)。设备侧确定式合并,无逐样本元数据 →
+    # 走原生 PreprocessedVisionInput(与非压缩路径同签名),仅 T=tome_T 变。
+    _TOME = os.environ.get("TOKEN_COMPRESS_MODE") == "tome"
+    # 可学习打分头(env TOKEN_LEARN_SCORE=1,默认关):训练态开 STE 软门,
+    # 参数 tok_scorer_* 由 data.install_token_select 的 patched setup 用
+    # self.param 注册进 params pytree,这里抽成独立可训子树 train["tok"]。
+    _LEARN = os.environ.get("TOKEN_LEARN_SCORE", "0") == "1"
+    if _LEARN:
+        os.environ["TOKEN_LEARN_TRAIN"] = "1"     # 训练前向开 STE(推理留空)
+        if a.teacher_npz or a.teacher_npz2:
+            raise SystemExit(
+                "TOKEN_LEARN_SCORE=1 暂不支持蒸馏: 老师 npz 无 tok_scorer_* "
+                "参数,老师前向会缺参报错。请先无蒸馏训练打分头。")
+    # 学习式重采样器(env TOKEN_RESAMPLER=1,默认关):参数 tok_resampler_*
+    # 由 data.install_token_select 的 patched setup 用 self.param 注册进
+    # params pytree,与打分头共用 train["tok"] 可训子树/优化器 "tok" 组/
+    # npz "tok/<路径>" 保存通道。前向天然可导(softmax 注意力),无需 STE。
+    _RSP = os.environ.get("TOKEN_RESAMPLER", "0") == "1"
+    # int4 量化感知训练(env QAT_INT4=1,默认关):对可训 LoRA 叶做 int4 假量化
+    # (逐 last-axis 通道对称,与部署 quantize_lora.py 逐位同口径),STE 直通梯度
+    # → 权重学会适应 4bit 舍入,补回 PTINT4 的精度损耗。不改存储(仍 int4)。
+    _QAT4 = os.environ.get("QAT_INT4", "0") == "1"
+    if _RSP and (a.teacher_npz or a.teacher_npz2):
+        raise SystemExit(
+            "TOKEN_RESAMPLER=1 暂不支持蒸馏: 老师前向走同一 patched setup,"
+            "老师 npz 无 tok_resampler_* 参数会缺参报错。请先无蒸馏训练。")
 
     devs = jax.devices()
     DP = a.dp or len(devs)
@@ -255,7 +294,8 @@ def main():
         cot_ratio=a.cot_ratio,
         attributes=load_jsonl_map(a.aux_file) if a.aux_file else None,
         seed=a.seed, val_n=vn, aux_conf_threshold=a.aux_conf_threshold,
-        augment=a.augment, augment_v2=a.augment_v2, val_ids=val_ids)
+        augment=a.augment, augment_v2=a.augment_v2,
+        augment_v3=a.augment_v3, val_ids=val_ids)
     train_idx, val_idx = full.train_idx, full.val_idx
     print(f"[data] train={len(train_idx)} val={len(val_idx)}"
           f"(按 camera 切分, seed={a.seed}, 先切后复制) "
@@ -264,9 +304,15 @@ def main():
     # ---- lora 结构初始化(v1 坑 1: eval_shape 免物化)----
     ex = full[0]
     p0, x0, counts = make_vision_input([ex["frames"]])
-    dummy_pvi = PreprocessedVisionInput(
-        patches=jnp.asarray(p0), positions_xy=jnp.asarray(x0),
-        soft_token_counts=counts)
+    if _DYNSEG:
+        # dynseg:seg_counts 走数据侧 pytree(逐帧变预算)。dummy 用首样本预算。
+        dummy_pvi = make_dyn_vision_input(
+            jnp.asarray(p0), jnp.asarray(x0), counts,
+            jnp.asarray(ex["seg_counts"][None], jnp.int32))
+    else:
+        dummy_pvi = PreprocessedVisionInput(
+            patches=jnp.asarray(p0), positions_xy=jnp.asarray(x0),
+            soft_token_counts=counts)
     struct = jax.eval_shape(lambda: model.init(
         jax.random.PRNGKey(0),
         tokens=jnp.asarray(ex["tokens"][None]), images=dummy_pvi))
@@ -306,6 +352,41 @@ def main():
         return jnp.zeros(leaf.shape, jnp.float32)   # B 零 + 冻结项零
     lora0 = jax.tree_util.tree_map_with_path(init_leaf, lora_struct)
 
+    # 可学习打分头子树: 从 struct 抽出 tok_scorer_* 叶(patched setup 注册,
+    # 属 base 侧非-LoRA 参数,但运行时 base=ckpt 不含它们 → 单独成可训子树,
+    # 前向时注入进 merged params)。b 暖启为 0(附加分≡0,选择逐位不变),
+    # A 小随机(std=1/D)。init-npz 若无该叶则保留暖启。
+    tok0 = {}
+    if _LEARN or _RSP:
+        from jax_impl.data import resampler_init_leaf
+        for path, leaf in jax.tree_util.tree_flatten_with_path(
+                struct["params"])[0]:
+            ps = _path_str(path)
+            if _LEARN and "tok_scorer" in ps:
+                if ps.endswith("_b"):
+                    tok0[ps] = jnp.zeros(leaf.shape, jnp.float32)   # 暖启=0
+                else:
+                    tok0[ps] = jnp.asarray(
+                        rng.normal(0, 1.0 / leaf.shape[0], leaf.shape),
+                        jnp.float32)
+            elif _RSP and "tok_resampler" in ps:
+                # 重采样器叶: 初始化语义单一事实源在 data.resampler_init_leaf
+                # (LN=1/bias=0/query=0.02/矩阵=1/√fan_in/wo 小启)
+                tok0[ps] = jnp.asarray(
+                    resampler_init_leaf(ps, leaf.shape, rng), jnp.float32)
+        if _LEARN and not any("tok_scorer" in k for k in tok0):
+            raise SystemExit(
+                "TOKEN_LEARN_SCORE=1 但 struct 中无 tok_scorer_* 参数 —— "
+                "install_token_select 的 setup 补丁未生效?"
+                "(确认 SELECT_TOKENS_K>0 或 dynseg/tome 已启用)")
+        if _RSP and not any("tok_resampler" in k for k in tok0):
+            raise SystemExit(
+                "TOKEN_RESAMPLER=1 但 struct 中无 tok_resampler_* 参数 —— "
+                "install_token_select 的 setup 补丁未生效?"
+                "(确认 make_vision_input 已在模型构造前跑过一次)")
+        print(f"[tok-score] 可训 token 头/重采样器: {sorted(tok0)} "
+              f"(共 {sum(int(x.size) for x in tok0.values())} 参数)")
+
     base = gm.ckpts.load_params(gm.ckpts.CheckpointPath.GEMMA4_E2B_IT)
 
     # ---- projector 全参(从 base 抽出作为可训练树)----
@@ -335,6 +416,8 @@ def main():
             "b": jnp.zeros((len(KS_CLASSES),), jnp.float32)}
 
     train0 = {"lora": lora0, "proj": proj0, "aux": aux0}
+    if _LEARN or _RSP:
+        train0["tok"] = tok0    # 打分头/重采样器(可训、随产物保存)
     if a.init_npz:                        # 续训: 覆盖同名叶(形状须一致)
         from jax_impl.npz_io import restore_train_tree
         z = np.load(a.init_npz)
@@ -354,11 +437,14 @@ def main():
     TEACH = {"lora": {}, "proj": {}}
     model_t = None
     if a.teacher_npz:
-        if a.rank_scheme in ("prod", "map"):
+        if a.rank_scheme == "prod":
             raise SystemExit(
-                "--teacher-npz 仅支持 uniform 学生: prod/map 的 adapter "
-                "patch 是类级别的,会同时劫持老师前向(老师 rank/scale "
-                "会被按路径改写)。map 产物修补请用普通 SFT 续训")
+                "--teacher-npz 不支持 prod 学生: prod 前向带 rsLoRA scale "
+                "(≠1),类级 patch 会给老师也套上 scale → 与 uniform 老师"
+                "(scale=1)训练口径不一致。map(前向 scale=1,与 uniform "
+                "老师同口径)已支持,见 prod_lora.teacher_rank 上下文覆盖")
+        _map_teach = (a.rank_scheme == "map")   # map 老师需 rank 覆盖上下文
+        from jax_impl.prod_lora import teacher_rank as _teacher_rank
         from jax_impl.npz_io import (detect_rank_scheme as _drs,
                                      load_lora_strict as _lls)
         zt = np.load(a.teacher_npz)
@@ -367,12 +453,26 @@ def main():
             raise SystemExit(
                 f"老师 npz 须 uniform 单一 rank(现 {t_ranks})—— 用 "
                 "svd_truncate_lora.py --rank <R> --pad-to-uniform 重切")
+        # ★ jax.eval_shape 的 trace 缓存按输入签名建键,但 LoRA rank 是经
+        # flax ModuleInterceptor 注入的、不在 jit 缓存键里 —— 学生(rank a.rank)
+        # 已在上面 eval_shape 过一次,老师若 rank 不同会命中学生的旧结构、
+        # 静默拿到学生 rank(实测 r64 学生 + r512 老师 → 老师被算成 r64,
+        # load_lora_strict 形状不符报错)。构建老师结构前清一次缓存即可,
+        # 只影响 eval_shape 定结构;训练 apply 用具体参数不受影响。
+        # map 学生: 上面 eval_shape 是变秩(逐路径),老师须清缓存并在
+        # teacher_rank 上下文里按 uniform t_rank 建结构(否则命中变秩旧
+        # trace 或被 rank_map 改写)。uniform 学生: 沿用原 rank≠判定。
+        if _map_teach or t_ranks[0] != a.rank:
+            jax.clear_caches()
         model_t = gm.nn.LoRA(rank=t_ranks[0],
                              model=gm.nn.Gemma4_E2B(text_only=False,
                                                     config=cfg64))
-        struct_t = jax.eval_shape(lambda: model_t.init(
-            jax.random.PRNGKey(0),
-            tokens=jnp.asarray(ex["tokens"][None]), images=dummy_pvi))
+        _tctx = _teacher_rank(t_ranks[0]) if _map_teach \
+            else contextlib.nullcontext()
+        with _tctx:
+            struct_t = jax.eval_shape(lambda: model_t.init(
+                jax.random.PRNGKey(0),
+                tokens=jnp.asarray(ex["tokens"][None]), images=dummy_pvi))
         lora_t = _lls(zt, gpeft.split_params(struct_t["params"])[1],
                       jnp, jnp.bfloat16)
         proj_t = {}
@@ -387,6 +487,30 @@ def main():
         TEACH = {"lora": lora_t, "proj": proj_t}
         print(f"[distill] teacher rank={t_ranks[0]} coef={a.distill_coef} "
               f"temp={a.distill_temp} proj={'有' if proj_t else '无(用 base)'}")
+        if a.teacher_npz2:
+            # 合议KD(0814): 老师2 须与老师1同 uniform rank → 复用 struct_t,
+            # 打包进同一 teach pytree("lora2"/"proj2"),train_step 签名零改动
+            zt2 = np.load(a.teacher_npz2)
+            t2_scheme, t2_ranks = _drs(zt2)
+            if t2_scheme != "uniform" or t2_ranks[0] != t_ranks[0]:
+                raise SystemExit(
+                    f"老师2 须与老师1同 uniform rank({t_ranks[0]}),"
+                    f"现 {t2_scheme}/{t2_ranks} —— pad-to-uniform 重切")
+            lora_t2 = _lls(zt2, gpeft.split_params(struct_t["params"])[1],
+                           jnp, jnp.bfloat16)
+            proj_t2 = {}
+            for f in zt2.files:
+                if not f.startswith("proj/"):
+                    continue
+                segs = f.split("/")[1:]
+                node = proj_t2
+                for s0 in segs[:-1]:
+                    node = node.setdefault(s0, {})
+                node[segs[-1]] = jnp.asarray(zt2[f], jnp.bfloat16)
+            TEACH["lora2"] = lora_t2
+            TEACH["proj2"] = proj_t2
+            print(f"[distill] 合议老师2 rank={t2_ranks[0]} "
+                  f"proj={'有' if proj_t2 else '无'} —— 两师 logits 平均")
 
     # lr 日程: warmup + 线性衰减到 0(对齐 torch Trainer 默认;MultiSteps
     # 只在累积满时调用内层 update → 日程按 opt step 计数,与 torch 同拍)
@@ -403,6 +527,8 @@ def main():
     # 是 torch 没有的隐藏收缩力)
     def _group(p, _):
         k = _path_str(p)
+        if k.startswith("tok/"):
+            return "tok"
         if k.startswith("proj"):
             return "proj"
         vis = "vision_encoder" in k
@@ -413,7 +539,8 @@ def main():
     GROUP_LR = {"proj": a.proj_lr,
                 "llm_a": a.lr, "llm_b": a.lr * a.loraplus_ratio,
                 "vis_a": a.vision_lr,
-                "vis_b": a.vision_lr * a.loraplus_ratio}
+                "vis_b": a.vision_lr * a.loraplus_ratio,
+                "tok": a.tok_lr}                       # 可学习打分头(不训时不用)
     tx = optax.chain(
         optax.clip_by_global_norm(1.0),         # 对齐 torch max_grad_norm
         optax.multi_transform(
@@ -460,18 +587,50 @@ def main():
             print("[resume] 未发现可用断点,从头开始")
 
     ls = a.label_smoothing
-    T = len(full.template)
+    focal_gamma = float(os.environ.get("FOCAL_GAMMA", "0.0"))  # focal: down-weight easy (high-conf m) tokens
+    pair_coef = float(os.environ.get("PAIR_MARGIN_COEF", "0.0"))  # pair-margin: 同父兄弟判别压力(SubKS 位)
+    pair_margin = float(os.environ.get("PAIR_MARGIN", "3.0"))     # hinge 间隔
+    # pair-margin 常量: SubKS 字母 token id(a..u, Gemma4 单 token)+ 同父兄弟掩码(KS_GROUP)
+    _SK_IDS_NP = np.asarray(
+        [236746, 236763, 236755, 236753, 236744, 236760, 236759, 236754,
+         236747, 236804, 236767, 236752, 236757, 236749, 236748, 236758,
+         236809, 236750, 236751, 236745, 236756], np.int32)      # a..u
+    _SK_GROUPS = [list(range(0, 13)), [13, 14], [15, 16, 17],     # Normal / PropDmg / LifeThreat
+                  [18], [19], [20]]                               # Loiter / VehAnom / UnauthEntry(单例无兄弟)
+    _SIB_NP = np.zeros((21, 21), bool)
+    for _g in _SK_GROUPS:
+        for _i in _g:
+            for _j in _g:
+                if _i != _j:
+                    _SIB_NP[_i, _j] = True
+    T = (full.seg_T if _DYNSEG                           # dynseg 变长模板 T=seg_T
+         else full.tome_T if _TOME                       # tome 单块模板 T=tome_T
+         else len(full.template))
     mesh = Mesh(np.asarray(devs[:DP]), ("dp",))
 
     def loss_fn(train, base_p, teach, tokens, labels, weights, patches,
                 pos_xy, aux_labels, ks_label):
         # v1 坑 5: fp32 参与会把激活链提升 fp32 → 前向统一 bf16;
         # 冻结 lora 叶 stop_gradient(v1 坑 6: 切断未训练子树反向)
-        lora_h = jax.tree_util.tree_map_with_path(
-            lambda p, x: x.astype(jnp.bfloat16)
-            if _is_trainable(_path_str(p))
-            else jax.lax.stop_gradient(x.astype(jnp.bfloat16)),
-            train["lora"])
+        def _fake_int4(x):
+            # 逐 last-axis 通道对称 int4,与部署 quantize_lora.py 同口径
+            xf = x.astype(jnp.float32)
+            axes = tuple(range(xf.ndim - 1))
+            amax = jnp.max(jnp.abs(xf), axis=axes, keepdims=True)
+            scale = jnp.where(amax > 0, amax / 7.0, 1.0)
+            q = jnp.clip(jnp.round(xf / scale), -7, 7)
+            return (q * scale).astype(jnp.bfloat16)
+
+        def _lora_leaf(p, x):
+            trn = _is_trainable(_path_str(p))
+            xb = x.astype(jnp.bfloat16)
+            if _QAT4:
+                # 前向走 int4 假量化;可训叶 STE 直通梯度,冻结叶 stop_gradient
+                fq = xb + jax.lax.stop_gradient(_fake_int4(xb) - xb)
+                return fq if trn else jax.lax.stop_gradient(_fake_int4(xb))
+            return xb if trn else jax.lax.stop_gradient(xb)
+
+        lora_h = jax.tree_util.tree_map_with_path(_lora_leaf, train["lora"])
         base_h = base_p
         if a.train_projector:
             emb = dict(base_p["embedder"])
@@ -481,8 +640,28 @@ def main():
             base_h = dict(base_p)
             base_h["embedder"] = emb
         params = gpeft.merge_params(base_h, lora_h)
-        pvi = PreprocessedVisionInput(
-            patches=patches, positions_xy=pos_xy, soft_token_counts=counts)
+        if _LEARN or _RSP:
+            # 打分头/重采样器参数注入 merged params 的注册路径(base=ckpt 不含,须补)。
+            # 沿路径拷贝各层 dict(不改 base/train 的 pytree 结构),叶取自
+            # train["tok"](可训、梯度回流),转 bf16 与前向一致。
+            params = dict(params)
+            for ps, leaf in train["tok"].items():
+                segs = ps.split("/")
+                node = params
+                for s in segs[:-1]:
+                    node[s] = dict(node[s])
+                    node = node[s]
+                node[segs[-1]] = leaf.astype(jnp.bfloat16)
+        if _DYNSEG:
+            # 逐帧预算从 tokens 尾部保留区取出(__getitem__ 编入,因果掩码之后、
+            # label 屏蔽区,永不参与 loss)→ 作为数据侧 seg_counts 送达 _selected。
+            # 无需改 shard_map 签名(tokens 本就是分片数据参数)→ 现有路径零改动。
+            seg = jax.lax.dynamic_slice_in_dim(
+                tokens, full.seg_off, full.seg_n, axis=1).astype(jnp.int32)
+            pvi = make_dyn_vision_input(patches, pos_xy, counts, seg)
+        else:
+            pvi = PreprocessedVisionInput(
+                patches=patches, positions_xy=pos_xy, soft_token_counts=counts)
         need_hidden = bool(train["aux"])
         out = model.apply({"params": params}, tokens=tokens, images=pvi,
                           return_hidden_states=need_hidden or None)
@@ -495,12 +674,27 @@ def main():
         tgt = jnp.take_along_axis(
             lg, jnp.clip(lb, 0)[..., None], axis=-1)[..., 0]
         ce = (1 - ls) * (lse - tgt) + ls * (lse - lg.mean(-1))
+        if focal_gamma > 0.0:                    # focal: down-weight easy (high-conf m) tokens
+            pt = jnp.exp(jnp.clip(tgt - lse, -30.0, 0.0))
+            ce = ((1.0 - pt) ** focal_gamma) * ce
         ce = jnp.where(valid > 0, ce, 0.0)      # PAD 行 NaN×0 防护
         loss = (ce * wt).sum() / jnp.clip((wt * valid).sum(), 1.0)
         # 训练动力学(cartography): 每样本加权 CE, 与 loss 同一批中间量,
         # 零额外前向。只含生产口径 CE(不混 KL/aux 头), 信号纯净 ——
         # 高波动低置信=疑似错标, 稳定高 loss=真难例(区分二者的第四证人)
         per_ex = (ce * wt).sum(-1) / jnp.clip((wt * valid).sum(-1), 1.0)
+
+        # 满分辨率 KD 老师前向(env KD_TEACHER_FULLRES=1,默认关):老师看满
+        # 1024 个 soft token(不压缩),学生仍压到 512 → 解封 KD 信息上界。仅替换
+        # 老师前向的 images(pvi_t),学生前向/shard_map 签名/其余全部不变;full_res
+        # 走 DynVisionInput 的 meta 侧,_selected 里 getattr 分支命中即跳过压缩。
+        # student 侧 install_token_select 已把 _encode_vision patch 成 _selected,
+        # 老师复用同一被 patch 的类,故 full_res 生效。默认关 → 不影响任何现有配方。
+        pvi_t = pvi
+        if os.environ.get("KD_TEACHER_FULLRES", "0") == "1":
+            _mst_fr = int(os.environ.get("MAX_SOFT_TOKENS", "64"))
+            _nfr = patches.shape[1] // (_mst_fr * 9)
+            pvi_t = make_full_vision_input(patches, pos_xy, (_mst_fr,) * _nfr)
 
         if a.teacher_npz:                       # KL 蒸馏(老师冻结前向)
             lora_t_h = jax.tree.map(
@@ -515,11 +709,42 @@ def main():
                 base_t = dict(base_p)
                 base_t["embedder"] = emb_t
             params_t = gpeft.merge_params(base_t, lora_t_h)
-            out_t = model_t.apply({"params": params_t}, tokens=tokens,
-                                  images=pvi)
+            # map 学生: 老师前向须在 teacher_rank 上下文内 trace,eff_rank
+            # 短路走 uniform 秩(否则被 rank_map 改写成变秩、shape 不符)。
+            # 学生 model.apply(上方)在上下文外 → 照常查表。
+            _t_ctx = (_teacher_rank(t_ranks[0]) if a.rank_scheme == "map"
+                      else contextlib.nullcontext())
+            with _t_ctx:
+                out_t = model_t.apply({"params": params_t}, tokens=tokens,
+                                      images=pvi_t)
             lg_t = jax.lax.stop_gradient(
                 (out_t.logits if hasattr(out_t, "logits") else out_t)
                 [:, T - 1:-1].astype(jnp.float32))
+            if "lora2" in teach:                # 合议KD: 老师2 前向,logits 平均
+                lora_t2_h = jax.tree.map(
+                    lambda x: jax.lax.stop_gradient(x.astype(jnp.bfloat16)),
+                    teach["lora2"])
+                base_t2 = base_p
+                if teach.get("proj2"):
+                    emb_t2 = dict(base_p["embedder"])
+                    for k in teach["proj2"]:
+                        emb_t2[k] = jax.tree.map(
+                            lambda x: x.astype(jnp.bfloat16),
+                            teach["proj2"][k])
+                    base_t2 = dict(base_p)
+                    base_t2["embedder"] = emb_t2
+                params_t2 = gpeft.merge_params(base_t2, lora_t2_h)
+                # teacher_rank 是 generator 型上下文,不可复用 → 新建一个
+                _t_ctx2 = (_teacher_rank(t_ranks[0])
+                           if a.rank_scheme == "map"
+                           else contextlib.nullcontext())
+                with _t_ctx2:
+                    out_t2 = model_t.apply({"params": params_t2},
+                                           tokens=tokens, images=pvi_t)
+                lg_t2 = jax.lax.stop_gradient(
+                    (out_t2.logits if hasattr(out_t2, "logits") else out_t2)
+                    [:, T - 1:-1].astype(jnp.float32))
+                lg_t = 0.5 * (lg_t + lg_t2)
             tau = a.distill_temp
             p_t = jax.nn.softmax(lg_t / tau)
             kl = (p_t * (jax.nn.log_softmax(lg_t / tau)
@@ -555,6 +780,27 @@ def main():
             if "ks" in train["aux"]:
                 loss = loss + a.ks_coef * head_ce(
                     train["aux"]["ks"]["w"], train["aux"]["ks"]["b"], ks_label)
+
+        if pair_coef > 0.0:                     # pair-margin: 同父兄弟判别压力(SubKS 位)
+            _SK = jnp.asarray(_SK_IDS_NP)                        # [21]
+            _SIB = jnp.asarray(_SIB_NP)                          # [21,21] 同父兄弟(排除自身)
+            _rows = jnp.arange(lg.shape[0])
+            has_w = wt > 0.0                                     # think 权重恰为 0.0 → 排除;首个带权=RT 位
+            rt_pos = jnp.argmax(has_w.astype(jnp.int32), axis=1)
+            sk_pos = jnp.minimum(rt_pos + 2, lg.shape[1] - 1)    # SubKS 位(CoT 变长安全)
+            sk_let = lg[_rows, sk_pos][:, _SK]                   # [B,21] 字母 logit
+            true_id = lb[_rows, sk_pos]                          # [B] 金标 SubKS token id
+            match = (true_id[:, None] == _SK[None, :])           # [B,21]
+            true_idx = jnp.argmax(match.astype(jnp.int32), axis=1)
+            true_logit = jnp.take_along_axis(
+                sk_let, true_idx[:, None], axis=1)[:, 0]         # [B]
+            sib = _SIB[true_idx].astype(jnp.float32)             # [B,21]
+            hinge = jnp.clip(
+                pair_margin - (true_logit[:, None] - sk_let), 0.0) * sib
+            pair = hinge.sum(1) / jnp.clip(sib.sum(1), 1.0)      # [B] 兄弟均值
+            row_ok = (has_w.any(1) & match.any(1)).astype(jnp.float32)
+            pair_loss = (pair * row_ok).sum() / jnp.clip(row_ok.sum(), 1.0)
+            loss = loss + pair_coef * pair_loss
         return loss, per_ex
 
     def grad_local(train, base_p, teach, tokens, labels, weights, patches,

@@ -96,6 +96,11 @@ def main():
                     help="RT 豁免字母(Δ=0;手术版示例: ABCD=只修 E)")
     ap.add_argument("--no-kv-cache", action="store_true",
                     help="回退无缓存全长前向(逐步 ~0.5s,对拍/排障用)")
+    ap.add_argument("--ext-score-npz", default=None,
+                    help="归因显著性 oracle:外部 token 打分 npz(attrib_saliency.py "
+                         "产物,含 gi[M,n,64]+ids)。覆盖运动/范数启发式选择。")
+    ap.add_argument("--ext-score-key", default="gi",
+                    help="ext-score npz 里用哪个数组打分(gi=|grad·input|)")
     a = ap.parse_args()
     from jax_impl.logtee import tee_stdio
     tee_stdio(os.path.dirname(a.out) or ".", name=os.path.basename(a.out) + ".log")
@@ -108,7 +113,28 @@ def main():
     from gemma.gm.nn.gemma4.vision import _encoder as gemma_vision
     from gemma.gm.nn.gemma4 import _transformer as g4_tr
     from gemma.gm.nn.gemma4._transformer import PreprocessedVisionInput
-    from jax_impl.data import SftDataset, make_vision_input
+    from jax_impl.data import (SftDataset, make_vision_input,
+                               make_dyn_vision_input, make_ext_vision_input)
+    SEG = os.environ.get("TOKEN_COMPRESS_MODE") == "dynseg"
+    EXT_SC = None                              # 归因显著性 oracle 映射 id→[n,64]
+    if a.ext_score_npz:
+        _zsc = np.load(a.ext_score_npz)
+        _ids = json.load(open(a.ext_score_npz.rsplit(".npz", 1)[0] + ".ids.json"))
+        _arr = _zsc[a.ext_score_key]
+        EXT_SC = {vid: _arr[i] for i, vid in enumerate(_ids)}
+        print(f"[ext-score] 载入 {len(EXT_SC)} 条 {a.ext_score_key} "
+              f"{_arr.shape} from {a.ext_score_npz}")
+
+    def _mk_pvi(patches, pos_xy, counts, ex):
+        # dynseg:逐样本逐帧预算 seg_counts 作为数据侧 pytree 叶流经 jit
+        # (prefill/step 只编译一次、逐样本复用 → 必须走数据侧,不能读模块全局,
+        #  否则会被烘死成首样本的常量 → 静默错值)。默认关时走原 PreprocessedVisionInput。
+        if SEG:
+            return make_dyn_vision_input(
+                patches, pos_xy, counts,
+                jnp.asarray(ex["seg_counts"][None], jnp.int32))
+        return PreprocessedVisionInput(
+            patches=patches, positions_xy=pos_xy, soft_token_counts=counts)
 
     # HF 语义对齐(v1 坑 7,与 train_sft/kto 同款): gm 前向会压缩视觉位
     # logits(_transformer.py remove_mm_logits),多模态输入下读 pos-1 的
@@ -160,7 +186,12 @@ def main():
     tok = gm.text.Gemma4Tokenizer()
     ds = SftDataset(a.labels, a.layout, tok, wds_dir=a.wds_dir,
                     max_label_len=a.max_new)
-    T = len(ds.template)
+    # dynseg 用逐样本变长模板(哨兵总数=DYNSEG_TOTAL,T 恒定=seg_T),
+    # tome 用单块模板(哨兵总数=TOME_TOTAL,T 恒定=tome_T),
+    # 二者都不能用固定的 16 帧 ds.template(哨兵 1024≠512)。
+    T = (ds.seg_T if ds.seg_mode
+         else ds.tome_T if getattr(ds, "tome_mode", False)
+         else len(ds.template))
     L = T + a.max_new
 
     if a.init_npz and has_lora:
@@ -181,16 +212,69 @@ def main():
     if a.init_npz and has_lora:
         ex0 = ds[0]
         p0, x0, counts0 = make_vision_input([ex0["frames"]])
+        _pvi0 = _mk_pvi(jnp.asarray(p0), jnp.asarray(x0), counts0, ex0)
         struct = jax.eval_shape(lambda: model.init(
             jax.random.PRNGKey(0), tokens=jnp.zeros((1, L), jnp.int32),
-            images=PreprocessedVisionInput(
-                patches=jnp.asarray(p0), positions_xy=jnp.asarray(x0),
-                soft_token_counts=counts0)))
+            images=_pvi0))
         lora_struct = gpeft.split_params(struct["params"])[1]
         # ① 严格加载: 未命中/形状不符直接报错,禁止静默填零
         lora = load_lora_strict(z, lora_struct, jnp, jnp.bfloat16)
         params = gpeft.merge_params(params, lora)
         print(f"[init] lora+proj({n_proj}叶) from {a.init_npz}")
+        # ① 可学习打分头(env TOKEN_LEARN_SCORE=1):base=ckpt 不含 tok_scorer_*,
+        # 训练态由 install_token_select 的 setup 补丁注册、单独存进 npz(键
+        # "tok/<struct路径>",见 train_sft 存档)。此处按 struct 里 tok_scorer_*
+        # 叶的真实路径,从 z 注入进 merged params(bf16,与训练前向一致)。
+        # TOKEN_LEARN_TRAIN 不设 → 前向纯硬 top_k、无 STE,端侧可导出。
+        if os.environ.get("TOKEN_LEARN_SCORE") == "1":
+            from flax.traverse_util import flatten_dict, unflatten_dict
+            fp = flatten_dict(params)
+            n_tok = 0
+            for path, _leaf in jax.tree_util.tree_flatten_with_path(
+                    struct["params"])[0]:
+                keys = tuple(getattr(kk, "key", str(kk)) for kk in path)
+                if "tok_scorer" not in "/".join(keys):
+                    continue
+                zk = "tok/" + "/".join(keys)
+                if zk not in z.files:
+                    raise SystemExit(
+                        f"[tok] init-npz 缺 {zk} —— 该产物未含可学习打分头?")
+                fp[keys] = jnp.asarray(z[zk], jnp.bfloat16)
+                n_tok += 1
+            if n_tok == 0:
+                raise SystemExit(
+                    "[tok] TOKEN_LEARN_SCORE=1 但 struct 无 tok_scorer_* —— "
+                    "install_token_select 的 setup 补丁未生效?")
+            params = unflatten_dict(fp)
+            print(f"[init] 可学习打分头 tok_scorer({n_tok}叶) from {a.init_npz}")
+        # ②′ 学习式重采样器(env TOKEN_RESAMPLER=1):与打分头同通道 ——
+        # 参数由 install_token_select 的 patched setup 注册、训练侧存进 npz
+        # (键 "tok/<struct路径>",见 train_sft 存档);此处按 struct 里
+        # tok_resampler_* 叶的真实路径从 z 注入 merged params(bf16,与训练
+        # 前向一致)。重采样器前向本就无 STE 分支,训推同一条路。
+        if os.environ.get("TOKEN_RESAMPLER") == "1":
+            from flax.traverse_util import flatten_dict, unflatten_dict
+            fp = flatten_dict(params)
+            n_rsp = 0
+            for path, _leaf in jax.tree_util.tree_flatten_with_path(
+                    struct["params"])[0]:
+                keys = tuple(getattr(kk, "key", str(kk)) for kk in path)
+                if "tok_resampler" not in "/".join(keys):
+                    continue
+                zk = "tok/" + "/".join(keys)
+                if zk not in z.files:
+                    raise SystemExit(
+                        f"[rsp] init-npz 缺 {zk} —— 该产物未含重采样器参数?"
+                        "(热身产物请核对 RESAMPLER_* env 与训练时一致)")
+                fp[keys] = jnp.asarray(z[zk], jnp.bfloat16)
+                n_rsp += 1
+            if n_rsp == 0:
+                raise SystemExit(
+                    "[rsp] TOKEN_RESAMPLER=1 但 struct 无 tok_resampler_* —— "
+                    "install_token_select 的 setup 补丁未生效?")
+            params = unflatten_dict(fp)
+            print(f"[init] 学习式重采样器 tok_resampler({n_rsp}叶) "
+                  f"from {a.init_npz}")
 
     @jax.jit
     def step_logits(par, tokens, pvi, pos):
@@ -261,11 +345,20 @@ def main():
             continue
         ex = ds[idx_of[rec["video_id"]]]
         patches, pos_xy, counts = make_vision_input([ex["frames"]])
-        pvi = PreprocessedVisionInput(
-            patches=jnp.asarray(patches), positions_xy=jnp.asarray(pos_xy),
-            soft_token_counts=counts)
+        if EXT_SC is not None:
+            sc = EXT_SC.get(rec["video_id"])
+            if sc is None:
+                raise SystemExit(f"[ext-score] 缺 {rec['video_id']} 的显著性")
+            pvi = make_ext_vision_input(
+                jnp.asarray(patches), jnp.asarray(pos_xy), counts,
+                jnp.asarray(sc[None], jnp.float32))     # [1,n,64]
+        else:
+            pvi = _mk_pvi(jnp.asarray(patches), jnp.asarray(pos_xy), counts, ex)
         toks = np.zeros(L, np.int32)
-        toks[:T] = ds.template
+        # dynseg/tome:用逐样本模板(ex["tokens"] 前 T 位),非固定 ds.template
+        toks[:T] = (ex["tokens"][:T]
+                    if (ds.seg_mode or getattr(ds, "tome_mode", False))
+                    else ds.template)
         t0 = time.time()
 
         def pick(row, i):

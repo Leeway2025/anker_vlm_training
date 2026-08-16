@@ -14,9 +14,31 @@ self.scope.path → 按路径定 rank;输出乘 scale)。gm.nn.LoRA(rank=...) �
 前向无缩放)不兼容 —— torch checkpoint 续训走 legacy,JAX 原生训练
 + export 走本方案;两者不得混用(FINDINGS 有说明)。
 """
+import contextlib
 import math
 
 E2B_GLOBAL_LAYERS = frozenset({4, 9, 14, 19, 24, 29, 34})
+
+
+@contextlib.contextmanager
+def teacher_rank(r):
+    """蒸馏老师前向的 rank 覆盖(仅对 install_map_lora 生效)。
+
+    map 补丁是类级别的,老师(uniform 大 rank)与变秩学生共用同一 adapter
+    类 → 老师前向会被 rank_map 按路径改写成学生秩、shape 不符崩。进入本
+    上下文后,map 的 eff_rank 短路返回 r(不查表),退出恢复。学生 apply
+    在上下文之外(_TEACHER_RANK=None)→ 照常查 rank_map。
+
+    在 jitted loss_fn 里包住老师 model_t.apply / 老师 eval_shape 即可
+    (追踪顺序: 学生先 trace(表)→ set r → 老师 trace(r)→ clear)。
+    非 map 方案(无补丁)下设置该全局无副作用。"""
+    from gemma.peft import _lora
+    prev = getattr(_lora, "_TEACHER_RANK", None)
+    _lora._TEACHER_RANK = r
+    try:
+        yield
+    finally:
+        _lora._TEACHER_RANK = prev
 
 
 def install_prod_lora(r_global=512, r_sliding=256, r_vision=256,
@@ -104,6 +126,9 @@ def install_map_lora(rank_map):
         return
 
     def eff_rank(path):
+        tr = getattr(_lora, "_TEACHER_RANK", None)
+        if tr is not None:                 # 蒸馏老师前向: 短路走 uniform 秩
+            return tr
         key = "/".join(str(s) for s in (path or ()))
         if key not in rank_map:
             raise KeyError(f"rank_map 缺路径 {key!r}({len(rank_map)} 项)"

@@ -45,6 +45,21 @@ def prod_scale_for_key(key, a_shape):
     return 2.0 * r / math.sqrt(r)          # = 2*sqrt(r)
 
 
+def _robust_svd(m):
+    """numpy 默认 gesdd 偶发 'SVD did not converge'(某些病态矩阵)。
+    退回 scipy 的 gesvd(QR 型,慢但稳);再不行加极小对角抖动重试。"""
+    try:
+        return np.linalg.svd(m, full_matrices=False)
+    except np.linalg.LinAlgError:
+        try:
+            import scipy.linalg
+            return scipy.linalg.svd(m, full_matrices=False, lapack_driver='gesvd')
+        except Exception:
+            eps = 1e-12 * (float(np.abs(m).max()) or 1.0)
+            jit = eps * np.eye(m.shape[0], m.shape[1], dtype=m.dtype)
+            return np.linalg.svd(m + jit, full_matrices=False)
+
+
 def truncate_pair(a, b, scale, k, act_diag=None, pad_to=0):
     """(a: […, r], b: [r, …]) → rank-k 最优近似的 (a', b', 能量占比)。
     scale 折进因子;k=0 表示满秩重分解(回环验证用)。
@@ -80,7 +95,7 @@ def truncate_pair(a, b, scale, k, act_diag=None, pad_to=0):
         m = s_in[:, None] * dw
     else:
         s_in, m = None, dw
-    u, s, vt = np.linalg.svd(m, full_matrices=False)
+    u, s, vt = _robust_svd(m)
     k_eff = min(k or len(s), len(s))
     energy = float((s[:k_eff] ** 2).sum() / max((s ** 2).sum(), 1e-30))
     root = np.sqrt(s[:k_eff])

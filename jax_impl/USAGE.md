@@ -313,6 +313,28 @@ export WANDB_API_KEY=<本地key>
 可回退 float32);val 卷子建议统一钉死: `export_val_split.py --ids-out`
 产清单后,所有训练加 `--val-ids <清单>`(消跨轮选模噪声)。
 
+## S8.6 可疑标注挖掘 —— label_audit(机器排队,人定性)
+
+交叉盲判 × 多种子合议 × CL 逐类阈值 × 近邻标签冲突,产出人工复核队列。
+定位:**只排队不改标**;规则口径差是学习目标,一条不改(改判 522 → RT −1.8 前科)。
+
+```bash
+# ① 每个种子做一次"折外"letter-logits 推理(A 折模型推 B 折,反之亦然;
+#    折内自测会背下错标,信号整个反掉 —— 红线,工具查不了,人保证):
+bash jax_impl/infer_sharded.sh python DATA/labels_foldB.jsonl hf_layout.json \
+  outputs/audit/seed1_foldB outputs/seed1_foldA/train_params_best.npz \
+  INFER_ARGS='--dump-letter-logits'
+# ② 排队(纯 CPU 分钟级;--emb 可选,折外倒二层池化特征,专抓同源近重复标注不一致):
+python3 jax_impl/label_audit.py mine \
+  --logits outputs/audit/seed1_foldout.jsonl --logits outputs/audit/seed2_foldout.jsonl \
+  --logits outputs/audit/seed3_foldout.jsonl --labels DATA/labels.jsonl \
+  [--emb outputs/audit/emb.npz] --top 5000 --out outputs/audit/suspects.csv
+# ③ 人工填 verdict 列(mislabel / rule_ok / unsure)→ 定复核预算截断点:
+python3 jax_impl/label_audit.py purity --worksheet outputs/audit/suspects_reviewed.csv
+```
+体温计:mine 会打印各种子折外盲判率 —— 健康 ~0.37;>0.9 报泄漏警告,队列作废先查泄漏。
+重标完成后照旧过冒烟门(±0.5 双向噪声带)才入库。合成自测:队首 precision 1.00 / recall 0.90。
+
 ## S9. 导出交付 —— 回到 HF/RKLLM 生态
 
 > **视觉塔 LoRA 已可导出**(2026-07-20,commit cb4bbe0 起): export_hf
